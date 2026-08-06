@@ -143,22 +143,28 @@ pytest
 
 ## Demo
 
-<!-- TODO: Add Demo GIF -->
+<!--
+  Demo GIF placeholder — docs/assets/zmai-demo.gif 尚未生成。
+  录屏建议：单条命令启动 → Agent 读 Issue → 先跑测试(失败) → 定位分析 →
+  修改代码 → 重跑测试(全绿) → 自动停止退出。完成后将 GIF 放到
+  docs/assets/zmai-demo.gif 并取消下面一行的注释。
+-->
+<!-- ![ZMAI Demo](docs/assets/zmai-demo.gif) -->
 
-A complete SWE workflow:
+展示 ZMAI 完整 SWE Agent 工作流：
 
 ```
 Issue
   ↓
-Analysis
+Test              ← run tests first, see the failures
   ↓
-Testing       ← run tests first, see the failures
+Analysis          ← diagnose the root cause
   ↓
-Fix           ← minimal, targeted code changes
+Code Modification ← minimal, targeted fixes
   ↓
-Verification  ← re-run tests, confirm green
+Verification      ← re-run tests, confirm green
   ↓
-Completion    ← autonomous stop, no further tool calls
+Completion Detection ← autonomous stop, no further tool calls
 ```
 
 Example — one-shot fix a real bug:
@@ -353,3 +359,9 @@ Changes follow [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog, SemVer).
 ## License
 
 MIT © [Xijing Liu](https://github.com/xijingliu) — see [LICENSE](LICENSE).
+
+---
+
+## Star
+
+If you find ZMAI useful, please consider giving this project a star ⭐
