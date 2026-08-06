@@ -52,3 +52,7 @@ test_input.json
 test_issue.txt
 zmai.json
 zmai_doc_*.txt
+
+# Hermes validation runtime outputs
+tests/hermes_validation/*.txt
+tests/hermes_validation/*.json
