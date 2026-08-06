@@ -15,6 +15,42 @@
 
 ---
 
+## 中文介绍 · ZMAI
+
+ZMAI 是一个**开源自主软件工程 Agent Runtime（自主软件工程 Agent 运行时）**。
+给它一个任务（"修复这个 Bug"、"增加这个功能"、"重构这个模块"），它会自主完成：
+
+```
+Issue 分析 → 任务规划 → 代码修改 → 自动测试验证 → 完成状态判断 → 自主停止
+```
+
+**它不是简单的 LLM API 封装** —— 从问题理解、测试驱动的调试、代码修改、
+验证闭环到完成检测与自主停止，整个 Agent 循环都在本项目内实现。
+
+### 🧩 核心能力
+
+- **SWE Agent 工作流闭环** — 发现 → 先跑测试 → 分析失败 → 修改代码 → 验证
+- **Completion Detection（完成状态检测）** — 跨轮累积判定，测试全绿立即停止
+- **LoopGuard 循环保护** — 相同调用 / 相同失败 / 无进展 三重循环检测
+- **Workspace Sandbox** — 路径穿越防护、文件大小限制、符号链接检测
+- **Multi-model Gateway** — DeepSeek / Claude / Gemini / 自定义插件
+
+### ✨ 技术亮点
+
+- **零第三方依赖** — 约 2 万行纯 Python 标准库实现（urllib / subprocess / pathlib / json）
+- **多后端抽象** — 统一 Backend 接口 + Credential Store 加密凭证存储
+- **客观验证（auto_verify）** — 不因"工具调用成功"就判定任务完成
+- **自主停止** — CompletionState + LoopGuard + max_iterations 硬上限三层防护
+- **Windows 友好** — 内置 Linux→Windows 命令翻译与 UTF-8 编码处理
+
+### ✅ 验证结果
+
+- **1245 tests passed, 7 skipped**（48 个测试文件，无需 API Key 即可运行）
+- **SWE Agent 实际任务验证通过** — 真实运行修复任务：读 Issue → 定位 Bug → 修改代码 → 测试从失败变全绿 → 自动停止
+- **Autostop 自主停止机制验证通过** — 可完成任务自动停止；不可完成任务达到最大迭代强制终止，无无限循环
+
+---
+
 ## What is ZMAI?
 
 ZMAI is an **Autonomous Software Engineering Agent Runtime** — a software
