@@ -5,8 +5,7 @@
 **Autonomous Software Engineering Agent Runtime**
 
 [![CI](https://github.com/xijingliu/ZMAI/actions/workflows/test.yml/badge.svg)](https://github.com/xijingliu/ZMAI/actions/workflows/test.yml)
-[![PyPI](https://img.shields.io/pypi/v/zmai)](https://pypi.org/project/zmai/)
-[![Python](https://img.shields.io/pypi/pyversions/zmai)](https://pypi.org/project/zmai/)
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](pyproject.toml)
 
