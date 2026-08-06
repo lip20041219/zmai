@@ -1,0 +1,15 @@
+{
+    "id": "task_004_fix_html",
+    "description": "style.css 中 .box 的 width: 0 缺少单位（应为 width: 90% 或类似值），导致页面渲染异常。修复这个 CSS 问题。",
+    "expected": ".box 的 width 有合法 CSS 单位，页面可以正常渲染",
+    "hint": "检查 .box 样式中的 width 属性。0 后面应该跟一个单位（如 px, %, em），或者换成 max-width。",
+    "files": [
+        "style.css"
+    ],
+    "verification": {
+        "setup": "",
+        "command": "python verify_css.py",
+        "expected_output": "",
+        "timeout": 10
+    }
+}

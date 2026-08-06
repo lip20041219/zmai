@@ -1,0 +1,15 @@
+{
+    "id": "task_001_fix_bug",
+    "description": "calculator.py 的 divide(10, 0) 应抛出 ZeroDivisionError，但现在返回 None。修复这个 bug。",
+    "expected": "divide(10, 0) 抛出 ZeroDivisionError，所有测试通过",
+    "hint": "divide() 函数用 try/except 捕获了所有 Exception 并返回 None。应该去掉捕获或只捕获特定异常。",
+    "files": [
+        "calculator.py"
+    ],
+    "verification": {
+        "setup": "cd project && copy nul __init__.py",
+        "command": "cd project && python -m pytest check_calculator.py -v",
+        "expected_output": "passed|PASSED|OK",
+        "timeout": 15
+    }
+}

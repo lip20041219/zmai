@@ -1,0 +1,12 @@
+{
+    "id": "demo_python_csv_bug",
+    "description": "csv_processor.py 中 parse_line() 使用 str.split(',') 无法处理引号包裹的逗号字段。实现正确的 CSV 行解析。",
+    "expected": "parse_line 正确处理带引号的字段，所有测试通过",
+    "files": ["csv_processor.py"],
+    "verification": {
+        "setup": "cd project && copy nul __init__.py",
+        "command": "cd project && python -m pytest test_csv.py -v",
+        "expected_output": "passed|PASSED",
+        "timeout": 15
+    }
+}
