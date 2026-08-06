@@ -1,0 +1,12 @@
+{
+    "id": "demo_flask_edit_bug",
+    "description": "Flask TODO app 中 edit_task route 只接受 GET 请求，但编辑表单提交 POST，导致 405 Method Not Allowed。添加 POST 支持。",
+    "expected": "edit_task 处理 POST 请求，编辑功能正常工作",
+    "files": ["app.py"],
+    "verification": {
+        "setup": "cd project && pip install flask pytest -q",
+        "command": "cd project && python -m pytest test_app.py -v",
+        "expected_output": "passed|PASSED",
+        "timeout": 30
+    }
+}

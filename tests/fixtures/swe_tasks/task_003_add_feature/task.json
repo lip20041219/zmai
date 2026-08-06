@@ -1,0 +1,15 @@
+{
+    "id": "task_003_add_feature",
+    "description": "todo.py 的 TodoList 缺少 clear_done() 方法。添加它：删除所有已完成的 (done=True) 待办事项。",
+    "expected": "clear_done() 添加成功，所有测试通过",
+    "hint": "需要在 TodoList 类中添加 clear_done() 方法，过滤掉 done=True 的条目并保存。",
+    "files": [
+        "todo.py"
+    ],
+    "verification": {
+        "setup": "cd project && copy nul __init__.py",
+        "command": "cd project && python -m pytest check_todo.py -v",
+        "expected_output": "passed|PASSED|OK",
+        "timeout": 15
+    }
+}

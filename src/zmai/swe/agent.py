@@ -1,0 +1,868 @@
+"""SWE Agent — software engineering agent (delivery-oriented)."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+from pathlib import Path
+from typing import Any
+
+from zmai.agent import Agent, AgentAction, AgentContext, AgentResult, AgentState
+from zmai.errors import BackendError
+from zmai.gateway import Backend
+from zmai.gateway.base import BackendRequest, BackendResponse
+from zmai.swe.models import Plan, MAX_REPLANS, format_plan_summary
+from zmai.swe.planner import generate_plan
+from zmai.swe.completion import CompletionState
+from zmai.swe.context import ContextManager
+from zmai.swe.loop_guard import LoopGuard, LoopResult
+from zmai.swe.scanner import RepositoryInfo, RepositoryScanner
+from zmai.swe.tools import (
+    EditTool,
+    GitTool,
+    GrepTool,
+    OpenInBrowserTool,
+    ReadFileTool,
+    ShellTool,
+    ShowToUserTool,
+    WriteFileTool,
+)
+from zmai.tool import ToolCall, ToolContext
+from zmai.swe.verifier import (
+    VerificationCheck,
+    VerificationResult,
+    auto_generate_checks,
+    verify_file_exists,
+    verify_exit_code,
+    verify_test_output,
+)
+from zmai.swe._async_utils import run_sync
+
+logger = logging.getLogger("zmai.swe.agent")
+
+
+def _now_ms() -> int:
+    """当前时间戳（毫秒）。"""
+    import time
+    return int(time.monotonic() * 1000)
+
+
+def _log_stop() -> None:
+    """打印任务完成/停止循环的显式日志（自主停止的可审计信号）。"""
+    logger.info("[ZMAI] Task completed.")
+    logger.info("[ZMAI] Stopping execution loop.")
+    logger.info("[ZMAI] No further tool calls allowed.")
+
+
+def _build_platform_prompt() -> str:
+    """Generate platform-specific guidance based on current OS."""
+    if sys.platform == "win32":
+        return """
+## Current OS: Windows (Important!)
+
+You MUST use Windows-compatible commands. Do NOT use Linux/Mac commands:
+
+### Command Mapping (Linux → Windows)
+| Linux (DON'T use) | Windows (DO use) |
+|---|---|
+| ls | dir |
+| ls -la | dir /a |
+| pwd | cd |
+| cat file.txt | type file.txt |
+| head -n 5 file.txt | (no direct equivalent; use read_file with line range) |
+| grep "pattern" file.py | Use the grep tool (not shell command) |
+| touch newfile.txt | echo. > newfile.txt or type nul > newfile.txt |
+| rm file.txt | del file.txt |
+| rm -rf dir/ | rmdir /s /q dir |
+| mv a.txt b.txt | move a.txt b.txt or ren a.txt b.txt |
+| cp a.txt b.txt | copy a.txt b.txt |
+| chmod +x script.sh | (not needed on Windows) |
+| which python | where python |
+| find . -name "*.py" | dir /s /b *.py |
+| kill -9 PID | taskkill /f /pid PID |
+| mkdir -p a/b/c | mkdir a\\b\\c |
+| uname -a | ver |
+| wc -l file.txt | find /c /v "" file.txt |
+| sort file.txt | sort file.txt |
+| echo $VAR | echo %VAR% |
+
+### Path Rules
+- Forward slash / or backslash \\ both work
+- Use %VAR% for environment variables, not $VAR
+- Windows is case-insensitive
+
+### Key Tips
+- **Do NOT use `ls`** — use `dir`
+- **Do NOT use `cat`** — use `type` or the read_file tool
+- **Do NOT use `pwd`** — use `cd`
+- **Do NOT use `grep`** — use the grep tool (more powerful)
+- Do NOT run interactive commands (they will hang)
+"""
+
+    return """
+## Current OS: Linux/Mac
+
+- Standard Unix commands work (ls, cat, grep, pwd, etc.)
+- Use forward slash / for paths
+- Do NOT run interactive commands (they will hang)
+"""
+
+
+_BASE_SYSTEM_PROMPT = """You are a Software Engineering Agent (SWE Agent). Your job doesn't end when code is written — you must deliver results the user can see.
+
+## Available Tools
+
+### Read
+- read_file: Read file content with optional line range
+
+### Write
+- write_file: Write/overwrite file content (use for new files)
+- edit: Line-level editing (replace_lines, regex_replace, insert, append)
+
+### Search
+- grep: Search text or regex in files (do NOT use shell grep — use this tool)
+
+### Execute
+- shell_exec: Execute shell commands in workspace directory
+- git: Execute git commands
+
+### Deliver
+- show_to_user: Print content to terminal for the user to see
+- open_in_browser: Open HTML file in browser
+
+## SWE Workflow (strict — mandatory for code fix tasks)
+
+For CODE FIX tasks you MUST follow this exact 5-phase workflow IN ORDER.
+Do NOT skip phases. Do NOT reorder phases.
+
+### Phase 1: Discover
+- Read the task description carefully
+- List project files (use dir or equivalent)
+- Identify relevant source files and test files
+
+### Phase 2: Run Tests First ⚠️ (CRITICAL)
+- Run tests via `python -m pytest` (never a bare `pytest`; on Windows prefer `.venv/Scripts/python -m pytest`)
+- See which tests FAIL before reading source code
+- Capture the failure output — this tells you what to fix
+- ⚠️ DO NOT read source files before running tests
+
+### Phase 3: Analyze Failures
+- Review test failure output carefully
+- Read ONLY source files related to the failures
+- Diagnose the root cause of each failure
+
+### Phase 4: Modify Code
+- Write/edit files to fix the root causes
+- Only modify files that need changes
+- Make minimal, targeted changes
+
+### Phase 5: Verify
+- Re-run tests to confirm the fix works
+- If tests still fail → return to Phase 3 (Analyze)
+- If all tests pass → deliver results with show_to_user
+
+## Critical Rules
+1. RUN TESTS FIRST — always run the test command before reading source files
+2. DO NOT read source files indefinitely without running tests first
+3. If you have read more than 8 source files without running tests, STOP and run tests now
+4. Do NOT use shell for file/text search — use the grep tool
+5. Do not repeatedly ls/dir without purpose
+6. A "Requirements:" / numbered-list section in the user's task is a set of CONSTRAINTS, NOT separate tasks. Lines like "run tests" or "stop after success" tell you HOW to work on your single objective — never spin them into independent sub-tasks, and never keep working after your objective is met.
+7. NEVER run a bare `pytest`. Always run tests via `python -m pytest` (or `.venv/Scripts/python -m pytest` on Windows)."""
+
+_PLAN_EXECUTION_PROMPT = """
+## Execution Plan (mandatory)
+
+Below is the plan you must follow when executing this task.
+Proceed step by step in the specified order. After each step, explicitly mark "Step X complete".
+If a step cannot be executed as planned, explain why and provide an alternative.
+After completing all steps, summarize the results."""
+
+
+def _build_system_prompt(backend: Backend | None = None) -> str:
+    """Build the full system prompt (base instructions + platform guide + backend identity)."""
+    # Backend identity — read dynamically from backend instance
+    identity_parts = []
+    if backend:
+        bn = getattr(backend, "name", "") or ""
+        bm = getattr(backend, "model", "") or ""
+        bp = getattr(backend, "provider", "") or ""
+        if bn:
+            identity_parts.append(f"## Your Identity")
+            identity_parts.append(f"You are running on {bp.upper() if bp else bn} Backend.")
+            if bm:
+                identity_parts.append(f"Current model: {bm}.")
+        identity_parts.append("")
+
+    platform_prompt = _build_platform_prompt()
+    return "\n".join(identity_parts) + _BASE_SYSTEM_PROMPT + platform_prompt
+
+
+class SWEAgent(Agent):
+    """Software Engineering Agent — code reading, modification, execution, and delivery."""
+
+    name = "swe_agent"
+    description = "Software Engineering Agent with delivery"
+
+    async def initialize(self, context: AgentContext) -> None:
+        logger.info("SWEAgent initializing: %s", context.agent_id)
+        # Initialize ContextManager
+        if "cm" not in context.metadata:
+            context.metadata["cm"] = ContextManager(config=context.config)
+
+        # ── Repository discovery: find and scan user project root ──
+        # Distinguish: user project root vs agent runtime workspace vs internal state
+        project_root = context.config.get("project_path")
+        if project_root:
+            project_root = Path(project_root).resolve()
+        else:
+            detected = RepositoryScanner.find_project_root()
+            if detected:
+                project_root = detected
+                context.config["project_path"] = str(project_root)
+                logger.info("Auto-detected project root: %s", project_root)
+
+        if project_root and "repo_info" not in context.metadata:
+            try:
+                repo_info = RepositoryScanner.scan(project_root)
+                context.metadata["repo_info"] = repo_info
+                logger.info(
+                    "Repository scanned: %s (%d source files, %d test files)",
+                    project_root, len(repo_info.source_files), len(repo_info.test_files),
+                )
+            except Exception as e:
+                logger.warning("Repository scan failed: %s", e)
+
+        # ── LoopGuard — 循环检测 ────────────────────────────────
+        if "loop_guard" not in context.metadata:
+            threshold = int(context.config.get("loop_guard.threshold", 5))
+            context.metadata["loop_guard"] = LoopGuard(threshold=threshold)
+            logger.info("LoopGuard initialized (threshold=%d)", threshold)
+
+        # ── CompletionState — 跨轮累积完成判定 ────────────────
+        if "completion" not in context.metadata:
+            context.metadata["completion"] = CompletionState()
+            logger.info("CompletionState initialized")
+
+        # ── Workflow phase tracking ────────────────────────────
+        if "has_run_test" not in context.metadata:
+            context.metadata["has_run_test"] = False
+            context.metadata["reads_without_test"] = 0
+            context.metadata["workflow_phase"] = "discover"
+            logger.info("Workflow phase initialized: discover")
+
+        # State is managed by Runtime's LifecycleManager; agent does not maintain independent state
+        if context.tools:
+            existing = {t.name for t in context.tools.list()}
+            for tool in [
+                ReadFileTool(), WriteFileTool(), EditTool(),
+                GrepTool(), ShellTool(), GitTool(),
+                ShowToUserTool(), OpenInBrowserTool(),
+            ]:
+                if tool.name not in existing:
+                    context.tools.register(tool)
+
+    async def plan(self, context: AgentContext) -> Plan:
+        """Plan Mode: Generate a structured Plan in read-only mode.
+
+        Uses PlanAgent internally. Does not modify any files.
+        Returns a Plan that can be shown to the user for confirmation before execution.
+        """
+        from zmai.swe.plan_agent import PlanAgent
+
+        if not context.backend:
+            raise RuntimeError("No available Backend, cannot generate Plan")
+
+        agent = PlanAgent(
+            agent_id=context.agent_id,
+            backend=context.backend,
+            tools=context.tools,
+            config=context.config,
+        )
+        plan = await agent.create_plan(context.task, context)
+        # Store plan for later confirmation and execution
+        context.metadata["execution_plan"] = plan
+        return plan
+
+    async def step(self, context: AgentContext) -> AgentAction:
+        logger.debug("SWEAgent step %d/%d", context.step_count, context.max_steps)
+
+        if not context.backend:
+            _l = context.metadata.get("__log__")
+            if _l:
+                try:
+                    _l.record_step(phase="error", action="no_backend",
+                                   success=False, error="No available Backend")
+                except Exception:
+                    pass
+            return AgentAction.fail("No available Backend. Please configure an API Key.")
+
+        context.step_count += 1
+        cm: ContextManager | None = context.metadata.get("cm")
+        if cm is None:
+            cm = ContextManager(config=context.config)
+            context.metadata["cm"] = cm
+
+        # Initialize task into context manager
+        cm.set_task(context.task)
+
+        # ── CompletionState — 惰性初始化（防御 initialize 未共享 ctx）──
+        completion: CompletionState | None = context.metadata.get("completion")
+        if completion is None:
+            completion = CompletionState()
+            context.metadata["completion"] = completion
+        # ── 硬终止（最高优先级，进入本步即先判）：完成状态已满足 → 立即 return，不再调用 backend ──
+        _green_once = context.metadata.get("test_success_count", 0) >= 1
+        if completion and (completion.should_complete() or _green_once):
+            logger.info(
+                "CompletionState satisfied — entering DONE (%s, step %d): %s",
+                context.agent_id, context.step_count, completion.summary(),
+            )
+            _log_stop()
+            _l = context.metadata.get("__log__")
+            if _l:
+                try:
+                    _l.record_step(phase="complete", action="completion_state",
+                                   success=True,
+                                   metadata={"step": context.step_count,
+                                             "reason": completion.summary()})
+                except Exception:
+                    pass
+            context.metadata["messages"] = cm.get_context()
+            return AgentAction.complete(
+                output=f"Task completed — objective met and tests green "
+                       f"(step {completion.last_pass_step}). No further work needed."
+            )
+
+        # ── Auto-plan phase ──────────────────────────────────
+        auto_plan = context.config.get("auto_plan", False)
+        plan: Plan | None = context.metadata.get("execution_plan")
+
+        if auto_plan and plan is None:
+            on_progress = context.metadata.get("on_progress")
+            if on_progress:
+                on_progress("info", "Generating execution plan...")
+            try:
+                plan = await run_sync(generate_plan, context.task, context.backend, context.config)
+                context.metadata["execution_plan"] = plan
+                # Update context manager with the plan
+                cm._recent.clear()
+                cm.add_message("user",
+                    f"{context.task}\n\n"
+                    f"Plan generated with {len(plan.steps)} steps. Execute in order."
+                )
+                logger.info("Plan generated: %s (%d steps)", plan.goal, len(plan.steps))
+                if on_progress:
+                    on_progress("info", f"Plan generated: {plan.goal} ({len(plan.steps)} steps)")
+                # ── ExecutionLog: plan ──────────────────────
+                _l = context.metadata.get("__log__")
+                if _l:
+                    try:
+                        _l.record_step(phase="plan", action="generate_plan",
+                                       success=True,
+                                       metadata={"goal": plan.goal[:200], "steps": len(plan.steps)})
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.error("Plan generation failed: %s", e)
+                _l = context.metadata.get("__log__")
+                if _l:
+                    try:
+                        _l.record_step(phase="plan", action="generate_plan",
+                                       success=False, error=str(e)[:500])
+                    except Exception:
+                        pass
+                return AgentAction.fail(f"Plan generation failed: {e}")
+
+        tool_defs = context.tools.definitions() if context.tools else []
+
+        # Inject memory context if available
+        memory_context = ""
+        if context.memory:
+            wm = context.memory.working(context.agent_id)
+            mem_items = wm.search("")  # all entries
+            if mem_items:
+                mem_lines = []
+                for e in mem_items[:10]:  # max 10 entries
+                    val_str = str(e.value)[:120]
+                    mem_lines.append(f"- {e.key}: {val_str}")
+                memory_context = "\n## Memory Context\n" + "\n".join(mem_lines) + "\n"
+
+        bc = context.backend.config if hasattr(context.backend, "config") else {}
+        system_prompt = _build_system_prompt(backend=context.backend) + memory_context
+
+        # ── Inject repository structure into system prompt ────────
+        repo_info: RepositoryInfo | None = context.metadata.get("repo_info")
+        if repo_info and repo_info.file_count > 0:
+            system_prompt += "\n\n" + RepositoryScanner.format_compact(repo_info)
+            system_prompt += (
+                "\n\n## Workspace Rules\n"
+                "The project files listed above are in the project root. "
+                "Your workspace sandbox (./workspace/) is for temporary output. "
+                "DO NOT scan the workspace/ or .state/ directories for project source code."
+            )
+
+        # Inject execution plan into system prompt
+        plan = context.metadata.get("execution_plan")
+        if plan:
+            system_prompt += _PLAN_EXECUTION_PROMPT + "\n" + format_plan_summary(plan)
+            cm.set_plan(f"{plan.goal} ({len(plan.steps)} steps)")
+
+        # Get messages from ContextManager
+        ctx_messages = cm.get_context()
+        request = BackendRequest(
+            messages=ctx_messages,
+            tools=tool_defs or None,
+            system_prompt=system_prompt,
+            max_tokens=bc.get("max_tokens", 4096),
+            temperature=bc.get("temperature", 0.7),
+        )
+
+        # ── Backend invocation (with auto-retry) ──────────────
+        # For non-BackendError transient failures (network issues, 503, etc.),
+        # retry with exponential backoff (1s, 2s, 4s…), up to max_retries.
+        # BackendError (401/400/model-not-found) is propagated immediately, no retry.
+        max_retries = int(context.config.get("retry.max_attempts", 3))
+
+        last_error: Exception | None = None
+        response: BackendResponse | None = None
+
+        for attempt in range(max_retries):
+            try:
+                response = await run_sync(context.backend.invoke, request)
+                last_error = None
+                break
+            except BackendError:
+                raise  # BackendError propagates immediately, no retry
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.info(
+                        "Backend call failed (attempt %d/%d), waiting %.1fs: %s",
+                        attempt + 1, max_retries, wait, e,
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(
+                        "Backend call permanently failed (attempt %d/%d): %s",
+                        attempt + 1, max_retries, e,
+                    )
+
+        if last_error or response is None:
+            _l = context.metadata.get("__log__")
+            if _l:
+                try:
+                    _l.record_step(phase="error", action="backend_failure",
+                                   success=False,
+                                   error=str(last_error or "Backend produced no response"))
+                except Exception:
+                    pass
+            return AgentAction.fail(str(last_error or "Backend produced no response"))
+
+        if response.content:
+            cm.add_message("assistant", response.content)
+
+        if response.tool_calls:
+            on_progress = context.metadata.get("on_progress")
+            # Count tool call success/failure for this round
+            step_tool_ok = 0
+            step_tool_fail = 0
+            guard: LoopGuard | None = context.metadata.get("loop_guard")
+            had_modification = False
+            round_tests_passed = False
+            # ── Read-limit tracking ──────────────────────────
+            reads_without_test = context.metadata.get("reads_without_test", 0)
+            has_run_test = context.metadata.get("has_run_test", False)
+            for tc in response.tool_calls:
+                if on_progress:
+                    on_progress("tool", tc.name)
+                tctx = ToolContext(
+                    agent_id=context.agent_id,
+                    workspace_path=context.workspace or Path("."),
+                    project_path=context.config.get("project_path"),
+                    config=context.config,
+                    timeout=context.config.get("timeout", 30),
+                )
+                _ts = _now_ms()
+                # 用 execute_tool 容错分发：LLM 幻觉出不存在的工具名时返回
+                # 结构化 tool_not_found 错误并写入日志，Agent 据此重新规划。
+                result = context.tools.execute_tool(tc.name, tc.params, tctx)
+                _dur = _now_ms() - _ts
+                if result.success:
+                    step_tool_ok += 1
+                    if tc.name in ("write_file", "edit", "git"):
+                        had_modification = True
+                        # ── CompletionState: 任何修改使旧测试结果失效 ──
+                        if completion:
+                            completion.record_modification(step=context.step_count)
+                    # ── Read-limit: detect test runs ──
+                    if tc.name == "shell_exec" and result.success:
+                        cmd = str(tc.params.get("command", "")).lower()
+                        if "pytest" in cmd or "python -m pytest" in cmd:
+                            has_run_test = True
+                            reads_without_test = 0
+                    # ── 测试运行结果 → CompletionState（跨轮累积）──
+                    if tc.name in ("shell_exec", "git") and result.success:
+                        cmd = str(tc.params.get("command", "")).lower()
+                        if ("pytest" in cmd or "unittest" in cmd
+                                or "nosetests" in cmd):
+                            exit_code = int(
+                                (result.metadata or {}).get("exit_code", 0)
+                            )
+                            passed = verify_test_output(result.output or "").passed
+                            if completion:
+                                completion.record_test_result(
+                                    exit_code=exit_code,
+                                    passed=passed,
+                                    step=context.step_count,
+                                )
+                            if passed:
+                                round_tests_passed = True
+                                # ── 防御机制：累计"测试全绿"次数 ──
+                                # 一旦出现 ≥1 次全绿，即具备硬终止资格，
+                                # 防止 success → success → success 无限循环。
+                                prev_green = context.metadata.get("test_success_count", 0)
+                                context.metadata["test_success_count"] = prev_green + 1
+                else:
+                    step_tool_fail += 1
+                # ── Track reads before test ─────────────
+                if tc.name == "read_file" and not has_run_test:
+                    reads_without_test += 1
+                # ── LoopGuard: record every tool call ─────
+                if guard:
+                    guard.record_tool_call(
+                        name=tc.name,
+                        params=tc.params,
+                        success=result.success,
+                        output=result.output or "",
+                        error=result.error,
+                    )
+                # ── ExecutionLog: tool_call + tool_result ──
+                _l = context.metadata.get("__log__")
+                if _l:
+                    try:
+                        _l.record_step(phase="tool_call", action=tc.name,
+                                       tool_name=tc.name, tool_input=tc.params,
+                                       success=True, duration_ms=_dur)
+                        _l.record_step(phase="tool_result", action=tc.name,
+                                       tool_name=tc.name,
+                                       success=result.success,
+                                       tool_output=result.output,
+                                       error=result.error,
+                                       duration_ms=_dur)
+                    except Exception:
+                        pass
+                if on_progress:
+                    tag = "OK" if result.success else "FAIL"
+                    brief = (result.output or result.error or "")[:80]
+                    on_progress("result", f"{tag}: {brief}")
+                # Auto-save key tool results to memory
+                if context.memory:
+                    wm = context.memory.working(context.agent_id)
+                    wm.store(f"tool:{tc.name}", {
+                        "success": result.success,
+                        "output": (result.output or "")[:200],
+                        "error": result.error,
+                    }, namespace="tools")
+                # Add tool results via ContextManager
+                cm.add_tool_result(
+                    name=tc.name,
+                    success=result.success,
+                    output=result.output or "",
+                    error=result.error,
+                )
+            # ── LoopGuard: track no-modification steps ──
+            if guard and not had_modification:
+                guard.record_no_modification()
+
+            # Accumulate tool execution stats to metadata for finalize
+            prev_ok = context.metadata.get("tool_calls_ok", 0)
+            prev_fail = context.metadata.get("tool_calls_fail", 0)
+            context.metadata["tool_calls_ok"] = prev_ok + step_tool_ok
+            context.metadata["tool_calls_fail"] = prev_fail + step_tool_fail
+
+            # ── 硬终止条件（最高优先级）：测试通过 → 任务完成，立即结束执行循环 ──
+            # 一旦成立必须立即 return complete，禁止继续进入下一轮 shell/read/test。
+            # 双重判定：
+            #   1) CompletionState.should_complete()（全绿 + exit0 + 无后续修改）
+            #   2) 防御机制：test_success_count >= 1 —— 已有一次全绿即强制停止，
+            #      杜绝 success → success → success 无限循环。
+            _green_once = context.metadata.get("test_success_count", 0) >= 1
+            if completion and (completion.should_complete() or _green_once):
+                context.metadata["tests_passed"] = True
+                context.metadata["messages"] = cm.get_context()
+                logger.info(
+                    "CompletionState satisfied — terminating (%s, step %d): %s",
+                    context.agent_id, context.step_count, completion.summary(),
+                )
+                _log_stop()
+                _l = context.metadata.get("__log__")
+                if _l:
+                    try:
+                        _l.record_step(phase="complete", action="tests_passed",
+                                       success=True,
+                                       metadata={"step": context.step_count,
+                                                 "reason": completion.summary()})
+                    except Exception:
+                        pass
+                return AgentAction.complete(
+                    output=f"Tests passed. Task completed in {context.step_count} step(s)."
+                )
+
+            # ── Read-limit enforcement ─────────────────────────
+            context.metadata["reads_without_test"] = reads_without_test
+            context.metadata["has_run_test"] = has_run_test
+            read_limit = int(context.config.get("workflow.read_limit", 8))
+            if not has_run_test and reads_without_test >= read_limit:
+                cm.add_message("user",
+                    f"[Workflow] 你已读取 {reads_without_test} 个文件但尚未运行测试。\n"
+                    f"请立即运行 `python -m pytest`（或项目的测试命令），根据测试失败信息修复代码。\n"
+                    f"在运行测试之前不要再读取更多文件。"
+                )
+                # Reset counter to avoid repeated messages
+                context.metadata["reads_without_test"] = 0
+                context.metadata["messages"] = cm.get_context()
+                return AgentAction.cont(
+                    output=f"Read limit reached ({reads_without_test} reads, no tests run yet)"
+                )
+
+            # ── LoopGuard: check for loops ────────────────────
+            if guard:
+                loop_result = guard.check()
+                if loop_result.blocked:
+                    logger.warning(
+                        "LoopGuard blocked: reason=%s, details=%s",
+                        loop_result.reason, loop_result.details,
+                    )
+                    # Reset guard so next step starts fresh
+                    guard.reset()
+                    # Inject blocked info into context so LLM sees it
+                    cm.add_message("user",
+                        f"[LoopGuard] 检测到循环执行模式。\n"
+                        f"原因: {loop_result.reason}\n"
+                        f"建议: {loop_result.suggestion}\n"
+                        f"请尝试完全不同的方法，不要重复之前的操作。"
+                    )
+                    # ── ExecutionLog: loop_guard ─────────
+                    _l = context.metadata.get("__log__")
+                    if _l:
+                        try:
+                            _l.record_step(phase="loop_guard", action="blocked",
+                                           success=False,
+                                           metadata=loop_result.details)
+                        except Exception:
+                            pass
+                    context.metadata["messages"] = cm.get_context()
+                    return AgentAction.cont(
+                        output=f"LoopGuard blocked: {loop_result.reason} (suggestion: {loop_result.suggestion})"
+                    )
+
+            # Context compaction
+            cm.compact()
+
+            # Backward compat: sync to metadata["messages"]
+            context.metadata["messages"] = cm.get_context()
+
+            return AgentAction.cont(output=f"Executed {len(response.tool_calls)} tools")
+
+        # ── Pre-completion check: is the Plan fully executed? ──
+        plan = context.metadata.get("execution_plan")
+        if plan and not plan.is_finished:
+            replan_count = context.metadata.get("replan_count", 0)
+            if replan_count < MAX_REPLANS:
+                context.metadata["replan_count"] = replan_count + 1
+                logger.info(
+                    "Plan not finished, replanning (attempt %d/%d)",
+                    replan_count + 1, MAX_REPLANS,
+                )
+                # Clear old plan, next step will auto-regenerate
+                context.metadata.pop("execution_plan", None)
+                cm.add_message("user",
+                    f"Plan not fully executed ({plan.completed_steps}/{len(plan.steps)} steps done). "
+                    f"Generate a new execution plan for the remaining work."
+                )
+                context.metadata["messages"] = cm.get_context()
+                # ── ExecutionLog: replan ───────────────────
+                _l = context.metadata.get("__log__")
+                if _l:
+                    try:
+                        _l.record_step(phase="replan", action="replan",
+                                       success=True,
+                                       metadata={"attempt": replan_count + 1,
+                                                  "max": MAX_REPLANS,
+                                                  "completed": plan.completed_steps,
+                                                  "total": len(plan.steps)})
+                    except Exception:
+                        pass
+                return AgentAction.cont(
+                    output=f"Replanning (attempt {replan_count + 1}/{MAX_REPLANS})"
+                )
+            else:
+                logger.warning(
+                    "Max replan attempts (%d) exceeded, Plan partially complete: %d/%d",
+                    MAX_REPLANS, plan.completed_steps, len(plan.steps),
+                )
+
+        # Context compaction
+        cm.compact()
+
+        # ── Objective verification ────────────────────────────
+        # Agent must not claim completion based solely on tool call success.
+        vresult = self._auto_verify(context)
+        if vresult is not None:
+            context.metadata["verification"] = vresult
+            # ── ExecutionLog: verification ─────────────────
+            _l = context.metadata.get("__log__")
+            if _l:
+                try:
+                    _l.record_step(phase="verification", action="auto_verify",
+                                   success=vresult.passed,
+                                   tool_output=vresult.summary[:2000],
+                                   metadata={
+                                       "checks": len(vresult.checks),
+                                       "passed_checks": len(vresult.passed_checks),
+                                       "failed_checks": len(vresult.failed_checks),
+                                   })
+                except Exception:
+                    pass
+
+            if not vresult.passed:
+                logger.info("Verification failed: %s", vresult.summary)
+                cm.add_message("user",
+                    f"[Verification Results]\n{vresult.summary}\n"
+                    f"{len(vresult.failed_checks)} check(s) failed. Please fix and retry."
+                )
+                # Inject failure info for the LLM to attempt fixing
+                for fc in vresult.failed_checks[:3]:
+                    cm.add_message("user",
+                        f"[Check: {fc.name}]\n"
+                        f"Strategy: {fc.strategy}\n"
+                        f"Evidence: {fc.evidence[:200]}\n"
+                        f"Error: {fc.error or 'none'}"
+                    )
+                context.metadata["messages"] = cm.get_context()
+                return AgentAction.cont(
+                    output=f"Verification failed: {vresult.summary}"
+                )
+
+            # ── CompletionState: 客观验证通过 → 标记任务目标已达成 ──
+            if completion:
+                completion.mark_objective_met()
+
+        # Backward compat: sync to metadata["messages"]
+        context.metadata["messages"] = cm.get_context()
+
+        # ── ExecutionLog: step complete ──────────────────
+        _l = context.metadata.get("__log__")
+        if _l:
+            try:
+                _l.record_step(phase="complete", action="step_complete",
+                               success=True,
+                               metadata={"step": context.step_count})
+            except Exception:
+                pass
+
+        return AgentAction.complete(output=response.content or "")
+
+    def _auto_verify(self, context: AgentContext) -> VerificationResult | None:
+        """Automatically generate and run objective verification.
+
+        Selects appropriate verification strategies based on context (modified files, tool results).
+        Returns None if no checks are available (treated as passed).
+        """
+        cm: ContextManager | None = context.metadata.get("cm")
+
+        modified_files = []
+        tool_results = []
+
+        if cm:
+            modified_files = cm._modified_files
+            tool_results = cm._tool_results
+
+        # Supplement from metadata tool stats
+        if not tool_results:
+            ok = context.metadata.get("tool_calls_ok", 0)
+            fail = context.metadata.get("tool_calls_fail", 0)
+            if ok == 0 and fail == 0:
+                return None  # No tools executed, skip verification
+
+        if not modified_files and not tool_results:
+            return None  # Nothing to check
+
+        ws_path = context.workspace
+        result = auto_generate_checks(modified_files, tool_results, ws_path)
+        logger.info("Verification complete: %s (%d/%d)", result.summary,
+                     sum(1 for c in result.checks if c.passed), len(result.checks))
+        return result
+
+    async def finalize(self, context: AgentContext) -> AgentResult:
+        """Finalize agent execution.
+
+        Determines actual status by priority (highest first):
+          1. timed_out → TIMEOUT (max_steps exhausted)
+          2. step_failed → FAILED (step() returned fail with error)
+          3. replan exhausted + Plan incomplete → FAILED
+          4. All tools failed → FAILED
+          5. Verification failed → FAILED
+          6. Everything else → COMPLETED
+        """
+        timed_out = context.metadata.get("timed_out", False)
+        step_failed = context.metadata.get("step_failed", False)
+        tool_ok = context.metadata.get("tool_calls_ok", 0)
+        tool_fail = context.metadata.get("tool_calls_fail", 0)
+        replan_count = context.metadata.get("replan_count", 0)
+        plan = context.metadata.get("execution_plan")
+
+        error: str | None = None
+
+        if timed_out:
+            status = AgentState.TIMEOUT
+            logger.info(
+                "SWEAgent timeout: %s (%d steps)",
+                context.agent_id, context.step_count,
+            )
+        elif step_failed:
+            status = AgentState.FAILED
+            error = str(step_failed) if step_failed is not True else None
+            logger.info(
+                "SWEAgent step failed: %s (%s)",
+                context.agent_id, error or "unknown error",
+            )
+        elif replan_count >= MAX_REPLANS and plan and not plan.is_finished:
+            status = AgentState.FAILED
+            logger.info(
+                "SWEAgent Plan incomplete with replan exhausted: %s (%d/%d steps, %d replans)",
+                context.agent_id, plan.completed_steps, len(plan.steps), replan_count,
+            )
+        elif tool_fail > 0 and (tool_ok == 0 or tool_fail >= tool_ok):
+            status = AgentState.FAILED
+            logger.info(
+                "SWEAgent tool calls failed: %s (%d steps, %d/%d tool calls failed)",
+                context.agent_id, context.step_count, tool_fail, tool_fail + tool_ok,
+            )
+        else:
+            # Check verification — failed verification must not result in COMPLETED
+            vresult: VerificationResult | None = context.metadata.get("verification")
+            if vresult is not None and not vresult.passed:
+                status = AgentState.FAILED
+                logger.info(
+                    "SWEAgent verification failed: %s (%s)",
+                    context.agent_id, vresult.summary,
+                )
+            else:
+                status = AgentState.COMPLETED
+
+        result = AgentResult(
+            agent_id=self.agent_id,
+            status=status,
+            output=context.metadata.get("output", ""),
+            steps=context.step_count,
+            error=error,
+        )
+        logger.info(
+            "SWEAgent finished: %s (%d steps, status=%s)",
+            self.agent_id, result.steps, status.value,
+        )
+        return result
