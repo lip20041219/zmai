@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+coverage/
+
+# Type checking
+.mypy_cache/
+.ruff_cache/
+
+# Project specific
+.claude/
+DOCTOR.md
+workspace/
+temp/
+agent_workspace/
+logs/
+
+# Runtime artifacts / local test files (never commit)
+final_test_result.txt
+process_result.json
+process_result_backup.json
+sample.json
+test.json
+test_input.json
+test_issue.txt
+zmai.json
+zmai_doc_*.txt

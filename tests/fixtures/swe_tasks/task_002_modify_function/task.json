@@ -1,0 +1,15 @@
+{
+    "id": "task_002_modify_function",
+    "description": "string_utils.py 缺少 is_palindrome(text) 函数。添加它：接收字符串，返回 bool 表示是否为回文（忽略大小写和空格）。",
+    "expected": "is_palindrome 添加成功，所有测试通过",
+    "hint": "需要添加 is_palindrome() 函数定义。移除空格和标点，转为小写，然后比较反转。",
+    "files": [
+        "string_utils.py"
+    ],
+    "verification": {
+        "setup": "cd project && copy nul __init__.py",
+        "command": "cd project && python -m pytest check_string_utils.py -v",
+        "expected_output": "passed|PASSED|OK",
+        "timeout": 15
+    }
+}

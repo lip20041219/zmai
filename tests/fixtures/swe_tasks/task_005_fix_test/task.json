@@ -1,0 +1,15 @@
+{
+    "id": "task_005_fix_test",
+    "description": "user_manager.py 的 validate_email() 正则太宽松（.+@.+），把 \"not-an-email\" 也判为有效。修复正则使其正确验证邮箱格式。",
+    "expected": "validate_email 正确识别有效/无效邮箱，所有测试通过",
+    "hint": "validate_email 的正则模式 '.+@.+' 只需要有 @ 就通过。应该写一个更严格的邮箱格式正则。",
+    "files": [
+        "user_manager.py"
+    ],
+    "verification": {
+        "setup": "cd project && copy nul __init__.py",
+        "command": "cd project && python -m pytest check_user_manager.py -v",
+        "expected_output": "passed|PASSED|OK",
+        "timeout": 15
+    }
+}

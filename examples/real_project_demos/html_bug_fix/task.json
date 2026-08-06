@@ -1,0 +1,12 @@
+{
+    "id": "demo_html_responsive",
+    "description": "首页缺少响应式设计：缺少 viewport meta 标签、about 区域使用固定 min-width 导致移动端溢出、service-cards 不换行、无 media queries。修复所有问题。",
+    "expected": "页面在移动端正常显示，所有内容不溢出",
+    "files": ["index.html", "style.css"],
+    "verification": {
+        "setup": "",
+        "command": "python -c \"import re; html=open('project/index.html').read(); css=open('project/style.css').read(); assert 'viewport' in html, 'missing viewport'; assert 'flex-wrap' in css or 'media' in css or '@media' in css, 'missing responsive CSS'; print('Responsive OK')\"",
+        "expected_output": "Responsive OK",
+        "timeout": 10
+    }
+}

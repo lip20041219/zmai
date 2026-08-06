@@ -1,0 +1,26 @@
+repos:
+  - repo: local
+    hooks:
+      - id: check-api-keys
+        name: Check for API keys in source code
+        description: Prevents committing API keys (sk- patterns) to the repository
+        entry: >
+          bash -c '
+          FOUND=$(grep -rn "sk-"
+            --include="*.py" --include="*.md" --include="*.json"
+            --include="*.yaml" --include="*.yml" --include="*.toml"
+            --include="*.cfg" --include="*.ini" --include="*.env"
+            --include="*.example" --include="*.sample"
+            --exclude-dir="__pycache__" --exclude-dir=".git"
+            --exclude-dir="node_modules" --exclude-dir=".venv"
+            --exclude-dir=".claude" --exclude-dir=".github"
+            . 2>/dev/null |
+            grep -v "sk-your\|sk-test\|YOUR_API_KEY\|replace_me\|placeholder\|sk-.*example" || true)
+          if [ -n "$FOUND" ]; then
+            echo "ERROR: Potential API keys found:"
+            echo "$FOUND"
+            exit 1
+          fi
+          '
+        language: system
+        stages: [commit]
