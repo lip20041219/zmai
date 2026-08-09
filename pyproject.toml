@@ -41,6 +41,8 @@ zmai = "zmai.cli.main:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "ruff>=0.1", "mypy>=1.0"]
+# tests/test_swe_fix_driving.py 用真实 Flask 项目验证端到端修复闭环
+test = ["pytest>=7", "flask>=3"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
