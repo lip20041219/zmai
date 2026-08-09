@@ -169,7 +169,12 @@ Do NOT skip phases. Do NOT reorder phases.
 4. Do NOT use shell for file/text search — use the grep tool
 5. Do not repeatedly ls/dir without purpose
 6. A "Requirements:" / numbered-list section in the user's task is a set of CONSTRAINTS, NOT separate tasks. Lines like "run tests" or "stop after success" tell you HOW to work on your single objective — never spin them into independent sub-tasks, and never keep working after your objective is met.
-7. NEVER run a bare `pytest`. Always run tests via `python -m pytest` (or `.venv/Scripts/python -m pytest` on Windows)."""
+7. NEVER run a bare `pytest`. Always run tests via `python -m pytest` (or `.venv/Scripts/python -m pytest` on Windows).
+8. AFTER A TEST FAILURE YOU MUST FIX IT — once you have run tests and seen failures, you are in the FIX PHASE. Read a few related source files to diagnose, THEN make the change with the `edit` or `write_file` tool. Do NOT keep reading file after file without modifying.
+9. READ-TO-FIX LIMIT — after a test failure, you may read at most a few (default 3) files before you MUST emit an `edit` or `write_file` call to fix the code. If you have not modified anything after reading 3 files post-failure, STOP reading and make your best fix now.
+10. NEVER loop: test-fail → read → test-fail → read with no modification. Each pass must move toward an edit. If your read is not advancing you toward a concrete fix, make the fix.
+11. FIX-DRIVEN TOOL CADENCE (mandatory when tests FAIL) — the ONLY acceptable tool sequence is: `shell_exec` (run pytest) → at most 3 `read_file`/`grep` to diagnose → an `edit` or `write_file` that changes code → `shell_exec` (rerun pytest). If you are in the fix phase and you call `read_file` or `grep` without having made a code change, you are failing the task.
+12. The runtime reports a "LIVE REPAIR STATUS" section each step. If it says tests are FAILING, your very next write tool call (`edit` or `write_file`) is MANDATORY — stop reading and make the edit now, even if you are not fully certain of the fix. A verifiable edit is strictly better than endless reading."""
 
 _PLAN_EXECUTION_PROMPT = """
 ## Execution Plan (mandatory)
@@ -178,6 +183,37 @@ Below is the plan you must follow when executing this task.
 Proceed step by step in the specified order. After each step, explicitly mark "Step X complete".
 If a step cannot be executed as planned, explain why and provide an alternative.
 After completing all steps, summarize the results."""
+
+
+def _build_fix_state_directive(context: AgentContext) -> str:
+    """每次 step 把当前修复状态注入 system prompt，让模型"看到"自己的只读进展。
+
+    对真实 LLM 而言，静态提示词（"你必须修改"）远不如动态状态来得有效：
+    模型每个 step 都会读到"测试已失败 / 已读 N 个文件 / 尚未修改"，从而被
+    明确逼入修改阶段。这是 FixDriving 循环兜底的补充（消息注入是异步的，这里
+    是每次调用都强制出现在模型上下文里）。
+    """
+    phase = context.metadata.get("repair_phase", "idle")
+    if phase == "idle":
+        return ""  # 尚未进入修复态，不注入噪音
+    test_failed = context.metadata.get("test_failed", False)
+    reads_after_fail = context.metadata.get("reads_after_fail", 0)
+    cfg = context.config or {}
+    limit = int(cfg.get("fix.read_limit", 3))
+    lines = ["\n## LIVE REPAIR STATUS (dynamic, act on this now)"]
+    lines.append(f"- repair phase: {phase}")
+    if test_failed:
+        lines.append(
+            f"- tests are FAILING → you MUST emit `edit` or `write_file` to fix "
+            f"(you have used {reads_after_fail}/{limit} reads since the failure)"
+        )
+        lines.append(
+            "- DO NOT call read_file/grep again without a code change. "
+            "Your next write tool call is required."
+        )
+    else:
+        lines.append("- tests are passing or not yet run; keep verifying.")
+    return "\n".join(lines) + "\n"
 
 
 def _build_system_prompt(backend: Backend | None = None) -> str:
@@ -251,6 +287,14 @@ class SWEAgent(Agent):
             context.metadata["reads_without_test"] = 0
             context.metadata["workflow_phase"] = "discover"
             logger.info("Workflow phase initialized: discover")
+
+        # ── Repair phase state machine (test fail → diagnose → plan → edit → verify) ──
+        # 测试失败后，Agent 必须走完"诊断→计划→修改→验证"的修复闭环，而不是只读不修。
+        # 这是对 LoopGuard 的补充：LoopGuard 负责"检测停滞"，repair_phase 负责"驱动进展"。
+        if "repair_phase" not in context.metadata:
+            context.metadata["repair_phase"] = "idle"  # idle|diagnose|plan|edit|verify|done
+            context.metadata["repair_plan_injected"] = False
+            context.metadata["repair_cycle"] = 0
 
         # State is managed by Runtime's LifecycleManager; agent does not maintain independent state
         if context.tools:
@@ -391,6 +435,8 @@ class SWEAgent(Agent):
 
         bc = context.backend.config if hasattr(context.backend, "config") else {}
         system_prompt = _build_system_prompt(backend=context.backend) + memory_context
+        # 注入当前修复状态：让模型每个 step 都看到"测试失败/已读N文件/必须修改"
+        system_prompt += _build_fix_state_directive(context)
 
         # ── Inject repository structure into system prompt ────────
         repo_info: RepositoryInfo | None = context.metadata.get("repo_info")
@@ -475,6 +521,15 @@ class SWEAgent(Agent):
             # ── Read-limit tracking ──────────────────────────
             reads_without_test = context.metadata.get("reads_without_test", 0)
             has_run_test = context.metadata.get("has_run_test", False)
+            # ── Fix-driving tracking (test failed → must modify) ──
+            # 测试失败后：允许有限读取分析，但达到阈值仍无修改 → 强制注入修改提示。
+            fix_read_limit = int(context.config.get("fix.read_limit", 3))
+            test_failed = context.metadata.get("test_failed", False)
+            reads_after_fail = context.metadata.get("reads_after_fail", 0)
+            # ── Repair phase 状态机（跨步持久化）──
+            # 驱动：idle→diagnose(测试失败)→plan(注入修复计划)→edit(修改成功)→verify(测试通过)→done
+            repair_phase = context.metadata.get("repair_phase", "idle")
+            repair_plan_injected = context.metadata.get("repair_plan_injected", False)
             for tc in response.tool_calls:
                 if on_progress:
                     on_progress("tool", tc.name)
@@ -494,42 +549,107 @@ class SWEAgent(Agent):
                     step_tool_ok += 1
                     if tc.name in ("write_file", "edit", "git"):
                         had_modification = True
+                        # 修改成功 → 退出修复态（已产生进展），进入"修改"阶段
+                        test_failed = False
+                        reads_after_fail = 0
+                        repair_phase = "edit"
                         # ── CompletionState: 任何修改使旧测试结果失效 ──
                         if completion:
                             completion.record_modification(step=context.step_count)
-                    # ── Read-limit: detect test runs ──
-                    if tc.name == "shell_exec" and result.success:
-                        cmd = str(tc.params.get("command", "")).lower()
-                        if "pytest" in cmd or "python -m pytest" in cmd:
-                            has_run_test = True
-                            reads_without_test = 0
-                    # ── 测试运行结果 → CompletionState（跨轮累积）──
-                    if tc.name in ("shell_exec", "git") and result.success:
-                        cmd = str(tc.params.get("command", "")).lower()
-                        if ("pytest" in cmd or "unittest" in cmd
-                                or "nosetests" in cmd):
-                            exit_code = int(
-                                (result.metadata or {}).get("exit_code", 0)
-                            )
-                            passed = verify_test_output(result.output or "").passed
-                            if completion:
-                                completion.record_test_result(
-                                    exit_code=exit_code,
-                                    passed=passed,
-                                    step=context.step_count,
-                                )
-                            if passed:
-                                round_tests_passed = True
-                                # ── 防御机制：累计"测试全绿"次数 ──
-                                # 一旦出现 ≥1 次全绿，即具备硬终止资格，
-                                # 防止 success → success → success 无限循环。
-                                prev_green = context.metadata.get("test_success_count", 0)
-                                context.metadata["test_success_count"] = prev_green + 1
                 else:
                     step_tool_fail += 1
+                # ── 测试运行检测（无论成败）──
+                # 关键：pytest 失败时 ShellTool 走 error 分支（result.success=False），
+                # 必须依然检测，否则 agent 永远不知道"测试失败"、无法进入修复阶段。
+                # 因此该检测放在 result.success 分支之外，pytest 成败都执行。
+                if tc.name == "shell_exec":
+                    _cmd_l = str(tc.params.get("command", "")).lower()
+                    if "pytest" in _cmd_l or "python -m pytest" in _cmd_l:
+                        has_run_test = True
+                        reads_without_test = 0
+                if tc.name in ("shell_exec", "git"):
+                    _cmd_l = str(tc.params.get("command", "")).lower()
+                    if ("pytest" in _cmd_l or "unittest" in _cmd_l
+                            or "nosetests" in _cmd_l):
+                        exit_code = int(
+                            (result.metadata or {}).get("exit_code", 0)
+                        )
+                        # 失败时 output 为空、错误在 error 里；合并供 verify_test_output 判定
+                        test_out = (result.output or "") + (result.error or "")
+                        passed = (exit_code == 0) and verify_test_output(test_out).passed
+                        if completion:
+                            completion.record_test_result(
+                                exit_code=exit_code,
+                                passed=passed,
+                                step=context.step_count,
+                            )
+                        if passed:
+                            round_tests_passed = True
+                            # 测试通过 → 退出修复态，清空失败后读取计数，进入"验证"阶段
+                            test_failed = False
+                            reads_after_fail = 0
+                            repair_phase = "verify"
+                            # 立即持久化：后续可能因全绿硬终止提前 return，避免阶段停留在 edit
+                            context.metadata["repair_phase"] = "verify"
+                            # ── 防御机制：累计"测试全绿"次数 ──
+                            # 一旦出现 ≥1 次全绿，即具备硬终止资格，
+                            # 防止 success → success → success 无限循环。
+                            prev_green = context.metadata.get("test_success_count", 0)
+                            context.metadata["test_success_count"] = prev_green + 1
+                        else:
+                            # 测试失败 → 进入修复态：强制后续进入修改阶段
+                            test_failed = True
+                            reads_after_fail = 0
+                            # 一旦测试曾失败，则只有"全绿重测"才能判定完成（粘性标记）
+                            context.metadata["tests_ever_failed"] = True
+                            if repair_phase != "edit":
+                                repair_phase = "diagnose"
+                            # ── 首次失败注入具体修复计划（让 Agent 制定修改方案而非只分析）──
+                            if not repair_plan_injected:
+                                repair_plan_injected = True
+                                repair_phase = "plan"
+                                _fail_text = (result.output or "") + (result.error or "")
+                                # ── P2: 语义化失败解析 ──
+                                # ── P1: 基于语义失败生成有序修复计划 ──
+                                # 整个解析/生成块用 try 兜底：即使模块缺失或解析失败，
+                                # 也不能让 Agent step 崩溃（Repair Plan 是增强而非硬依赖）。
+                                _plan_msg = ""
+                                try:
+                                    from zmai.swe.failure import (
+                                        format_failure, parse_test_failure,
+                                    )
+                                    from zmai.swe.fix_planner import (
+                                        format_plan, generate_fix_plan,
+                                    )
+                                    _issue = parse_test_failure(_fail_text)
+                                    if _issue is not None:
+                                        _plan = generate_fix_plan(_issue)
+                                        _plan_msg = "\n" + format_failure(_issue) \
+                                                    + "\n" + format_plan(_plan)
+                                except Exception:
+                                    _plan_msg = ""
+                                cm.add_message("user",
+                                    "[Repair Plan] 测试失败。请按以下闭环立即修复（不要只读不修）：\n"
+                                    "1. 诊断：从上面的失败信息找出根因（必要时只读取最相关的 1-2 个源码文件）\n"
+                                    "2. 计划：明确要修改哪个文件、添加或改动什么代码\n"
+                                    "3. 修改：用 `edit` 或 `write_file` 工具实施修改\n"
+                                    "4. 验证：重新运行 `python -m pytest`，直到通过\n"
+                                    f"\n失败分析：\n{_fail_text[:800]}\n{_plan_msg}"
+                                )
+                                _l = context.metadata.get("__log__")
+                                if _l:
+                                    try:
+                                        _l.record_step(phase="repair", action="inject_plan",
+                                                       success=False,
+                                                       metadata={"cycle": context.metadata.get("repair_cycle", 0)})
+                                    except Exception:
+                                        pass
                 # ── Track reads before test ─────────────
                 if tc.name == "read_file" and not has_run_test:
                     reads_without_test += 1
+                # ── Fix-driving: 测试失败后只读不修，累计读取计数 ──
+                if tc.name == "read_file" and test_failed and not had_modification:
+                    reads_after_fail += 1
                 # ── LoopGuard: record every tool call ─────
                 if guard:
                     guard.record_tool_call(
@@ -614,6 +734,11 @@ class SWEAgent(Agent):
             # ── Read-limit enforcement ─────────────────────────
             context.metadata["reads_without_test"] = reads_without_test
             context.metadata["has_run_test"] = has_run_test
+            context.metadata["test_failed"] = test_failed
+            context.metadata["reads_after_fail"] = reads_after_fail
+            # ── Repair phase 状态机持久化（跨步驱动诊断→计划→修改→验证）──
+            context.metadata["repair_phase"] = repair_phase
+            context.metadata["repair_plan_injected"] = repair_plan_injected
             read_limit = int(context.config.get("workflow.read_limit", 8))
             if not has_run_test and reads_without_test >= read_limit:
                 cm.add_message("user",
@@ -626,6 +751,38 @@ class SWEAgent(Agent):
                 context.metadata["messages"] = cm.get_context()
                 return AgentAction.cont(
                     output=f"Read limit reached ({reads_without_test} reads, no tests run yet)"
+                )
+
+            # ── Fix-driving enforcement ────────────────────────
+            # 测试失败后只读不修达到阈值 → 强制进入修改阶段（读取永远无法让测试通过）。
+            if test_failed and reads_after_fail >= fix_read_limit:
+                logger.warning(
+                    "FixDriving: test failed, %d reads after failure without modification — forcing fix phase",
+                    reads_after_fail,
+                )
+                if guard:
+                    guard.reset()  # 给予全新方向，避免 no_progress 误伤分析阶段
+                repair_phase = "plan"  # 强制回到"计划→修改"，阻断只读停滞
+                cm.add_message("user",
+                    f"[FixDriving] 测试已失败，但你已读取 {reads_after_fail} 个相关文件仍未修改代码（当前阶段：{repair_phase}）。\n"
+                    f"读取不会让测试通过——你必须做出修改。\n"
+                    f"请停止读取，立即用 `edit` 或 `write_file` 工具修改代码来修复失败的测试。\n"
+                    f"先做出你认为正确的修改，然后重新运行 `python -m pytest` 验证。"
+                )
+                context.metadata["reads_after_fail"] = 0
+                context.metadata["messages"] = cm.get_context()
+                # ── ExecutionLog: fix_driving ─────────
+                _l = context.metadata.get("__log__")
+                if _l:
+                    try:
+                        _l.record_step(phase="fix_driving", action="force_modify",
+                                       success=False,
+                                       metadata={"reads_after_fail": reads_after_fail,
+                                                 "limit": fix_read_limit})
+                    except Exception:
+                        pass
+                return AgentAction.cont(
+                    output=f"Test failed, forced into fix phase after {reads_after_fail} reads"
                 )
 
             # ── LoopGuard: check for loops ────────────────────
@@ -763,6 +920,33 @@ class SWEAgent(Agent):
                                metadata={"step": context.step_count})
             except Exception:
                 pass
+
+        # ── 修复审计：修改后未重测且测试曾失败 → 不得判定 completed ──
+        # 防止"edit 后 end_turn 却仅凭 file_exists/git_diff 被误判完成"：
+        # 一旦本任务测试曾失败，就必须先有一次全绿重测（completion.tests_passed）
+        # 才能完成。否则强制进入重测，绝不带着未通过的测试 claim 完成。
+        _tests_failed_ever = context.metadata.get("tests_ever_failed", False)
+        if _tests_failed_ever and completion and not completion.tests_passed:
+            logger.warning(
+                "Completion blocked: tests failed earlier but no green re-run; "
+                "forcing pytest re-test instead of completing"
+            )
+            cm.add_message("user",
+                "[Workflow] 你修改了代码，但自上次失败后还没有一次通过的测试运行。\n"
+                "不要停止——请重新运行 `python -m pytest` 验证你的修改。\n"
+                "只有测试全部通过才算完成。"
+            )
+            context.metadata["messages"] = cm.get_context()
+            _l = context.metadata.get("__log__")
+            if _l:
+                try:
+                    _l.record_step(phase="completion_guard", action="block_unverified",
+                                   success=False,
+                                   metadata={"tests_failed_ever": True,
+                                             "tests_passed": completion.tests_passed})
+                except Exception:
+                    pass
+            return AgentAction.cont(output="Modified but not re-tested; forcing pytest re-run")
 
         return AgentAction.complete(output=response.content or "")
 

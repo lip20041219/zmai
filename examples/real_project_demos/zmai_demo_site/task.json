@@ -1,0 +1,12 @@
+{
+    "id": "demo_zmai_site",
+    "description": "ZMAI Demo 网站含 3 个 bug：首页 404（缺路由）、/api/users 返回字段名错误（应为 user）、/button 方法错误（应支持 GET）。修复这个网站所有bug，使测试全部通过。",
+    "expected": "test_home_shows_welcome / test_users_api_works / test_button_works 全部通过；网站可访问",
+    "files": ["app.py"],
+    "verification": {
+        "setup": "cd project && pip install flask pytest -q",
+        "command": "cd project && python -m pytest -v",
+        "expected_output": "3 passed",
+        "timeout": 30
+    }
+}
