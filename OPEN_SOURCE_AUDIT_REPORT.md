@@ -17,7 +17,7 @@
 | 真实能力 | SWE Agent 真实运行：读 ISSUE → 先跑测试 → 定位 → 改代码 → 验证 → 自动停止（6 步完成，4/4 测试通过） | ✅ 已验证 |
 | 工程规范 | CI (GitHub Actions 双 OS × 3 Python)、pre-commit API key 检测、Keep a Changelog、SemVer、SECURITY.md 完整、docs/ 含 ARCHITECTURE.md + 20+ 设计文档 | ✅ 规范 |
 | 发布状态 | dist/ 有 0.1.0 构建产物，但 **git 仓库 0 commit**、未发布 PyPI、无真实用户 | ❌ 未开源 |
-| 基准数据 | BENCHMARK.md 显示 20% 成功率 (1/5)，且 Token Usage 全为 0（无效基准） | ❌ 弱 |
+| 基准数据 | BENCHMARK.md 旧数据已作废（20% 成功率 + Token 0 不可复现），已重写为正式 benchmark 状态说明（✅ 已解决 2026-08-07） | ✅ 已解决 |
 | 文档一致性 | README 宣称 "600+ tests"（实际 1252）等数字过时；Demo 区 GIF 为 TODO | ⚠️ 待更新 |
 
 **结论**: 代码与测试达到 Beta 上沿，但"git 零提交 + 基准无效 + 文档数字过时"三项使其**尚未达到开源发布标准**。整理后 1-2 天可达标。
@@ -37,7 +37,7 @@
    - "600+ tests" → 实际 **1252 collected / 1245 passed**
    - "Zero dependencies" 声明核实（pyproject dependencies=[] 属实 ✅）
 3. **处理无效的 BENCHMARK.md**
-   - 20% 成功率 + 0 token 的旧数据（2026-07-29）会吓退评估者，且无法复现
+   - 20% 成功率 + 0 token 的旧数据（2026-07-29）会吓退评估者，且无法复现 → ✅ 已解决（2026-08-07 重写为正式状态说明，声明 SWE-bench 未评测 + 保留真实验证）
    - 选项 A：删除，改为 "SWE-bench Lite 评估中"
    - 选项 B：用真实 API 重跑 5 任务 benchmark，发布真实数据
 
@@ -157,7 +157,7 @@ graph TB
 
 **需注意**：
 - 竞争力取决于 LLM API 成本（无 key 无法演示）→ 面试演示用 DeepSeek（便宜）
-- 20% benchmark 旧数据不要主动展示；用"修复 demo 真实录屏"代替
+- 旧 20% benchmark 数据已从 BENCHMARK.md 移除（不可复现）；对外展示用 BENCHMARK.md 状态说明中的真实验证 + "修复 demo 真实录屏"
 - 建议简历措辞："自主软件工程 Agent 运行时（零依赖），实现完成判定、循环防护、验证闭环，1250+ 测试"——一句话讲清原理（符合用户答辩风格）
 
 **定位建议**: 这是"AI 应用层工程"项目，适合投 AI 应用/后端/平台工程岗；简历价值 > 单纯调 API 的 demo 项目。
