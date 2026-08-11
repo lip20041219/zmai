@@ -488,7 +488,8 @@ class GrepTool(Tool):
             result = ToolResult.err(f"regex error: {e}")
             _emit_tool_result(self.name, context, params, result, _st); return result
 
-        root = context.project_path or context.workspace_path
+        # project_path/workspace_path 可能是 str，统一转 Path（否则 root.glob 崩溃）
+        root = Path(context.project_path or context.workspace_path)
         results = []
         total = 0
         _IGNORE_DIRS = {".git", "node_modules", "__pycache__",
