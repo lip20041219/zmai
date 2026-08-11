@@ -28,7 +28,7 @@ from zmai.swe.tools import (
     ShowToUserTool,
     WriteFileTool,
 )
-from zmai.tool import ToolCall, ToolContext
+from zmai.tool import ToolCall, ToolContext, ToolResult
 from zmai.swe.verifier import (
     VerificationCheck,
     VerificationResult,
@@ -543,7 +543,17 @@ class SWEAgent(Agent):
                 _ts = _now_ms()
                 # 用 execute_tool 容错分发：LLM 幻觉出不存在的工具名时返回
                 # 结构化 tool_not_found 错误并写入日志，Agent 据此重新规划。
-                result = context.tools.execute_tool(tc.name, tc.params, tctx)
+                # ── FixDriving 硬拦截：强制修改阶段禁止继续读取 ──
+                # 测试失败且已达到读取阈值后，read_file/grep 只会让 agent 继续空转。
+                # 结构性阻断读取，逼 agent 下一步只能是 edit/write_file（或重跑 pytest）。
+                _force_edit = context.metadata.get("force_edit", False)
+                if _force_edit and tc.name in ("read_file", "grep"):
+                    result = ToolResult.err(
+                        "[FixDriving] 强制修改阶段：测试已失败且你已读取足够多文件。"
+                        "禁止再次 read_file/grep —— 立即用 edit 或 write_file 修改代码修复失败的测试。"
+                    )
+                else:
+                    result = context.tools.execute_tool(tc.name, tc.params, tctx)
                 _dur = _now_ms() - _ts
                 if result.success:
                     step_tool_ok += 1
@@ -552,6 +562,7 @@ class SWEAgent(Agent):
                         # 修改成功 → 退出修复态（已产生进展），进入"修改"阶段
                         test_failed = False
                         reads_after_fail = 0
+                        context.metadata["force_edit"] = False
                         repair_phase = "edit"
                         # ── CompletionState: 任何修改使旧测试结果失效 ──
                         if completion:
@@ -763,6 +774,8 @@ class SWEAgent(Agent):
                 if guard:
                     guard.reset()  # 给予全新方向，避免 no_progress 误伤分析阶段
                 repair_phase = "plan"  # 强制回到"计划→修改"，阻断只读停滞
+                # 结构性拦截：下一轮起禁止 read_file/grep，直到 agent 产生一次修改
+                context.metadata["force_edit"] = True
                 cm.add_message("user",
                     f"[FixDriving] 测试已失败，但你已读取 {reads_after_fail} 个相关文件仍未修改代码（当前阶段：{repair_phase}）。\n"
                     f"读取不会让测试通过——你必须做出修改。\n"
@@ -1020,23 +1033,34 @@ class SWEAgent(Agent):
                 "SWEAgent Plan incomplete with replan exhausted: %s (%d/%d steps, %d replans)",
                 context.agent_id, plan.completed_steps, len(plan.steps), replan_count,
             )
-        elif tool_fail > 0 and (tool_ok == 0 or tool_fail >= tool_ok):
+        # 测试曾全绿通过是"目标已达成"的决定性信号。
+        # 修复过程中必然会出现多次失败 pytest（tool_fail 累积），
+        # 若最终测试已通过，不得再被 tool_fail 比例误判为 FAILED。
+        elif (
+            not (
+                context.metadata.get("tests_passed", False)
+                or context.metadata.get("test_success_count", 0) >= 1
+            )
+            and tool_fail > 0
+            and (tool_ok == 0 or tool_fail >= tool_ok)
+        ):
             status = AgentState.FAILED
             logger.info(
                 "SWEAgent tool calls failed: %s (%d steps, %d/%d tool calls failed)",
                 context.agent_id, context.step_count, tool_fail, tool_fail + tool_ok,
             )
-        else:
+        elif (
+            (vresult := context.metadata.get("verification")) is not None
+            and not vresult.passed
+        ):
             # Check verification — failed verification must not result in COMPLETED
-            vresult: VerificationResult | None = context.metadata.get("verification")
-            if vresult is not None and not vresult.passed:
-                status = AgentState.FAILED
-                logger.info(
-                    "SWEAgent verification failed: %s (%s)",
-                    context.agent_id, vresult.summary,
-                )
-            else:
-                status = AgentState.COMPLETED
+            status = AgentState.FAILED
+            logger.info(
+                "SWEAgent verification failed: %s (%s)",
+                context.agent_id, vresult.summary,
+            )
+        else:
+            status = AgentState.COMPLETED
 
         result = AgentResult(
             agent_id=self.agent_id,

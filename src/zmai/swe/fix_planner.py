@@ -80,10 +80,21 @@ def _field_steps(issue: FailureIssue) -> list[str]:
     ]
 
 
+def _encoding_steps(issue: FailureIssue) -> list[str]:
+    """文件编码读取失败（UnicodeDecodeError / GBK 读 UTF-8）的修复步骤。"""
+    return [
+        "1. 定位读取该文件的 read_text()/read() 调用",
+        "2. 在该调用上显式指定 encoding='utf-8'（Windows 默认 GBK 无法读取 UTF-8 文件）",
+        "3. 用 `edit` 或 `write_file` 修改该处编码参数",
+        "4. 运行 `python -m pytest` 验证",
+    ]
+
+
 # 失败类型 → 专属步骤生成器
 _STEP_GENERATORS: dict[str, object] = {
     "NotFound": _route_steps,
     "MissingField": _field_steps,
+    "EncodingError": _encoding_steps,
 }
 
 

@@ -110,12 +110,22 @@ _SEMANTIC_RULES: list[tuple[str, str, str, list[str]]] = [
             "检查函数调用参数的类型是否匹配",
         ],
     ),
+    (
+        r"UnicodeDecodeError:\s*'([^']+)' codec can't decode",
+        "文件读取编码错误：Windows 用 '{0}'（默认 GBK）读取 UTF-8 文件失败。",
+        "EncodingError",
+        [
+            "在 read_text/read() 调用上显式指定 encoding='utf-8'",
+            "或把源文件另存为 '{0}' 编码",
+            "确认目标文件确实是 UTF-8 编码（而非 '{0}'）",
+        ],
+    ),
 ]
 
 _ERROR_TYPE_RE = re.compile(
     r"^(?P<error>AssertionError|KeyError|NameError|TypeError|ImportError|"
     r"ModuleNotFoundError|AttributeError|IndexError|ValueError|RuntimeError|"
-    r"SyntaxError)\b"
+    r"SyntaxError|UnicodeDecodeError)\b"
 )
 
 
