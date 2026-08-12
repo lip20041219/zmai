@@ -454,3 +454,63 @@ class TestNoFalseCompletionAfterEdit:
         ctx, action = asyncio.run(_run_agent(project, backend))
 
         assert action.type == "complete", f"重测全绿应正常完成: {action.type}: {action.output}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 测试 6: FixDriving 粘性 —— 失败 pytest 重跑不能逃逸强制修改
+# ═══════════════════════════════════════════════════════════════════
+#
+# 真实故障：force_edit 只拦 read_file/grep 时，执着的 LLM 可反复用
+# shell_exec 重跑失败的 pytest 来"逃逸"（失败重跑会清零 reads_after_fail），
+# 导致 agent 无限 read/重跑、永远不到 edit，直到 LoopGuard → 超时。
+# 本测试证明：force_edit 激活后，shell_exec pytest 重跑同样被拦截，
+# agent 被确定性地逼入 edit/write_file，最终修复并全绿完成。
+
+
+class TestFixDrivingStickyEscape:
+    def test_failing_pytest_rerun_blocked_after_force_edit(self, tmp_path: Path):
+        """force_edit 后重跑失败 pytest 被拦截 → agent 只能 edit → 全绿完成。"""
+        project = tmp_path / "flask_app11"
+        _write_flask_project(project)
+
+        # step1 pytest(失败) → step2 连续3次read(触发force_edit)
+        # step3 再次shell_exec pytest(必须被拦截，证明无法逃逸)
+        # step4 edit(唯一被允许的推进动作) → step5 pytest(全绿) → 完成
+        script: list[list[ToolCall] | None] = [
+            [ToolCall(id="1", name="shell_exec",
+                      params={"command": "python -m pytest -q"})],
+            [ToolCall(id="2", name="read_file", params={"path": "app.py"}),
+             ToolCall(id="3", name="read_file", params={"path": "app.py"}),
+             ToolCall(id="4", name="read_file", params={"path": "app.py"})],
+            [ToolCall(id="5", name="shell_exec",
+                      params={"command": "python -m pytest -q"})],
+            [ToolCall(id="6", name="edit",
+                      params={"path": "app.py", "mode": "regex_replace",
+                              "old_text": r"def index\(\):",
+                              "new_text": "@app.route('/')\ndef index():"})],
+            [ToolCall(id="7", name="shell_exec",
+                      params={"command": "python -m pytest -q"})],
+            None,
+        ]
+        backend = _ScriptedBackend(script)
+        ctx, action = asyncio.run(_run_agent(project, backend))
+
+        # 1) 关键回归断言：force_edit 激活后，重跑失败 pytest 被拦截（逃逸闭合）。
+        #    agent 收到的工具结果里必须出现针对 shell 的强制修改提示。
+        joined = _messages_text(ctx)
+        assert "禁止再次 read_file/grep/shell_exec/git" in joined, \
+            "force_edit 激活后重跑失败 pytest 必须被拦截，否则可无限逃逸"
+
+        # 2) agent 被逼入 edit：app.py 被真实修改，加上了路由
+        app_text = (project / "app.py").read_text(encoding="utf-8")
+        assert APP_FIXED_MARKER in app_text, "app.py 应包含 @app.route('/')"
+
+        # 3) 最终完成
+        assert action.type == "complete", f"应 complete, 实际 {action.type}: {action.output}"
+
+        # 4) 真实 pytest 全绿
+        import subprocess, sys
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q"],
+                           cwd=str(project), capture_output=True, text=True,
+                           timeout=60, encoding="utf-8", errors="replace")
+        assert r.returncode == 0, f"修复后 pytest 应通过: {r.stdout}{r.stderr}"

@@ -547,10 +547,17 @@ class SWEAgent(Agent):
                 # 测试失败且已达到读取阈值后，read_file/grep 只会让 agent 继续空转。
                 # 结构性阻断读取，逼 agent 下一步只能是 edit/write_file（或重跑 pytest）。
                 _force_edit = context.metadata.get("force_edit", False)
-                if _force_edit and tc.name in ("read_file", "grep"):
+                # FixDriving 强制修改阶段：拦截所有非写、非展示工具。
+                # 若只拦 read_file/grep，执着的 LLM 可反复用 shell_exec 重跑失败的
+                # pytest 来"逃逸"——每次失败重跑都会把 reads_after_fail 清零，
+                # 永远到不了 edit（无限 read → LoopGuard → 超时）。
+                # 因此这里拦截 read_file/grep/shell_exec/git，让唯一可推进的动作
+                # 就是 edit/write_file；force_edit 仅在一次成功的写操作后清除。
+                if _force_edit and tc.name not in ("edit", "write_file", "show_to_user"):
                     result = ToolResult.err(
                         "[FixDriving] 强制修改阶段：测试已失败且你已读取足够多文件。"
-                        "禁止再次 read_file/grep —— 立即用 edit 或 write_file 修改代码修复失败的测试。"
+                        "禁止再次 read_file/grep/shell_exec/git —— 立即用 edit 或 "
+                        "write_file 修改代码修复失败的测试。"
                     )
                 else:
                     result = context.tools.execute_tool(tc.name, tc.params, tctx)
