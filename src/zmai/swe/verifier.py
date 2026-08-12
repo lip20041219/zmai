@@ -253,6 +253,44 @@ def verify_exit_code(
         )
 
 
+def parse_test_totals(test_output: str) -> dict[str, int]:
+    """解析 pytest 输出的各类测试数量（通过/失败/错误/跳过/反选/忽略）。
+
+    用于"基线测试数回退防护"：若某次运行实际执行的测试总数低于首次记录的
+    基线，说明有测试被反选、删除或忽略，即使 pytest exit 0 且显示 passed，
+    也视为未真正验证业务代码（伪造成功），不得计入完成。
+
+    注意：只从 pytest **末尾的汇总行**（形如 "4 passed, 1 deselected in 0.05s"）
+    解析，不能在整个输出里找计数——traceback 里的 "200"、"passed" 等片段会
+    造成误匹配（曾把 4 个测试误判成 200 个）。
+    """
+    import re
+    text = test_output or ""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    # 汇总行：包含某计数词且带耗时标记 " in "
+    summary = text
+    for ln in reversed(lines):
+        if re.search(r"\d+\s+(passed|failed|error|skipped|deselected|ignored)", ln) \
+                and " in " in ln:
+            summary = ln
+            break
+    low = summary.lower()
+
+    def _count(pat: str) -> int:
+        m = re.search(pat, low)
+        return int(m.group(1)) if m else 0
+
+    return {
+        "passed": _count(r"(\d+)\s+passed"),
+        "failed": _count(r"(\d+)\s+failed"),
+        "errors": _count(r"(\d+)\s+errors?"),
+        "skipped": _count(r"(\d+)\s+skipped"),
+        "deselected": _count(r"(\d+)\s+deselected"),
+        "ignored": _count(r"(\d+)\s+ignored"),
+        "collected": _count(r"(\d+)\s+collected\s+items"),
+    }
+
+
 def verify_test_output(test_output: str) -> VerificationCheck:
     """Test output verification.
 
