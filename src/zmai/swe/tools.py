@@ -99,6 +99,70 @@ def _resolve_tool_path(context: ToolContext, user_path: str) -> tuple[bool, Path
         return False, resolved, f"路径安全限制: {user_path} 不在工作区内"
 
 
+# ── 测试文件只读保护 ──────────────────────────────────────────
+# 测试文件是"验收标准"：Agent 修改它们（改断言/删测试/跳过测试/加假测试）
+# 属于"伪造成功"，必须拦截。tests/ 目录、test_*.py、*_test.py、conftest.py
+# 以及纯测试执行配置（pytest.ini/tox.ini/.coveragerc）一律只读。
+_TEST_DIR_NAMES = {"tests"}
+_TEST_CONFIG_FILES = {"conftest.py", "pytest.ini", "tox.ini", ".coveragerc"}
+
+
+def _is_test_file(path: Path, root: Path) -> bool:
+    """判断文件是否为测试/验收文件（只读，禁止修改）。
+
+    Args:
+        path: 已解析的绝对路径。
+        root: 项目根（project_path 或 workspace_path）。
+
+    Returns:
+        True 表示该文件是测试文件，禁止写操作。
+    """
+    try:
+        rel = path.resolve().relative_to(root.resolve())
+    except (ValueError, OSError):
+        return False  # 无法判定为项目内测试文件 → 不拦截（保守）
+    name = rel.name
+    if any(p in _TEST_DIR_NAMES for p in rel.parts[:-1]):
+        return True
+    if name in _TEST_CONFIG_FILES:
+        return True
+    if name.endswith(".py"):
+        return name.startswith("test_") or name.endswith("_test.py")
+    return False
+
+
+def _test_file_guard_msg(path: Path) -> str:
+    """生成测试文件拦截的明确原因，供 Agent 继续分析业务代码。"""
+    return (
+        f"[TestGuard] 拒绝修改测试/验收文件 {path.name}：测试文件是只读验收标准，"
+        f"禁止修改、删除、放宽断言或跳过测试。请分析业务代码并修改它，"
+        f"让测试通过，不要改动 tests/ 下的任何文件。"
+    )
+
+
+_DESTRUCTIVE_VERBS = re.compile(r"^(del|rm|move|mv|ren|rmdir|unlink)(\s|$)")
+# 测试文件标记：test_*.py / *_test.py / tests/ 目录
+_TEST_FILE_TOKEN = re.compile(
+    r"test_[a-z0-9_]+\.py\b|_test\.py\b|[/\\]tests[/\\]|(^|[ /\\])tests($|[ /\\])"
+)
+
+
+def _shell_attempts_test_mutation(cmd: str) -> bool:
+    """粗略检测 shell 命令是否试图删除/移动/重命名测试文件。
+
+    这是对 EditTool/WriteFileTool 只读保护的补充：失误/恶意的 Agent 可绕过写
+    工具，直接用 shell（del/rm/move/ren 等）删除或移走测试文件，使 pytest 以
+    "0 passed" 通过——伪造成功。此处做保守拦截，仅当命令以破坏性动词开头且
+    目标包含测试文件标记时才拦截，避免误伤正常命令。
+    """
+    low = (cmd or "").lower().strip()
+    if not low:
+        return False
+    if not _DESTRUCTIVE_VERBS.match(low):
+        return False
+    return bool(_TEST_FILE_TOKEN.search(low))
+
+
 class ShowToUserTool(Tool):
     name = "show_to_user"
     description = "Print content to terminal for the user to see."
@@ -274,6 +338,11 @@ class WriteFileTool(Tool):
             result = ToolResult.err(err_msg)
             _emit_tool_result(self.name, context, params, result, _st); return result
 
+        # 测试文件只读保护：禁止写入/覆盖测试文件（含新建 tests/ 下文件）
+        if _is_test_file(full, Path(context.project_path or context.workspace_path)):
+            result = ToolResult.err(_test_file_guard_msg(full))
+            _emit_tool_result(self.name, context, params, result, _st); return result
+
         # 检查文件大小
         if len(content) > self._MAX_WRITE_SIZE:
             result = ToolResult.err(
@@ -378,6 +447,11 @@ class EditTool(Tool):
         is_safe, full, err_msg = _resolve_tool_path(context, path)
         if not is_safe:
             result = ToolResult.err(err_msg)
+            _emit_tool_result(self.name, context, params, result, _st); return result
+
+        # 测试文件只读保护：禁止编辑/删除/放宽断言/跳过测试
+        if _is_test_file(full, Path(context.project_path or context.workspace_path)):
+            result = ToolResult.err(_test_file_guard_msg(full))
             _emit_tool_result(self.name, context, params, result, _st); return result
 
         # 文件大小限制：禁止写入超限内容（与 WriteFileTool 一致）
@@ -593,6 +667,14 @@ class ShellTool(Tool):
             result = ToolResult.err("command required")
             _emit_tool_result(self.name, context, params, result, _st); return result
         cmd = _translate_cmd(cmd)
+        # 测试文件只读保护：拦截 shell 对测试文件的删除/移动/重命名（绕过写工具）
+        if _shell_attempts_test_mutation(cmd):
+            result = ToolResult.err(
+                "[TestGuard] 拒绝通过 shell 删除/移动/重命名测试文件："
+                "测试文件是只读验收标准，禁止删除、移走或跳过测试。"
+                "请修改业务代码让测试通过。"
+            )
+            _emit_tool_result(self.name, context, params, result, _st); return result
         confirm_fn = context.config.get("on_confirm")
         if confirm_fn and not confirm_fn("shell_exec", cmd):
             result = ToolResult.ok(output="cancelled by user")

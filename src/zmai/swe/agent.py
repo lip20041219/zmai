@@ -33,6 +33,7 @@ from zmai.swe.verifier import (
     VerificationCheck,
     VerificationResult,
     auto_generate_checks,
+    parse_test_totals,
     verify_file_exists,
     verify_exit_code,
     verify_test_output,
@@ -595,6 +596,25 @@ class SWEAgent(Agent):
                         # 失败时 output 为空、错误在 error 里；合并供 verify_test_output 判定
                         test_out = (result.output or "") + (result.error or "")
                         passed = (exit_code == 0) and verify_test_output(test_out).passed
+                        # ── P0 基线测试数回退防护（防伪造成功）──
+                        # 首次运行记录应运行的总测试数；后续"绿色"运行若实际执行
+                        # 总数低于基线（测试被反选/删除/忽略，如 pyproject addopts
+                        # 反选或 shell 通配符删除），即使 exit 0 + passed 也视为
+                        # 未真正验证业务代码，不得计入完成。
+                        _totals = parse_test_totals(test_out)
+                        _total_tests = (_totals["passed"] + _totals["failed"]
+                                        + _totals["errors"])
+                        _baseline = context.metadata.get("baseline_test_count")
+                        if _baseline is None:
+                            if _total_tests > 0:
+                                context.metadata["baseline_test_count"] = _total_tests
+                        elif passed and _baseline > 0 and _total_tests < _baseline:
+                            logger.warning(
+                                "TestGuard: test count %d < baseline %d — "
+                                "rejecting green to prevent fake success",
+                                _total_tests, _baseline,
+                            )
+                            passed = False
                         if completion:
                             completion.record_test_result(
                                 exit_code=exit_code,
