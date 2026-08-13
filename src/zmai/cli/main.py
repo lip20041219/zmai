@@ -132,6 +132,7 @@ def _print_help() -> None:
     print("  zmai --json <task>          Run task, output JSON")
     print("  zmai --no-color <task>      Run task without color")
     print("  zmai --backend <name>       Run task with specific backend")
+    print("  zmai --max-steps <N>        Max agent steps before forced stop (default 300)")
     print("  zmai --version              Show version")
     print("  zmai --help                 Show this help")
     print("\nSubcommands:")
@@ -167,6 +168,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-color", action="store_true", help="disable color")
     p.add_argument("--backend", help="backend name (see zmai auth list for available)")
     p.add_argument("--plan", action="store_true", help="auto plan mode: generate plan before execution")
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="max agent steps before forced stop (default 300, e.g. 100/300/500/1000)")
     p.add_argument("task", nargs="*", help="task description")
     p.add_argument("--help", action="store_true", help="show help")
     return p
@@ -545,6 +548,9 @@ def main(argv: list[str] | None = None) -> None:
             ]
         )
         config.set("project_path", terminal_cwd)
+        # 用户显式指定 --max-steps 时覆盖默认（否则用 config/兜底 300）
+        if getattr(args, "max_steps", None) is not None:
+            config.set("runtime.max_iterations", args.max_steps)
         runtime = Runtime(config=config)
         theme = _get_theme(args, config)
 

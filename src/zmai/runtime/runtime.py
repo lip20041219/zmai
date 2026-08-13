@@ -219,7 +219,7 @@ class Runtime:
                 backend=backend_inst,
                 workspace=ws_path,
                 tools=self._tools,
-                max_steps=int(self._config.get("runtime.max_iterations", 100)),
+                max_steps=int(self._config.get("runtime.max_iterations", 300)),
                 metadata={"messages": [], "on_progress": on_progress},
                 memory=self._memory,
             )
