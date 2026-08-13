@@ -27,7 +27,7 @@ class DeepSeekBackend(Backend):
 
     统一配置字段（所有 Backend 共用）:
         api_key:     API Key（默认从 DEEPSEEK_API_KEY 环境变量读取）。
-        model:       模型名称（默认 deepseek-chat）。
+        model:       模型名称（默认 deepseek-v4-flash）。
         base_url:    API 基础 URL（默认 https://api.deepseek.com/v1）。
         timeout:     请求超时秒数（默认 120）。
         max_tokens:  最大生成 token 数（默认 4096）。
@@ -47,7 +47,7 @@ class DeepSeekBackend(Backend):
             logger.warning("%s 未设置，DeepSeekBackend 无法正常工作", self._env_key)
 
         # 统一配置字段（所有 Backend 共用同一套 key 名）
-        self._model: str = c.get("model", "deepseek-chat")
+        self._model: str = c.get("model", "deepseek-v4-flash")
         self._base_url: str = c.get("base_url", "https://api.deepseek.com/v1").rstrip("/")
         self._timeout: int = int(c.get("timeout", 120))
         self._max_tokens: int = int(c.get("max_tokens", 4096))
@@ -180,7 +180,7 @@ plugin = _BackendPlugin(
     name="deepseek",
     backend_class=DeepSeekBackend,
     label="DeepSeek",
-    default_model="deepseek-chat",
+    default_model="deepseek-v4-flash",
     default_base_url="https://api.deepseek.com/v1",
     default_timeout=120,
     default_max_tokens=4096,

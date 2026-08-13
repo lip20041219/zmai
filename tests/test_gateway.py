@@ -475,7 +475,7 @@ class TestDeepSeekBackend:
     def test_init_defaults(self):
         backend = DeepSeekBackend(config={"api_key": "test-key"})
         assert backend.name == "deepseek"
-        assert backend.model == "deepseek-chat"
+        assert backend.model == "deepseek-v4-flash"
         assert backend._base_url == "https://api.deepseek.com/v1"
 
     def test_init_custom_config(self):
@@ -726,6 +726,30 @@ class TestBackendInvalidResponse:
             with pytest.raises(BackendInvalidResponse, match="缺少必要字段"):
                 backend.invoke(req)
 
+    def test_deepseek_invoke_openai_compatible_endpoint(self):
+        """默认协议必须为 OpenAI-compatible，发往 /chat/completions，且用 Bearer。
+
+        回归：DeepSeek 默认模型配置不得被误路由到 Anthropic /messages 协议。
+        """
+        backend = DeepSeekBackend(config={"api_key": "test-key"})
+        body = json.dumps({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }).encode()
+        with patch("zmai.gateway.backends.deepseek.urllib.request.urlopen") as mock_urlopen:
+            self._mock_urlopen(mock_urlopen, body)
+            req = BackendRequest(messages=[{"role": "user", "content": "hi"}])
+            backend.invoke(req)
+        request = mock_urlopen.call_args[0][0]
+        url = request.full_url
+        assert url.startswith("https://api.deepseek.com/v1"), f"端点域名错误: {url}"
+        assert url.endswith("/chat/completions"), f"应为 OpenAI-compatible 端点, 实际 {url}"
+        assert request.headers["Authorization"].startswith("Bearer ")
+        sent = json.loads(request.data.decode())
+        assert "messages" in sent, "应为 OpenAI messages 格式"
+        assert "model" in sent
+        assert sent["model"] == "deepseek-v4-flash"
+
     # ── GeminiBackend ──────────────────────────────────────
 
     def test_gemini_empty_response(self):
@@ -751,3 +775,32 @@ class TestBackendInvalidResponse:
             req = BackendRequest(messages=[{"role": "user", "content": "hi"}])
             with pytest.raises(BackendInvalidResponse, match="candidates 为空"):
                 backend.invoke(req)
+
+
+# ── PluginRegistry 默认 Backend 选择 ──────────────────────────
+
+class TestPluginRegistryDefaultSelection:
+    def test_default_stays_deepseek_when_anthropic_key_present(self, monkeypatch):
+        """存在 ANTHROPIC_API_KEY 时，若 AuthStore 指定 deepseek，
+        默认 backend 仍为 deepseek，绝不因 Anthropic 凭据切换为 claude。"""
+        monkeypatch.setattr(
+            "zmai.auth.store.AuthStore.get_active_backend",
+            lambda self: "deepseek",
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test1234567890123456789")
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        from zmai.gateway.plugin import PluginRegistry
+        reg = PluginRegistry(config={"gateway.default_backend": "auto"})
+        assert reg.default_name == "deepseek"
+
+    def test_default_stays_deepseek_via_config_when_anthropic_key_present(self, monkeypatch):
+        """即使 AuthStore 无 active，config 显式指定 deepseek 也优先于 ANTHROPIC_API_KEY。"""
+        monkeypatch.setattr(
+            "zmai.auth.store.AuthStore.get_active_backend",
+            lambda self: "",
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test1234567890123456789")
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        from zmai.gateway.plugin import PluginRegistry
+        reg = PluginRegistry(config={"gateway.default_backend": "deepseek"})
+        assert reg.default_name == "deepseek"
