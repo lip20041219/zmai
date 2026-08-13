@@ -49,6 +49,18 @@ def _now_ms() -> int:
     return int(time.monotonic() * 1000)
 
 
+def _stats(context: AgentContext, **deltas: int) -> dict:
+    """累计修复效率统计（total_steps/reads/duplicate_reads/pytest_calls 等）。
+
+    用于审计 Agent 是否高效闭环，而不只是看 max_steps 是否耗尽。
+    存入 context.metadata["swe_stats"]。
+    """
+    d = context.metadata.setdefault("swe_stats", {})
+    for k, v in deltas.items():
+        d[k] = d.get(k, 0) + v
+    return d
+
+
 def _log_stop() -> None:
     """打印任务完成/停止循环的显式日志（自主停止的可审计信号）。"""
     logger.info("[ZMAI] Task completed.")
@@ -664,9 +676,13 @@ class SWEAgent(Agent):
                                     from zmai.swe.fix_planner import (
                                         format_plan, generate_fix_plan,
                                     )
-                                    _issue = parse_test_failure(_fail_text)
+                                    _issue = parse_test_failure(
+                                        _fail_text,
+                                        context.config.get("project_path"),
+                                    )
                                     if _issue is not None:
                                         _plan = generate_fix_plan(_issue)
+                                        context.metadata["last_failure_issue"] = _issue
                                         _plan_msg = "\n" + format_failure(_issue) \
                                                     + "\n" + format_plan(_plan)
                                 except Exception:
@@ -702,6 +718,26 @@ class SWEAgent(Agent):
                         output=result.output or "",
                         error=result.error,
                     )
+                # ── 修复效率统计（供审计，不改变行为）──
+                _stats(context, total_calls=1)
+                if tc.name == "read_file":
+                    _stats(context, read_calls=1)
+                    _rp = (tc.params or {}).get("path", "")
+                    _read_seen = context.metadata.setdefault("_read_files_seen", set())
+                    if _rp not in _read_seen:
+                        _read_seen.add(_rp)
+                        _stats(context, unique_read_files=1)
+                    elif (result.metadata or {}).get("cached"):
+                        _stats(context, duplicate_reads=1)
+                if tc.name == "shell_exec":
+                    _cmd = str((tc.params or {}).get("command", "")).lower()
+                    if "pytest" in _cmd:
+                        _stats(context, pytest_calls=1)
+                        # 无修改重跑：距上次修改的 pytest 且结果相同 → 无进展重跑
+                        if not had_modification:
+                            _stats(context, unchanged_pytest_calls=1)
+                if tc.name in ("edit", "write_file"):
+                    _stats(context, edit_calls=1)
                 # ── ExecutionLog: tool_call + tool_result ──
                 _l = context.metadata.get("__log__")
                 if _l:
@@ -803,6 +839,7 @@ class SWEAgent(Agent):
                     "FixDriving: test failed, %d reads after failure without modification — forcing fix phase",
                     reads_after_fail,
                 )
+                _stats(context, fixdriving_activations=1)
                 if guard:
                     guard.reset()  # 给予全新方向，避免 no_progress 误伤分析阶段
                 repair_phase = "plan"  # 强制回到"计划→修改"，阻断只读停滞
@@ -840,13 +877,38 @@ class SWEAgent(Agent):
                     )
                     # Reset guard so next step starts fresh
                     guard.reset()
-                    # Inject blocked info into context so LLM sees it
-                    cm.add_message("user",
-                        f"[LoopGuard] 检测到循环执行模式。\n"
-                        f"原因: {loop_result.reason}\n"
-                        f"建议: {loop_result.suggestion}\n"
-                        f"请尝试完全不同的方法，不要重复之前的操作。"
+                    # ── 修复效率统计 ──
+                    _stats(context, loopguard_blocks=1)
+                    # ── 结构化恢复信号：列出最近的无效动作 + 规定下一步策略 ──
+                    recent = [
+                        f"- {c['name']} {str(c.get('signature','')).split(':',1)[-1][:80]}"
+                        for c in guard.get_recent_calls(6)
+                    ]
+                    recent_txt = "\n".join(recent) if recent else "- (无)"
+                    # 升级计数器：同一失败反复被阻断 → 不再重复相同动作，转入强制定向修改
+                    recoveries = context.metadata.get("loop_recovery_count", 0) + 1
+                    context.metadata["loop_recovery_count"] = recoveries
+                    recover_limit = int(context.config.get("loop_guard.recover_limit", 2))
+                    if recoveries >= recover_limit:
+                        context.metadata["force_edit"] = True
+                        context.metadata["repair_phase"] = "plan"
+                    recovery_msg = (
+                        f"[LoopGuard][LoopRecovery] 检测到重复的无进展动作（第 {recoveries} 次恢复）。\n"
+                        f"原因: {loop_result.reason}（{loop_result.suggestion}）\n"
+                        f"之前的无效动作:\n{recent_txt}\n"
+                        f"下一步必须:\n"
+                        f"- 不要重复上述任何 read/shell 动作。\n"
+                        f"- 使用当前失败证据定位一个具体修复目标。\n"
+                        f"- 若根因证据已足够，直接用 `edit`/`write_file` 修改业务文件。\n"
+                        f"- 不要修改测试文件。\n"
+                        f"- 若证据不足，只允许一次新的定向读取（或重跑一次 pytest）。"
                     )
+                    if recoveries >= recover_limit:
+                        recovery_msg += (
+                            f"\n\n已连续 {recoveries} 次循环恢复仍未推进——进入修复升级："
+                            f"你现在必须直接修改代码，禁止再读取无关文件。"
+                        )
+                    cm.add_message("user", recovery_msg)
                     # ── ExecutionLog: loop_guard ─────────
                     _l = context.metadata.get("__log__")
                     if _l:
@@ -858,7 +920,7 @@ class SWEAgent(Agent):
                             pass
                     context.metadata["messages"] = cm.get_context()
                     return AgentAction.cont(
-                        output=f"LoopGuard blocked: {loop_result.reason} (suggestion: {loop_result.suggestion})"
+                        output=f"LoopGuard blocked: {loop_result.reason} (recovery {recoveries})"
                     )
 
             # Context compaction
@@ -1100,6 +1162,7 @@ class SWEAgent(Agent):
             output=context.metadata.get("output", ""),
             steps=context.step_count,
             error=error,
+            metadata={"swe_stats": context.metadata.get("swe_stats", {})},
         )
         logger.info(
             "SWEAgent finished: %s (%d steps, status=%s)",
