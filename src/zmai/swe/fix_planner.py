@@ -50,7 +50,9 @@ _EMPTY_PLAN = FixPlan(
 
 def _default_steps(issue: FailureIssue) -> list[str]:
     """通用修复步骤（任意失败类型都适用）。"""
-    src = issue.file or "相关源文件"
+    # 优先候选业务文件（如 static/js/main.js），其次出错文件（可能是测试文件本身）
+    src = (issue.candidate_files[0] if issue.candidate_files else issue.file) \
+        or "相关源文件"
     return [
         "1. 重跑 `python -m pytest` 复现失败，读取失败摘要",
         f"2. 读取 {src} 与失败测试，定位根因",
