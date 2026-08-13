@@ -636,8 +636,13 @@ class SWEAgent(Agent):
                             context.metadata["test_success_count"] = prev_green + 1
                         else:
                             # 测试失败 → 进入修复态：强制后续进入修改阶段
+                            if not test_failed:
+                                # 首次进入修复态才清零读数。若每次失败 pytest 都清零，
+                                # agent 会用 read→pytest→read 无限交替逃逸 FixDriving
+                                # （读数永远攒不满 fix.read_limit，force_edit 永不激活），
+                                # 直到耗尽 max_steps 提前终止。
+                                reads_after_fail = 0
                             test_failed = True
-                            reads_after_fail = 0
                             # 一旦测试曾失败，则只有"全绿重测"才能判定完成（粘性标记）
                             context.metadata["tests_ever_failed"] = True
                             if repair_phase != "edit":

@@ -91,7 +91,7 @@ class AgentContext:
     workspace: Path | None = None
     tools: ToolRegistry | None = None
     logger: logging.Logger | None = None
-    max_steps: int = 100
+    max_steps: int = 300
     step_count: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
     memory: Any = None  # MemoryManager 实例，Agent 可通过此存取记忆
