@@ -44,6 +44,7 @@ logs/
 tests/workspace/
 
 # Runtime artifacts / local test files (never commit)
+/main.py
 final_test_result.txt
 process_result.json
 process_result_backup.json
