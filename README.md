@@ -128,7 +128,9 @@ complete                ← CompletionState 判定完成，自主停止
 
 ## 6. Demo
 
-<video src="docs/zmai-demo.mp4" width="720" autoplay loop muted controls></video>
+![ZMAI Demo](docs/demo.gif)
+
+> 更高清视频: [docs/zmai-demo.mp4](docs/zmai-demo.mp4)
 
 一行命令修复真实 Bug：
 
