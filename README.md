@@ -9,7 +9,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](pyproject.toml)
 
-`pip install zmai` · **Zero third-party dependencies** · **1307 tests passing**
+`pip install zmai` · **Zero third-party dependencies** · **1311 tests passing**
 
 </div>
 
@@ -235,7 +235,7 @@ ZMAI 配置按优先级解析：**file → env → CLI**。
 ```
 pytest
 
-1307 passed, 9 skipped
+1311 passed, 9 skipped
 ```
 
 - 测试覆盖 auth、credential store、gateway、runtime、loop guard、termination、workspace security、SWE workflow、CLI 等
@@ -265,7 +265,7 @@ zmai/
 │   │   └── tools.py      # 工具（含 TestGuard / ReadCache）
 │   ├── workspace/        # Workspace Sandbox
 │   └── ...
-├── tests/                # 1307+ 测试
+├── tests/                # 1311+ 测试
 ├── examples/             # 使用示例
 └── docs/                 # 文档 / zmai-demo.mp4
 ```
