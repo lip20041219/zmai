@@ -617,21 +617,25 @@ class SWEAgent(Agent):
                         _total_tests = (_totals["passed"] + _totals["failed"]
                                         + _totals["errors"])
                         _baseline = context.metadata.get("baseline_test_count")
+                        # partial_green：子集全绿但未覆盖完整基线。
+                        # 它不是 failed，但也不能算 full_green / complete。
+                        _scope_complete = True
                         if _baseline is None:
                             if _total_tests > 0:
                                 context.metadata["baseline_test_count"] = _total_tests
                         elif passed and _baseline > 0 and _total_tests < _baseline:
                             logger.warning(
                                 "TestGuard: test count %d < baseline %d — "
-                                "rejecting green to prevent fake success",
+                                "partial green, forcing full-suite re-run",
                                 _total_tests, _baseline,
                             )
-                            passed = False
+                            _scope_complete = False
                         if completion:
                             completion.record_test_result(
                                 exit_code=exit_code,
                                 passed=passed,
                                 step=context.step_count,
+                                scope_complete=_scope_complete,
                             )
                         if passed:
                             round_tests_passed = True
@@ -641,11 +645,32 @@ class SWEAgent(Agent):
                             repair_phase = "verify"
                             # 立即持久化：后续可能因全绿硬终止提前 return，避免阶段停留在 edit
                             context.metadata["repair_phase"] = "verify"
-                            # ── 防御机制：累计"测试全绿"次数 ──
-                            # 一旦出现 ≥1 次全绿，即具备硬终止资格，
-                            # 防止 success → success → success 无限循环。
-                            prev_green = context.metadata.get("test_success_count", 0)
-                            context.metadata["test_success_count"] = prev_green + 1
+                            if _scope_complete:
+                                # ── full_green：达到基线 + exit 0 + verify 通过 ──
+                                # 累计"测试全绿"次数；一旦 ≥1 即具备硬终止资格，
+                                # 防止 success → success → success 无限循环。
+                                prev_green = context.metadata.get("test_success_count", 0)
+                                context.metadata["test_success_count"] = prev_green + 1
+                                # 清空子集未覆盖标记（已覆盖完整基线）。
+                                context.metadata["test_scope_incomplete"] = False
+                                context.metadata["required_next_action"] = ""
+                            else:
+                                # ── partial_green：不 complete、不累计 success ──
+                                # 明确告知模型：本次通过但未覆盖基线，必须运行完整套件。
+                                # 结构化 recovery 状态：注入下一轮 Agent 上下文，让
+                                # 模型"看到"它只验证了子集，下一步必须跑完整套件，
+                                # 而不是继续 read/edit 或重复跑同一个子集。
+                                context.metadata["test_scope_incomplete"] = True
+                                context.metadata["tests_passed"] = False
+                                context.metadata["required_next_action"] = "run_full_test_suite"
+                                cm.add_message("user",
+                                    "[TEST_SCOPE_INCOMPLETE] 当前测试运行通过，但只执行了 "
+                                    f"{_total_tests}/{_baseline} 个测试（未覆盖完整基线套件）。\n"
+                                    "本次结果不能作为最终完成验证。\n"
+                                    "不要继续随机读取、修改文件或重复运行同一个子集。\n"
+                                    "下一步必须运行完整测试套件：python -m pytest -q\n"
+                                    "只有完整测试数量达到基线且全部通过后才能完成任务。"
+                                )
                         else:
                             # 测试失败 → 进入修复态：强制后续进入修改阶段
                             if not test_failed:
@@ -908,6 +933,14 @@ class SWEAgent(Agent):
                             f"\n\n已连续 {recoveries} 次循环恢复仍未推进——进入修复升级："
                             f"你现在必须直接修改代码，禁止再读取无关文件。"
                         )
+                    # ── scope-aware 恢复：测试子集未覆盖完整基线时的循环，强制跑完整套件 ──
+                    if context.metadata.get("test_scope_incomplete"):
+                        recovery_msg += (
+                            "\n\n[TestScope] 检测到你仍在重复执行测试子集，未覆盖完整基线套件。"
+                            "不要再重复运行同一个子集或继续 read/edit。"
+                            "下一步只能运行完整测试套件：python -m pytest -q"
+                        )
+                        context.metadata["required_next_action"] = "run_full_test_suite"
                     cm.add_message("user", recovery_msg)
                     # ── ExecutionLog: loop_guard ─────────
                     _l = context.metadata.get("__log__")
@@ -1028,20 +1061,24 @@ class SWEAgent(Agent):
             except Exception:
                 pass
 
-        # ── 修复审计：修改后未重测且测试曾失败 → 不得判定 completed ──
+        # ── 修复审计：修改后未全绿重测且测试曾失败 → 不得判定 completed ──
         # 防止"edit 后 end_turn 却仅凭 file_exists/git_diff 被误判完成"：
-        # 一旦本任务测试曾失败，就必须先有一次全绿重测（completion.tests_passed）
-        # 才能完成。否则强制进入重测，绝不带着未通过的测试 claim 完成。
+        # 一旦本任务测试曾失败，就必须先有一次覆盖完整基线套件的全绿重测
+        # （completion.tests_complete）才能完成。否则强制进入重测，绝不带着
+        # 未通过的测试 claim 完成。tests_complete=False 同时覆盖两种场景：
+        #   a) 从未全绿（tests_passed=False）
+        #   b) partial_green：子集通过但未达基线（tests_passed=True, tests_complete=False）
         _tests_failed_ever = context.metadata.get("tests_ever_failed", False)
-        if _tests_failed_ever and completion and not completion.tests_passed:
+        if _tests_failed_ever and completion and not completion.tests_complete:
             logger.warning(
-                "Completion blocked: tests failed earlier but no green re-run; "
-                "forcing pytest re-test instead of completing"
+                "Completion blocked: tests failed earlier but no full-scope green "
+                "re-run; forcing full-suite pytest re-test instead of completing"
             )
             cm.add_message("user",
-                "[Workflow] 你修改了代码，但自上次失败后还没有一次通过的测试运行。\n"
-                "不要停止——请重新运行 `python -m pytest` 验证你的修改。\n"
-                "只有测试全部通过才算完成。"
+                "[Workflow] 你修改了代码，但自上次失败后还没有一次覆盖完整测试套件的"
+                "全绿运行（部分测试通过不能作为完成验证）。\n"
+                "不要停止——请运行完整测试套件 `python -m pytest -q` 验证你的修改。\n"
+                "只有完整测试全部通过（达到基线数量）才算完成。"
             )
             context.metadata["messages"] = cm.get_context()
             _l = context.metadata.get("__log__")
@@ -1050,7 +1087,8 @@ class SWEAgent(Agent):
                     _l.record_step(phase="completion_guard", action="block_unverified",
                                    success=False,
                                    metadata={"tests_failed_ever": True,
-                                             "tests_passed": completion.tests_passed})
+                                             "tests_passed": completion.tests_passed,
+                                             "tests_complete": completion.tests_complete})
                 except Exception:
                     pass
             return AgentAction.cont(output="Modified but not re-tested; forcing pytest re-run")
@@ -1144,10 +1182,17 @@ class SWEAgent(Agent):
                 context.agent_id, context.step_count, tool_fail, tool_fail + tool_ok,
             )
         elif (
-            (vresult := context.metadata.get("verification")) is not None
+            not (
+                context.metadata.get("tests_passed", False)
+                or context.metadata.get("test_success_count", 0) >= 1
+            )
+            and (vresult := context.metadata.get("verification")) is not None
             and not vresult.passed
         ):
-            # Check verification — failed verification must not result in COMPLETED
+            # Check verification — failed verification must not result in COMPLETED.
+            # 但"测试曾全绿通过"是目标已达成的决定性信号（同上 tool_fail 分支）：
+            # 修复过程中 mid-run 的 auto_verify 可能留下一次过期的 failed 结果，
+            # 不得用它覆盖一次合法的全绿完成。
             status = AgentState.FAILED
             logger.info(
                 "SWEAgent verification failed: %s (%s)",
