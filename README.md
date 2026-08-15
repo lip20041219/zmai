@@ -154,6 +154,25 @@ ZMAI 默认使用 **DeepSeek** 后端：
 - DeepSeek 走 OpenAI-compatible 端点，`base_url` + `api_key` 即可配置
 - 通过 `zmai auth setup` 加密存储凭证，或环境变量 `DEEPSEEK_API_KEY`
 
+### 最小配置与运行示例
+
+配置一个 DeepSeek key 后即可零设置使用（DeepSeek 是默认后端）：
+
+```bash
+# 方式一：环境变量（临时，仅当前 shell 生效）
+export DEEPSEEK_API_KEY=your_api_key_here
+
+# 方式二：交互式加密存储（推荐，持久化）
+zmai auth setup
+
+# 直接用（默认 DeepSeek backend）
+zmai "修复当前项目所有 bug"
+
+# 切换到其他后端
+zmai --backend claude "分析这个仓库的架构"
+zmai --backend gemini "写一个单元测试"
+```
+
 ---
 
 ## 8. Safety Guards
