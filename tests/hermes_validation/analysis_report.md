@@ -2,14 +2,14 @@
 
 **生成时间**: 2026-08-06
 **分析者**: Hermes Agent (自动化测试工程师)
-**分析范围**: ZMAI 根目录 D:\desk\ZMAI
+**分析范围**: ZMAI 根目录 <project-root>
 
 ---
 
 ## 1. 项目结构总览
 
 ```
-D:\desk\ZMAI\
+<project-root>\
 ├── run_agent.py          # Claude Code 无头调用入口 (--workspace/--prompt/--skip-permissions)
 ├── main.py               # 3 字节空壳
 ├── pyproject.toml        # 零依赖 SWE agent runtime (pytest dev 依赖)
@@ -103,7 +103,7 @@ D:\desk\ZMAI\
 
 ## 6. 测试环境事实
 
-- claude CLI 2.1.169 已安装 (C:\Users\MECHREVO\.local\bin\claude)
+- claude CLI 2.1.169 已安装 (C:\Users\<user>\.local\bin\claude)
 - Python 3.11.9, .venv 含 pytest.exe
 - DeepSeek API key 已配置于 ~/.zmai/credentials (加密存储, DOCTOR PASS)
 - ~/.zmai/config.json 存在

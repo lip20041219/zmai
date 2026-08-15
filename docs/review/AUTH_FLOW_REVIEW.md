@@ -100,7 +100,7 @@ main()
 
 ### Q1: API Key 实际写入到哪里？
 
-**`~/.zmai/credentials`**（`C:\Users\MECHREVO\.zmai\credentials`，408 字节）
+**`~/.zmai/credentials`**（`C:\Users\<user>\.zmai\credentials`，408 字节）
 
 加密方案：XOR + base64
 
@@ -145,10 +145,10 @@ Runtime 不直接读取 credentials 文件。通过两条间接路径：
 
 | 组件 | 路径常量 | 实际值 |
 |------|----------|--------|
-| `AuthStore.CREDENTIALS_FILE` | `Path.home() / ".zmai" / "credentials"` | `C:\Users\MECHREVO\.zmai\credentials` |
-| `AuthStore.AUTH_DIR` | `Path.home() / ".zmai"` | `C:\Users\MECHREVO\.zmai` |
-| `FileSource(global_cfg)` | `Path.home() / ".zmai" / "config.json"` | `C:\Users\MECHREVO\.zmai\config.json` |
-| 项目 zmai.json | `root / "zmai.json"` | `D:\desk\ZMAI\zmai.json` |
+| `AuthStore.CREDENTIALS_FILE` | `Path.home() / ".zmai" / "credentials"` | `C:\Users\<user>\.zmai\credentials` |
+| `AuthStore.AUTH_DIR` | `Path.home() / ".zmai"` | `C:\Users\<user>\.zmai` |
+| `FileSource(global_cfg)` | `Path.home() / ".zmai" / "config.json"` | `C:\Users\<user>\.zmai\config.json` |
+| 项目 zmai.json | `root / "zmai.json"` | `<project-root>\zmai.json` |
 
 ---
 
@@ -341,7 +341,7 @@ def _run_auth(argv):
 ## 四、验证记录汇总
 
 ```
-凭证文件存在:          ✅ C:\Users\MECHREVO\.zmai\credentials (408 字节)
+凭证文件存在:          ✅ C:\Users\<user>\.zmai\credentials (408 字节)
 解密测试:              ✅ PASS (MachineGuid 密钥)
 API Key 长度:          ✅ 35 字符
 active_backend:        "deepseek"

@@ -23,21 +23,21 @@
 ### 1a. 路径解析（以当前用户为例）
 
 ```
-~/.zmai = C:\Users\MECHREVO\.zmai
-CWD     = D:\desk\ZMAI
+~/.zmai = C:\Users\<user>\.zmai
+CWD     = <project-root>
 ```
 
 | 配置项 | 解析后路径 |
 |---|---|
-| Global Config | `C:\Users\MECHREVO\.zmai\config.json` |
-| Credentials | `C:\Users\MECHREVO\.zmai\credentials` |
-| Plugin Backends | `C:\Users\MECHREVO\.zmai\backends/` |
-| Project Plugins | `D:\desk\ZMAI\.zmai\backends/` |
-| Memory | `C:\Users\MECHREVO\.zmai\memory/` |
-| Sessions | `C:\Users\MECHREVO\.zmai\sessions/` |
-| History | `C:\Users\MECHREVO\.zmai\history` |
-| Project Config | `D:\desk\ZMAI\zmai.json` |
-| Workspace | `D:\desk\ZMAI\workspace/` |
+| Global Config | `C:\Users\<user>\.zmai\config.json` |
+| Credentials | `C:\Users\<user>\.zmai\credentials` |
+| Plugin Backends | `C:\Users\<user>\.zmai\backends/` |
+| Project Plugins | `<project-root>\.zmai\backends/` |
+| Memory | `C:\Users\<user>\.zmai\memory/` |
+| Sessions | `C:\Users\<user>\.zmai\sessions/` |
+| History | `C:\Users\<user>\.zmai\history` |
+| Project Config | `<project-root>\zmai.json` |
+| Workspace | `<project-root>\workspace/` |
 
 ---
 
@@ -117,11 +117,11 @@ Runtime.__init__(config)
   │
   ├── MemoryManager()
   │     └── Path.home() / ".zmai" / "memory"
-  │           └── C:\Users\MECHREVO\.zmai\memory/
+  │           └── C:\Users\<user>\.zmai\memory/
   │
   └── AuthStore（通过 PluginRegistry 间接调用）
         └── Path.home() / ".zmai" / "credentials"
-              └── C:\Users\MECHREVO\.zmai\credentials
+              └── C:\Users\<user>\.zmai\credentials
 ```
 
 ---
