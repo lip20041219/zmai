@@ -153,6 +153,7 @@ ZMAI 默认使用 **DeepSeek** 后端：
 
 - DeepSeek 走 OpenAI-compatible 端点，`base_url` + `api_key` 即可配置
 - 通过 `zmai auth setup` 加密存储凭证，或环境变量 `DEEPSEEK_API_KEY`
+- **ZMAI 不含任何硬编码 API key，也不收集/上传使用者的 key**。每个使用者配置自己的 key（环境变量或加密凭证存储）；`base_url` 默认 `https://api.deepseek.com/v1`，零额外设置。
 
 ### 最小配置与运行示例
 
