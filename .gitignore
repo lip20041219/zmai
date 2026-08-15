@@ -37,10 +37,11 @@ coverage/
 # Project specific
 .claude/
 DOCTOR.md
-workspace/
+/workspace/
 temp/
 agent_workspace/
 logs/
+tests/workspace/
 
 # Runtime artifacts / local test files (never commit)
 final_test_result.txt

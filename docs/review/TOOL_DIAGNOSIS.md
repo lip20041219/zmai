@@ -54,8 +54,8 @@ User: "帮我把这个 HTML 写到文件"
 ### 4. Current Workspace Root
 
 ```
-Workspace root:    D:\desk\ZMAI\workspace
-Agent workspace:   D:\desk\ZMAI\workspace\repl_XXXX_N\
+Workspace root:    <project-root>\workspace
+Agent workspace:   <project-root>\workspace\repl_XXXX_N\
 ```
 
 26 stale agent directories exist in workspace/. Each REPL turn creates a new one.
@@ -63,8 +63,8 @@ Agent workspace:   D:\desk\ZMAI\workspace\repl_XXXX_N\
 ### 5. Current Working Directory (cwd)
 
 ```
-cwd at startup:    D:\desk\ZMAI         (set by os.chdir(root) in main.py)
-shell_exec cwd:    D:\desk\ZMAI\workspace\agent_xxx  (ToolContext.workspace_path)
+cwd at startup:    <project-root>         (set by os.chdir(root) in main.py)
+shell_exec cwd:    <project-root>\workspace\agent_xxx  (ToolContext.workspace_path)
 ```
 
 **Verdict:** shell_exec runs in workspace sandbox. Files written by Agent and files visible via shell are in different places.
@@ -72,8 +72,8 @@ shell_exec cwd:    D:\desk\ZMAI\workspace\agent_xxx  (ToolContext.workspace_path
 ### 6. Runtime Current Directory
 
 ```
-Runtime._workspace root:  D:\desk\ZMAI\workspace
-Runtime._config:          includes project_path = "D:\desk\ZMAI"
+Runtime._workspace root:  <project-root>\workspace
+Runtime._config:          includes project_path = "<project-root>"
 ```
 
 The Config object HAS project_path. Runtime.run() doesn't pass it through.
@@ -81,7 +81,7 @@ The Config object HAS project_path. Runtime.run() doesn't pass it through.
 ### 7. AgentContext.workspace
 
 ```
-AgentContext.workspace = D:\desk\ZMAI\workspace\repl_XXXX_N   ✅
+AgentContext.workspace = <project-root>\workspace\repl_XXXX_N   ✅
 AgentContext.config    = {}                                     ❌ empty
 ```
 
@@ -111,7 +111,7 @@ shell_exec(encoding="utf-8", errors="replace")  ✅
 
 ```
 Workspace root writable:  ✅  (confirmed: os.access returns True)
-User: MECHREVO (admin)    ✅
+User: <user> (admin)    ✅
 ```
 
 **Verdict:** Permissions are fine. Not the issue.

@@ -4,7 +4,7 @@
 
 **Autonomous Software Engineering Agent Runtime**
 
-[![CI](https://github.com/xijingliu/ZMAI/actions/workflows/test.yml/badge.svg)](https://github.com/xijingliu/ZMAI/actions/workflows/test.yml)
+[![CI](https://github.com/lip20041219/zmai/actions/workflows/test.yml/badge.svg)](https://github.com/lip20041219/zmai/actions/workflows/test.yml)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](pyproject.toml)
@@ -41,6 +41,10 @@ Issue 分析 → 任务规划 → 代码修改 → 自动测试验证 → 完成
 - **多后端抽象** — 统一 Backend 接口 + Credential Store 加密凭证存储
 - **客观验证（auto_verify）** — 不因"工具调用成功"就判定任务完成
 - **自主停止** — CompletionState + LoopGuard + max_iterations 硬上限三层防护
+- **FailureParser** — 从 pytest traceback 语义化解析失败根因（expected/actual/line/候选业务文件）
+- **FixPlanner** — 基于失败解析自动生成"诊断→计划→修改→验证"的有序修复计划
+- **TestGuard** — 测试文件只读保护，杜绝通过改测试/删测试/放宽断言伪造成功；并按基线测试数拦截套件收缩
+- **ReadCache** — 重复读取同一未变化文件自动命中缓存并提示复用，避免无效 read 空转
 - **Windows 友好** — 内置 Linux→Windows 命令翻译与 UTF-8 编码处理
 
 ### ✅ 验证结果
@@ -48,6 +52,7 @@ Issue 分析 → 任务规划 → 代码修改 → 自动测试验证 → 完成
 - **1245 tests passed, 7 skipped**（48 个测试文件，无需 API Key 即可运行）
 - **SWE Agent 实际任务验证通过** — 真实运行修复任务：读 Issue → 定位 Bug → 修改代码 → 测试从失败变全绿 → 自动停止
 - **Autostop 自主停止机制验证通过** — 可完成任务自动停止；不可完成任务达到最大迭代强制终止，无无限循环
+- **基准声明** — 尚未发布公开标准基准（SWE-bench Full/Verified/Lite）分数；内部真实运行的验证数据见 [BENCHMARK.md](BENCHMARK.md)，不可用于跨项目对比。
 
 ---
 
@@ -229,7 +234,7 @@ graph TB
 ### Install (development)
 
 ```bash
-git clone https://github.com/xijingliu/ZMAI.git
+git clone https://github.com/lip20041219/zmai.git
 cd ZMAI
 python -m venv .venv
 .venv/Scripts/activate          # Windows; on Unix: source .venv/bin/activate

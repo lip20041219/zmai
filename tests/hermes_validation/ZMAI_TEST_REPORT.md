@@ -2,7 +2,7 @@
 
 **生成时间**: 2026-08-06
 **测试工程师**: Hermes Agent (自动化测试)
-**项目根目录**: D:\desk\ZMAI
+**项目根目录**: <project-root>
 
 ---
 
@@ -10,7 +10,7 @@
 
 | 项目 | 值 |
 |------|-----|
-| OS | Windows 10 (MECHREVO 机械革命) |
+| OS | Windows 10 (<user> 机械革命) |
 | Python | 3.11.9 (.venv) |
 | pytest | 9.1.1 |
 | claude CLI | 2.1.169 (未登录, authMethod=none) |
