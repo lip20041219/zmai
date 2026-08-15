@@ -676,6 +676,24 @@ def _translate_cmd(cmd: str) -> str:
     return cmd
 
 
+def _cap_shell_output(output: str, command: str, limit: int = 10000,
+                      tail_keep: int = 3000) -> str:
+    """截断 shell 输出，但对 pytest 命令保留尾部。
+
+    大型 pytest 输出的最终 summary 行（如 "1302 passed, 0 failed"）在输出
+    末尾。若按头截断会被切掉，导致 parse_test_totals() 解析为 0，误触发
+    baseline 回退。因此对 pytest/python -m pytest 命令：保留头部（失败
+    traceback）+ 尾部（summary），中间省略。普通 shell 命令维持原有限制。
+    """
+    if len(output) <= limit:
+        return output
+    if re.search(r"\bpytest\b|python\s+-m\s+pytest", command, re.IGNORECASE):
+        head = output[: max(0, limit - tail_keep)]
+        tail = output[-tail_keep:]
+        return f"{head}\n...[output truncated, {len(output)} chars]...\n{tail}"
+    return output[:limit]
+
+
 class ShellTool(Tool):
     name = "shell_exec"
     description = (
@@ -722,10 +740,12 @@ class ShellTool(Tool):
             if r.stderr:
                 output += f"\n[stderr]\n{r.stderr}"
             if r.returncode != 0:
-                result = ToolResult.err(error=f"exit {r.returncode}: {output[:5000]}",
-                                       metadata={"exit_code": r.returncode})
+                result = ToolResult.err(
+                    error=f"exit {r.returncode}: {_cap_shell_output(output, cmd, 5000)}",
+                    metadata={"exit_code": r.returncode})
             else:
-                result = ToolResult.ok(output=output[:10000], metadata={"exit_code": r.returncode})
+                result = ToolResult.ok(output=_cap_shell_output(output, cmd, 10000),
+                                       metadata={"exit_code": r.returncode})
         except subprocess.TimeoutExpired:
             result = ToolResult.err(f"timeout ({timeout}s)")
         except Exception as e:
