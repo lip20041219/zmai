@@ -128,7 +128,7 @@ complete                ← CompletionState 判定完成，自主停止
 
 ## 6. Demo
 
-![ZMAI Demo](docs/demo.gif)
+<video src="docs/zmai-demo.mp4" width="720" autoplay loop muted controls></video>
 
 一行命令修复真实 Bug：
 
@@ -267,7 +267,7 @@ zmai/
 │   └── ...
 ├── tests/                # 1307+ 测试
 ├── examples/             # 使用示例
-└── docs/                 # 文档 / demo.gif
+└── docs/                 # 文档 / zmai-demo.mp4
 ```
 
 ---
