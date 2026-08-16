@@ -119,7 +119,7 @@ class TestRecentMessages:
 
     def test_add_tool_result(self):
         r = RecentMessages(window_size=5)
-        slid = r.add_tool_result({"name": "read", "success": True, "output": "content"})
+        r.add_tool_result({"name": "read", "success": True, "output": "content"})
         assert len(r.tool_results) == 1
         assert r.tool_results[0]["name"] == "read"
 

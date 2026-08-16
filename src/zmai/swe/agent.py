@@ -530,7 +530,6 @@ class SWEAgent(Agent):
             step_tool_fail = 0
             guard: LoopGuard | None = context.metadata.get("loop_guard")
             had_modification = False
-            round_tests_passed = False
             # ── Read-limit tracking ──────────────────────────
             reads_without_test = context.metadata.get("reads_without_test", 0)
             has_run_test = context.metadata.get("has_run_test", False)
@@ -638,7 +637,6 @@ class SWEAgent(Agent):
                                 scope_complete=_scope_complete,
                             )
                         if passed:
-                            round_tests_passed = True
                             # 测试通过 → 退出修复态，清空失败后读取计数，进入"验证"阶段
                             test_failed = False
                             reads_after_fail = 0

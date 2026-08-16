@@ -81,7 +81,7 @@ class TestAuthStoreInit:
             patch("zmai.auth.store.CREDENTIALS_FILE", auth_dir / "credentials"),
             patch("zmai.auth.store._resolve_key", return_value=FIXED_KEY),
         ):
-            store = AuthStore()
+            AuthStore()
             assert auth_dir.is_dir()
 
     def test_init_without_credentials(self, auth_store: AuthStore):

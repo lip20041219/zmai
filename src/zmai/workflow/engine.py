@@ -116,7 +116,6 @@ class WorkflowEngine:
                         continue
 
         result.steps = step_results
-        any_failed = any(s.status == StepStatus.FAILED for s in step_results)
         last_failed = step_results and step_results[-1].status == StepStatus.FAILED
         result.status = WorkflowStatus.COMPLETED if not last_failed else WorkflowStatus.FAILED
         result.completed_at = _now()

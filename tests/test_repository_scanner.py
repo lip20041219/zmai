@@ -486,7 +486,6 @@ class TestFormatOutput:
         info = RepositoryScanner.scan(root)
         compact = RepositoryScanner.format_compact(info)
         # compact 格式应精简（不包含多行目录树）
-        lines = compact.strip().split("\n")
         # 应包含项目标记
         assert root.name in compact
         # 应包含文件引用

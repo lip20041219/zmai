@@ -243,7 +243,6 @@ def test_complete_then_no_more_llm_or_tool(tmp_path):
         metadata={},
     )
     asyncio.run(agent.initialize(ctx))
-    invokes_before = 0
     complete_step = None
     for i in range(6):
         action = asyncio.run(agent.step(ctx))
