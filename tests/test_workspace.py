@@ -53,12 +53,13 @@ def prepared_workspace(workspace: Workspace) -> tuple[Workspace, str, Path]:
 class TestWorkspaceInit:
     def test_create_with_default_root(self, tmp_root: Path) -> None:
         ws = Workspace(root=tmp_root)
-        assert ws._root == tmp_root
+        # resolve() 展开 Windows 8.3 短名（RUNNER~1 vs runneradmin）
+        assert ws._root.resolve() == tmp_root.resolve()
         assert ws._root.exists()
 
     def test_create_with_string_path(self, tmp_root: Path) -> None:
         ws = Workspace(root=str(tmp_root))
-        assert ws._root == tmp_root
+        assert ws._root.resolve() == tmp_root.resolve()
 
     def test_create_with_nonexistent_dir(self, tmp_root: Path) -> None:
         path = tmp_root / "nested" / "workspace"

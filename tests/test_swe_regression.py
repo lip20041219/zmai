@@ -496,7 +496,8 @@ class TestGrepEdgeCases:
         assert "regex" in r.error.lower()
 
     def test_unicode_pattern(self, ctx: ToolContext, ws: Path):
-        (ws / "data.txt").write_text("你好世界\nhello world\n")
+        # 显式 utf-8：Windows 默认 cp1252 无法编码中文
+        (ws / "data.txt").write_text("你好世界\nhello world\n", encoding="utf-8")
         t = GrepTool()
         r = t.execute(ctx, {"pattern": "你好"})
         assert r.success
