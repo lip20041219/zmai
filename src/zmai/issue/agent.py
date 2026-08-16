@@ -205,7 +205,6 @@ class IssueAgent:
 
     def _analyze(self, issue: IssueDescription) -> str:
         """分析 Issue：读取相关文件，理解问题。"""
-        task = issue.format_for_agent()
         lines: list[str] = [
             "## 问题分析",
             "",

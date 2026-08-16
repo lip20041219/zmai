@@ -174,7 +174,7 @@ class DeepSeekBackend(Backend):
 
 # ── Plugin descriptor ─────────────────────────────────────
 
-from zmai.gateway.plugin import BackendPlugin as _BackendPlugin
+from zmai.gateway.plugin import BackendPlugin as _BackendPlugin  # noqa: E402
 
 plugin = _BackendPlugin(
     name="deepseek",

@@ -336,9 +336,6 @@ class EvalHarness:
                     return set()
 
             runtime._gateway.register("mock", _MockEvalBackend, default=True)
-            backend = "mock"
-        else:
-            backend = self.backend_name
 
         # ── 3. 运行 Agent ────────────────────────────────────
         agent_task = (

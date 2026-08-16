@@ -336,7 +336,7 @@ class ClaudeBackend(Backend):
 # ── Plugin descriptor ─────────────────────────────────────
 # 供 PluginRegistry 自动发现
 
-from zmai.gateway.plugin import BackendPlugin as _BackendPlugin
+from zmai.gateway.plugin import BackendPlugin as _BackendPlugin  # noqa: E402
 
 plugin = _BackendPlugin(
     name="claude",

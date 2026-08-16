@@ -246,7 +246,7 @@ class TestEmptyAssistantMessage:
                 tools=registry,
                 metadata={"messages": []},
             )
-            action = await agent.step(ctx)
+            await agent.step(ctx)
             msgs = ctx.metadata.get("messages", [])
             # 不应有空 content 的 assistant 消息
             for msg in msgs:
@@ -307,7 +307,7 @@ class TestEmptyAssistantMessage:
                 tools=registry,
                 metadata={"messages": []},
             )
-            action = await agent.step(ctx)
+            await agent.step(ctx)
             msgs = ctx.metadata.get("messages", [])
             assistant_msgs = [m for m in msgs if m.get("role") == "assistant"]
             assert len(assistant_msgs) >= 1

@@ -312,7 +312,7 @@ class TestTaskCancellation:
         rt = runtime_with_cancel_mock
 
         async def run_and_cancel():
-            task = asyncio.create_task(
+            asyncio.create_task(
                 rt.run(agent_id="cancel_test", task="do something", backend="cancel_mock")
             )
             await asyncio.sleep(0.05)
@@ -333,7 +333,7 @@ class TestTaskCancellation:
         rt = runtime_with_cancel_mock
 
         async def run_and_cancel():
-            task = asyncio.create_task(
+            asyncio.create_task(
                 rt.run(agent_id="cancel_test2", task="do something", backend="cancel_mock")
             )
             await asyncio.sleep(0.05)

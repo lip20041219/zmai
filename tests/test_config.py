@@ -174,7 +174,6 @@ class TestCLISource:
         assert src.load() == {"backend": "deepseek"}
 
     def test_empty_args(self):
-        src = CLISource([])
         # CLISource 使用 args or sys.argv，空列表会被 or 忽略
         # 所以 mock sys.argv 确保不读真实参数
         import sys
@@ -252,9 +251,6 @@ class TestConfig:
             def load(self):
                 return {"key": "from_cli"}
 
-        cfg = Config(sources=[MockEnv("ZMAI_"), MockCLI([])])
-        # 实际上这里 File 源是 Config 默认的，但我们在 sources 中指定
-        # 直接用 Mock 测试
         cfg2 = Config(sources=[FileSource(f), MockEnv("ZMAI_")])
         assert cfg2.get("key") == "from_env"  # Env 覆盖 File
 
