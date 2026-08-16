@@ -4,11 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from zmai.config import Config
-from zmai.gateway import BackendRegistry
-from zmai.gateway.backends import ClaudeBackend
-from zmai.runtime import Runtime
-from zmai.swe.agent import SWEAgent
 from zmai.swe.tools import ReadFileTool, ShellTool, WriteFileTool
 from zmai.tool import ToolContext, ToolRegistry
 

@@ -6,7 +6,8 @@ import json
 import logging
 import urllib.error
 import urllib.request
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 from zmai.errors import BackendError
 from zmai.gateway.base import (

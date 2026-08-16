@@ -7,7 +7,6 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # ── ANSI 转义码 ──────────────────────────────────────────────
 
 class _ANSICodes:

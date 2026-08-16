@@ -5,10 +5,8 @@ from __future__ import annotations
 import shutil
 import sys
 from pathlib import Path
-from typing import Any
 
 from zmai.cli.formatters import Theme
-
 
 PLUGINS_HOME = Path.home() / ".zmai" / "backends"
 
@@ -25,7 +23,7 @@ def run_plugin(argv: list[str]) -> None:
         files = sorted(PLUGINS_HOME.glob("*.py"))
         if not files:
             print("no plugins installed.")
-            print(f"  use: zmai plugin install <file.py>")
+            print("  use: zmai plugin install <file.py>")
             return
         theme = Theme.dark()
         print(f"  {theme.dim('Plugin directory:')}")

@@ -16,7 +16,6 @@
 import argparse
 import asyncio
 import json
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -24,8 +23,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]  # ZMAI 根
 sys.path.insert(0, str(ROOT))
 
-from zmai.runtime import Runtime  # noqa: E402
 from zmai.config import Config  # noqa: E402
+from zmai.runtime import Runtime  # noqa: E402
 
 DEMO = ROOT / "tests" / "hermes_validation" / "swe_fix_demo"
 

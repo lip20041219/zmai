@@ -6,17 +6,17 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
-from typing import Any
 
 from zmai.agent import Agent, AgentAction, AgentContext, AgentResult, AgentState
 from zmai.errors import BackendError
 from zmai.gateway import Backend
 from zmai.gateway.base import BackendRequest, BackendResponse
-from zmai.swe.models import Plan, MAX_REPLANS, format_plan_summary
-from zmai.swe.planner import generate_plan
+from zmai.swe._async_utils import run_sync
 from zmai.swe.completion import CompletionState
 from zmai.swe.context import ContextManager
-from zmai.swe.loop_guard import LoopGuard, LoopResult
+from zmai.swe.loop_guard import LoopGuard
+from zmai.swe.models import MAX_REPLANS, Plan, format_plan_summary
+from zmai.swe.planner import generate_plan
 from zmai.swe.scanner import RepositoryInfo, RepositoryScanner
 from zmai.swe.tools import (
     EditTool,
@@ -28,17 +28,13 @@ from zmai.swe.tools import (
     ShowToUserTool,
     WriteFileTool,
 )
-from zmai.tool import ToolCall, ToolContext, ToolResult
 from zmai.swe.verifier import (
-    VerificationCheck,
     VerificationResult,
     auto_generate_checks,
     parse_test_totals,
-    verify_file_exists,
-    verify_exit_code,
     verify_test_output,
 )
-from zmai.swe._async_utils import run_sync
+from zmai.tool import ToolContext, ToolResult
 
 logger = logging.getLogger("zmai.swe.agent")
 
@@ -187,7 +183,7 @@ Do NOT skip phases. Do NOT reorder phases.
 9. READ-TO-FIX LIMIT — after a test failure, you may read at most a few (default 3) files before you MUST emit an `edit` or `write_file` call to fix the code. If you have not modified anything after reading 3 files post-failure, STOP reading and make your best fix now.
 10. NEVER loop: test-fail → read → test-fail → read with no modification. Each pass must move toward an edit. If your read is not advancing you toward a concrete fix, make the fix.
 11. FIX-DRIVEN TOOL CADENCE (mandatory when tests FAIL) — the ONLY acceptable tool sequence is: `shell_exec` (run pytest) → at most 3 `read_file`/`grep` to diagnose → an `edit` or `write_file` that changes code → `shell_exec` (rerun pytest). If you are in the fix phase and you call `read_file` or `grep` without having made a code change, you are failing the task.
-12. The runtime reports a "LIVE REPAIR STATUS" section each step. If it says tests are FAILING, your very next write tool call (`edit` or `write_file`) is MANDATORY — stop reading and make the edit now, even if you are not fully certain of the fix. A verifiable edit is strictly better than endless reading."""
+12. The runtime reports a "LIVE REPAIR STATUS" section each step. If it says tests are FAILING, your very next write tool call (`edit` or `write_file`) is MANDATORY — stop reading and make the edit now, even if you are not fully certain of the fix. A verifiable edit is strictly better than endless reading."""  # noqa: E501
 
 _PLAN_EXECUTION_PROMPT = """
 ## Execution Plan (mandatory)
@@ -238,7 +234,7 @@ def _build_system_prompt(backend: Backend | None = None) -> str:
         bm = getattr(backend, "model", "") or ""
         bp = getattr(backend, "provider", "") or ""
         if bn:
-            identity_parts.append(f"## Your Identity")
+            identity_parts.append("## Your Identity")
             identity_parts.append(f"You are running on {bp.upper() if bp else bn} Backend.")
             if bm:
                 identity_parts.append(f"Current model: {bm}.")
@@ -694,10 +690,12 @@ class SWEAgent(Agent):
                                 _plan_msg = ""
                                 try:
                                     from zmai.swe.failure import (
-                                        format_failure, parse_test_failure,
+                                        format_failure,
+                                        parse_test_failure,
                                     )
                                     from zmai.swe.fix_planner import (
-                                        format_plan, generate_fix_plan,
+                                        format_plan,
+                                        generate_fix_plan,
                                     )
                                     _issue = parse_test_failure(
                                         _fail_text,
@@ -711,8 +709,8 @@ class SWEAgent(Agent):
                                 except Exception:
                                     _plan_msg = ""
                                 cm.add_message("user",
-                                    "[Repair Plan] 测试失败。请按以下闭环立即修复（不要只读不修）：\n"
-                                    "1. 诊断：从上面的失败信息找出根因（必要时只读取最相关的 1-2 个源码文件）\n"
+                                    "[Repair Plan] 测试失败。请按以下闭环立即修复（不要只读不修）：\n"  # noqa: E501
+                                    "1. 诊断：从上面的失败信息找出根因（必要时只读取最相关的 1-2 个源码文件）\n"  # noqa: E501
                                     "2. 计划：明确要修改哪个文件、添加或改动什么代码\n"
                                     "3. 修改：用 `edit` 或 `write_file` 工具实施修改\n"
                                     "4. 验证：重新运行 `python -m pytest`，直到通过\n"
@@ -723,7 +721,7 @@ class SWEAgent(Agent):
                                     try:
                                         _l.record_step(phase="repair", action="inject_plan",
                                                        success=False,
-                                                       metadata={"cycle": context.metadata.get("repair_cycle", 0)})
+                                                       metadata={"cycle": context.metadata.get("repair_cycle", 0)})  # noqa: E501
                                     except Exception:
                                         pass
                 # ── Track reads before test ─────────────
@@ -845,7 +843,7 @@ class SWEAgent(Agent):
             if not has_run_test and reads_without_test >= read_limit:
                 cm.add_message("user",
                     f"[Workflow] 你已读取 {reads_without_test} 个文件但尚未运行测试。\n"
-                    f"请立即运行 `python -m pytest`（或项目的测试命令），根据测试失败信息修复代码。\n"
+                    f"请立即运行 `python -m pytest`（或项目的测试命令），根据测试失败信息修复代码。\n"  # noqa: E501
                     f"在运行测试之前不要再读取更多文件。"
                 )
                 # Reset counter to avoid repeated messages
@@ -859,7 +857,7 @@ class SWEAgent(Agent):
             # 测试失败后只读不修达到阈值 → 强制进入修改阶段（读取永远无法让测试通过）。
             if test_failed and reads_after_fail >= fix_read_limit:
                 logger.warning(
-                    "FixDriving: test failed, %d reads after failure without modification — forcing fix phase",
+                    "FixDriving: test failed, %d reads after failure without modification — forcing fix phase",  # noqa: E501
                     reads_after_fail,
                 )
                 _stats(context, fixdriving_activations=1)
@@ -869,7 +867,7 @@ class SWEAgent(Agent):
                 # 结构性拦截：下一轮起禁止 read_file/grep，直到 agent 产生一次修改
                 context.metadata["force_edit"] = True
                 cm.add_message("user",
-                    f"[FixDriving] 测试已失败，但你已读取 {reads_after_fail} 个相关文件仍未修改代码（当前阶段：{repair_phase}）。\n"
+                    f"[FixDriving] 测试已失败，但你已读取 {reads_after_fail} 个相关文件仍未修改代码（当前阶段：{repair_phase}）。\n"  # noqa: E501
                     f"读取不会让测试通过——你必须做出修改。\n"
                     f"请停止读取，立即用 `edit` 或 `write_file` 工具修改代码来修复失败的测试。\n"
                     f"先做出你认为正确的修改，然后重新运行 `python -m pytest` 验证。"
@@ -916,7 +914,7 @@ class SWEAgent(Agent):
                         context.metadata["force_edit"] = True
                         context.metadata["repair_phase"] = "plan"
                     recovery_msg = (
-                        f"[LoopGuard][LoopRecovery] 检测到重复的无进展动作（第 {recoveries} 次恢复）。\n"
+                        f"[LoopGuard][LoopRecovery] 检测到重复的无进展动作（第 {recoveries} 次恢复）。\n"  # noqa: E501
                         f"原因: {loop_result.reason}（{loop_result.suggestion}）\n"
                         f"之前的无效动作:\n{recent_txt}\n"
                         f"下一步必须:\n"
@@ -975,7 +973,7 @@ class SWEAgent(Agent):
                 # Clear old plan, next step will auto-regenerate
                 context.metadata.pop("execution_plan", None)
                 cm.add_message("user",
-                    f"Plan not fully executed ({plan.completed_steps}/{len(plan.steps)} steps done). "
+                    f"Plan not fully executed ({plan.completed_steps}/{len(plan.steps)} steps done). "  # noqa: E501
                     f"Generate a new execution plan for the remaining work."
                 )
                 context.metadata["messages"] = cm.get_context()

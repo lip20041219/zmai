@@ -11,11 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import sys
 from pathlib import Path
-from types import SimpleNamespace
-
-import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 

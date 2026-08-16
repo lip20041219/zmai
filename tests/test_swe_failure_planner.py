@@ -11,11 +11,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-import pytest
-
 from zmai.swe.failure import format_failure, parse_test_failure
 from zmai.swe.fix_planner import format_plan, generate_fix_plan
-
 
 # ═══════════════════════════════════════════════════════════════════
 # P2 — Failure Parser
@@ -124,14 +121,19 @@ def _messages_text(ctx) -> str:
 class TestRepairPlanEndToEnd:
     def test_failure_injects_semantic_analysis_and_plan(self, tmp_path: Path):
         """Agent 首次失败时应注入 [Repair Plan]，且含语义分析与修复计划。"""
+        from collections.abc import Iterator
+
         from zmai.agent import AgentContext
         from zmai.gateway.base import (
-            Backend, BackendCapability, BackendEvent,
-            BackendRequest, BackendResponse, TokenUsage,
+            Backend,
+            BackendCapability,
+            BackendEvent,
+            BackendRequest,
+            BackendResponse,
+            TokenUsage,
         )
         from zmai.swe.agent import SWEAgent
         from zmai.tool import ToolCall, ToolRegistry
-        from typing import Iterator
 
         # 真实 Flask 项目（缺路由 → 404）
         (tmp_path / "app.py").write_text(

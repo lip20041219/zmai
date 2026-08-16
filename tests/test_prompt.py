@@ -8,7 +8,6 @@ from zmai.prompt import PromptEngine, PromptRole, PromptType
 from zmai.prompt.base import PromptTemplate, TemplateEngine
 from zmai.prompt.templates import DEFAULT_TEMPLATES
 
-
 # ── 测试: PromptType ─────────────────────────────────────────
 
 
@@ -459,9 +458,9 @@ class TestDefaultTemplates:
         required_vars: dict[str, list[str]] = {
             "system": ["agent_name", "description", "workspace_path", "backend_name", "max_steps"],
             "planner": ["task", "context", "max_steps"],
-            "executor": ["plan", "step_number", "step_description", "total_steps", "tool_descriptions"],
+            "executor": ["plan", "step_number", "step_description", "total_steps", "tool_descriptions"],  # noqa: E501
             "verifier": ["step_description", "execution_result", "verification_criteria"],
-            "report": ["task", "execution_summary", "steps_details", "total_steps", "completed_steps"],
+            "report": ["task", "execution_summary", "steps_details", "total_steps", "completed_steps"],  # noqa: E501
         }
         for ptype, vars in required_vars.items():
             template = DEFAULT_TEMPLATES.get(ptype, "")

@@ -15,11 +15,16 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
-from zmai.agent import Agent, AgentAction, AgentContext, AgentResult, AgentState
+from tests.mocks import (
+    ConnectionErrorBackend,
+    InfiniteLoopBackend,
+)
+from zmai.agent import AgentState
 from zmai.config.config import Config
 from zmai.errors import RuntimeError
 from zmai.gateway.base import (
@@ -32,12 +37,6 @@ from zmai.gateway.base import (
 )
 from zmai.runtime import LifecycleManager, Runtime
 from zmai.tool import Tool, ToolCall, ToolContext, ToolResult
-
-from tests.mocks import (
-    ConnectionErrorBackend,
-    InfiniteLoopBackend,
-    SuccessBackend,
-)
 
 # ═══════════════════════════════════════════════════════════════
 # Helpers

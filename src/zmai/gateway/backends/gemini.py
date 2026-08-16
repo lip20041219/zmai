@@ -10,7 +10,8 @@ import json
 import logging
 import urllib.error
 import urllib.request
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 from zmai.errors import BackendError
 from zmai.gateway.base import (
@@ -203,7 +204,7 @@ class GeminiBackend(Backend):
             "contents": contents,
             "generationConfig": {
                 "maxOutputTokens": request.max_tokens or self._max_tokens,
-                "temperature": request.temperature if request.temperature is not None else self._temperature,
+                "temperature": request.temperature if request.temperature is not None else self._temperature,  # noqa: E501
             },
         }
 

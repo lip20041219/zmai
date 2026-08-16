@@ -8,11 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 import threading
-import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -68,7 +66,6 @@ FILE_CATEGORIES: dict[str, str] = {
     ".swift": "code",
     ".kt": "code",
     ".scala": "code",
-    ".rs": "code",
     ".sh": "code",
     ".bash": "code",
     ".zsh": "code",
@@ -887,7 +884,7 @@ class Workspace:
             agent_path_resolved.relative_to(self._root)
         except ValueError:
             raise WorkspaceError(
-                f"Agent 工作区必须在 workspace root 下",
+                "Agent 工作区必须在 workspace root 下",
                 path=str(agent_path),
             )
 

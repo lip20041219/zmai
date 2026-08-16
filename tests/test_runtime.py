@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
-from typing import Any, Iterator
-from unittest.mock import patch
+from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
+from tests.mocks import ConnectionErrorBackend, InfiniteLoopBackend
+from zmai.agent import AgentContext, AgentState
 from zmai.config.config import Config
 from zmai.gateway.base import (
     Backend,
@@ -18,12 +19,8 @@ from zmai.gateway.base import (
     BackendResponse,
     TokenUsage,
 )
-from zmai.gateway.registry import BackendRegistry
-from zmai.agent import AgentContext, AgentState
 from zmai.runtime import Runtime
 from zmai.tool import Tool, ToolCall, ToolContext, ToolResult
-from tests.mocks import ConnectionErrorBackend, InfiniteLoopBackend
-
 
 # ═══════════════════════════════════════════════════════════════
 # MockBackend
@@ -321,7 +318,6 @@ class TestTaskCancellation:
             await asyncio.sleep(0.5)
             # 取消后状态应为 terminal（cancelled 或 completed 均为可能）
             state = rt._lifecycle.get_state("cancel_test")
-            from zmai.agent import AgentState
             assert state in ("cancelled", "timeout", "completed", "failed"), (
                 f"取消后应为 terminal 状态，实际 {state}"
             )
@@ -341,7 +337,6 @@ class TestTaskCancellation:
             await asyncio.sleep(0.5)
             # 取消后的状态应为 terminal（不再是 executing）
             state = rt._lifecycle.get_state("cancel_test2")
-            from zmai.agent import AgentState
             assert state in ("cancelled", "timeout", "completed", "failed"), (
                 f"取消后应为 terminal 状态，实际 {state}"
             )

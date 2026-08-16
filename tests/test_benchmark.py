@@ -10,8 +10,8 @@ import pytest
 
 from zmai.eval import (
     BenchmarkRunner,
-    BenchmarkTask,
     BenchmarkStats,
+    BenchmarkTask,
     ResultCollector,
     ScoreReporter,
     StepTokenUsage,
@@ -54,7 +54,7 @@ class TestTaskLoader:
              "prompt": "def sub(a,b): return a-b", "test": "assert sub(5,3)==2",
              "entry_point": "sub"},
         ]
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:  # noqa: E501
             json.dump(data, f)
             tmp_path = f.name
         try:
@@ -71,7 +71,7 @@ class TestTaskLoader:
             loader.load("unknown_source")
 
     def test_benchmark_task_to_dict(self):
-        task = BenchmarkTask(id="test_001", source="custom", description="test task", repo="owner/repo", verification={"command": "pytest"})
+        task = BenchmarkTask(id="test_001", source="custom", description="test task", repo="owner/repo", verification={"command": "pytest"})  # noqa: E501
         d = task.to_dict()
         assert d["id"] == "test_001"
         assert d["source"] == "custom"
@@ -116,8 +116,8 @@ class TestResultCollector:
     def test_collect_with_token_logs(self):
         results = [EvalResult(task_id="t1", status="PASS", duration=5.0)]
         logs = [
-            StepTokenUsage(step_id=1, phase="tool_call", input_tokens=500, output_tokens=200, duration_ms=1000),
-            StepTokenUsage(step_id=2, phase="tool_result", input_tokens=100, output_tokens=50, duration_ms=500),
+            StepTokenUsage(step_id=1, phase="tool_call", input_tokens=500, output_tokens=200, duration_ms=1000),  # noqa: E501
+            StepTokenUsage(step_id=2, phase="tool_result", input_tokens=100, output_tokens=50, duration_ms=500),  # noqa: E501
         ]
         collector = ResultCollector(model="deepseek-chat")
         stats = collector.collect(results, token_logs=logs)
@@ -128,8 +128,8 @@ class TestResultCollector:
 
     def test_collect_per_task_summary(self):
         results = [
-            EvalResult(task_id="t1", status="PASS", duration=5.0, steps=3, error=None, agent_status="completed"),
-            EvalResult(task_id="t2", status="FAIL", duration=10.0, steps=5, error="verification failed", agent_status="completed"),
+            EvalResult(task_id="t1", status="PASS", duration=5.0, steps=3, error=None, agent_status="completed"),  # noqa: E501
+            EvalResult(task_id="t2", status="FAIL", duration=10.0, steps=5, error="verification failed", agent_status="completed"),  # noqa: E501
         ]
         collector = ResultCollector()
         stats = collector.collect(results)
@@ -158,11 +158,11 @@ class _Fixture:
             avg_input_tokens=250.0, avg_output_tokens=150.0,
             estimated_cost_usd=0.005, model_used="mock",
             per_task=[
-                {"task_id": "t1", "status": "PASS", "duration_s": 5.0, "steps": 3, "error": "", "agent_status": "completed"},
-                {"task_id": "t2", "status": "PASS", "duration_s": 8.0, "steps": 4, "error": "", "agent_status": "completed"},
-                {"task_id": "t3", "status": "PASS", "duration_s": 10.0, "steps": 5, "error": "", "agent_status": "completed"},
-                {"task_id": "t4", "status": "FAIL", "duration_s": 15.0, "steps": 7, "error": "verification failed", "agent_status": "completed"},
-                {"task_id": "t5", "status": "TIMEOUT", "duration_s": 30.0, "steps": 20, "error": "", "agent_status": "timeout"},
+                {"task_id": "t1", "status": "PASS", "duration_s": 5.0, "steps": 3, "error": "", "agent_status": "completed"},  # noqa: E501
+                {"task_id": "t2", "status": "PASS", "duration_s": 8.0, "steps": 4, "error": "", "agent_status": "completed"},  # noqa: E501
+                {"task_id": "t3", "status": "PASS", "duration_s": 10.0, "steps": 5, "error": "", "agent_status": "completed"},  # noqa: E501
+                {"task_id": "t4", "status": "FAIL", "duration_s": 15.0, "steps": 7, "error": "verification failed", "agent_status": "completed"},  # noqa: E501
+                {"task_id": "t5", "status": "TIMEOUT", "duration_s": 30.0, "steps": 20, "error": "", "agent_status": "timeout"},  # noqa: E501
             ],
             token_breakdown=[],
         )
@@ -182,7 +182,7 @@ class TestScoreReporter:
     def test_json_roundtrip(self):
         stats = _Fixture.make_stats()
         reporter = ScoreReporter()
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:  # noqa: E501
             tmp_path = f.name
         try:
             reporter.to_json(stats, path=tmp_path)
@@ -202,7 +202,7 @@ class TestScoreReporter:
     def test_markdown_to_file(self):
         stats = _Fixture.make_stats()
         reporter = ScoreReporter()
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:  # noqa: E501
             tmp_path = f.name
         try:
             reporter.to_markdown(stats, path=tmp_path)
@@ -222,7 +222,7 @@ class TestScoreReporter:
     def test_csv_to_file(self):
         stats = _Fixture.make_stats()
         reporter = ScoreReporter()
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8") as f:  # noqa: E501
             tmp_path = f.name
         try:
             reporter.to_csv(stats, path=tmp_path)
@@ -341,10 +341,10 @@ class TestCLIIntegration:
 
     def test_run_eval_custom_with_output_file(self):
         from zmai.cli.eval_cmd import _cmd_custom
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:  # noqa: E501
             tmp_path = f.name
         try:
-            _cmd_custom(["--output", "json", "--output-file", tmp_path, "--backend", "mock", "--max-steps", "2"])
+            _cmd_custom(["--output", "json", "--output-file", tmp_path, "--backend", "mock", "--max-steps", "2"])  # noqa: E501
             content = Path(tmp_path).read_text(encoding="utf-8")
             data = json.loads(content)
             assert "summary" in data
@@ -359,7 +359,7 @@ class TestCLIIntegration:
 
     def test_parse_common_args_custom(self):
         from zmai.cli.eval_cmd import _parse_common_args
-        args = _parse_common_args(["--output", "json", "--output-file", "report.json", "--backend", "deepseek", "--max-steps", "50"])
+        args = _parse_common_args(["--output", "json", "--output-file", "report.json", "--backend", "deepseek", "--max-steps", "50"])  # noqa: E501
         assert args["output"] == "json"
         assert args["output_file"] == "report.json"
         assert args["backend"] == "deepseek"

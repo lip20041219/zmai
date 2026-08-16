@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -172,12 +172,12 @@ def validate_plan_dict(data: dict[str, Any]) -> tuple[bool, str]:
 def format_plan_summary(plan: Plan) -> str:
     """Format as readable plan summary (for injection into system prompt)."""
     lines = [
-        f"## Execution Plan",
+        "## Execution Plan",
         f"Objective: {plan.goal}",
         f"Complexity: {plan.estimated_complexity}",
     ]
     if plan.assumptions:
-        lines.append(f"Assumptions:")
+        lines.append("Assumptions:")
         for a in plan.assumptions:
             lines.append(f"  - {a}")
     if plan.files_to_modify:
@@ -186,7 +186,7 @@ def format_plan_summary(plan: Plan) -> str:
         lines.append(f"Expected: {plan.expected_outcome[:120]}")
     if plan.verification_strategy:
         lines.append(f"Verification: {plan.verification_strategy[:120]}")
-    lines.append(f"Steps:")
+    lines.append("Steps:")
     for s in plan.steps:
         status_mark = {
             "pending": "⏳",
@@ -203,7 +203,7 @@ def format_plan_summary(plan: Plan) -> str:
             lines.append(f"     Verify: {s.verification_strategy[:100]}")
 
     if plan.risks:
-        lines.append(f"Risks:")
+        lines.append("Risks:")
         for r in plan.risks:
             lines.append(f"  - {r}")
 

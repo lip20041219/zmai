@@ -14,18 +14,22 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 from zmai.agent import AgentContext
 from zmai.gateway.base import (
-    Backend, BackendCapability, BackendEvent,
-    BackendRequest, BackendResponse, TokenUsage,
+    Backend,
+    BackendCapability,
+    BackendEvent,
+    BackendRequest,
+    BackendResponse,
+    TokenUsage,
 )
 from zmai.swe.agent import SWEAgent
 from zmai.swe.completion import CompletionState
-from zmai.swe.verifier import parse_test_totals
 from zmai.swe.tools import _cap_shell_output
+from zmai.swe.verifier import parse_test_totals
 from zmai.tool import ToolCall, ToolRegistry
 
 
@@ -40,7 +44,7 @@ def _write_project(tmp_path: Path) -> None:
     lines.append("def test_fix2():\n    assert bug.FIXED\n")
     (tmp_path / "test_all.py").write_text("".join(lines), encoding="utf-8")
     # test_app.py：子集，7 个恒过测试。
-    sub = ["def test_sub%d():\n    assert True\n" % i for i in range(7)]
+    sub = [f"def test_sub{i}():\n    assert True\n" for i in range(7)]
     (tmp_path / "test_app.py").write_text("".join(sub), encoding="utf-8")
 
 
@@ -295,7 +299,7 @@ def test_stale_verification_does_not_override_green_completion(tmp_path):
             break
     from zmai.agent import AgentState
     assert final is not None
-    assert final.status == AgentState.COMPLETED, f"全绿完成不得被过期 verification 覆盖: {final.status}"
+    assert final.status == AgentState.COMPLETED, f"全绿完成不得被过期 verification 覆盖: {final.status}"  # noqa: E501
     assert ctx.metadata["test_success_count"] == 1
 
 

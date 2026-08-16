@@ -2,21 +2,18 @@
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
-
-import pytest
 
 from zmai.swe.verifier import (
     VerificationCheck,
     VerificationResult,
-    verify_file_exists,
-    verify_file_content,
-    verify_exit_code,
-    verify_test_output,
-    verify_git_diff,
     auto_generate_checks,
+    verify_exit_code,
+    verify_file_content,
+    verify_file_exists,
+    verify_git_diff,
+    verify_test_output,
 )
 
 
@@ -27,7 +24,7 @@ class TestVerificationResult:
         """所有检查通过 → passed=True。"""
         vr = VerificationResult(
             passed=True,
-            checks=[VerificationCheck(name="check1", strategy="file_exists", passed=True, target="f.txt", evidence="存在")],
+            checks=[VerificationCheck(name="check1", strategy="file_exists", passed=True, target="f.txt", evidence="存在")],  # noqa: E501
             summary="1/1 通过",
         )
         assert vr.passed is True
@@ -39,8 +36,8 @@ class TestVerificationResult:
         vr = VerificationResult(
             passed=False,
             checks=[
-                VerificationCheck(name="c1", strategy="file_exists", passed=True, target="f1", evidence="存在"),
-                VerificationCheck(name="c2", strategy="file_exists", passed=False, target="f2", evidence="不存在", error="not found"),
+                VerificationCheck(name="c1", strategy="file_exists", passed=True, target="f1", evidence="存在"),  # noqa: E501
+                VerificationCheck(name="c2", strategy="file_exists", passed=False, target="f2", evidence="不存在", error="not found"),  # noqa: E501
             ],
             summary="1/2 通过",
         )
@@ -51,10 +48,10 @@ class TestVerificationResult:
     def test_merge_all_pass(self):
         """merge 全部通过 → passed=True。"""
         r1 = VerificationResult(passed=True, checks=[
-            VerificationCheck(name="c1", strategy="file_exists", passed=True, target="f1", evidence="ok"),
+            VerificationCheck(name="c1", strategy="file_exists", passed=True, target="f1", evidence="ok"),  # noqa: E501
         ])
         r2 = VerificationResult(passed=True, checks=[
-            VerificationCheck(name="c2", strategy="file_exists", passed=True, target="f2", evidence="ok"),
+            VerificationCheck(name="c2", strategy="file_exists", passed=True, target="f2", evidence="ok"),  # noqa: E501
         ])
         merged = VerificationResult.merge([r1, r2])
         assert merged.passed is True
@@ -63,10 +60,10 @@ class TestVerificationResult:
     def test_merge_any_fail(self):
         """merge 中有失败 → passed=False。"""
         r1 = VerificationResult(passed=True, checks=[
-            VerificationCheck(name="c1", strategy="file_exists", passed=True, target="f1", evidence="ok"),
+            VerificationCheck(name="c1", strategy="file_exists", passed=True, target="f1", evidence="ok"),  # noqa: E501
         ])
         r2 = VerificationResult(passed=False, checks=[
-            VerificationCheck(name="c2", strategy="file_exists", passed=False, target="f2", evidence="no", error="not found"),
+            VerificationCheck(name="c2", strategy="file_exists", passed=False, target="f2", evidence="no", error="not found"),  # noqa: E501
         ])
         merged = VerificationResult.merge([r1, r2])
         assert merged.passed is False
@@ -76,7 +73,7 @@ class TestVerificationResult:
         """to_dict 包含所有字段。"""
         vr = VerificationResult(
             passed=True,
-            checks=[VerificationCheck(name="c", strategy="file_exists", passed=True, target="f", evidence="ok")],
+            checks=[VerificationCheck(name="c", strategy="file_exists", passed=True, target="f", evidence="ok")],  # noqa: E501
             summary="1/1",
         )
         d = vr.to_dict()
@@ -254,12 +251,12 @@ class TestAutoGenerateChecks:
             modified_files=["test_main.py"],
             tool_results=[
                 {"name": "shell_exec", "success": True, "output": "PASSED: 3 tests passed"},
-                {"name": "pytest", "success": False, "output": "FAILED: 1 test failed\nAssertionError"},
+                {"name": "pytest", "success": False, "output": "FAILED: 1 test failed\nAssertionError"},  # noqa: E501
             ],
         )
         test_checks = [c for c in results.checks if c.strategy == "test_output"]
         if test_checks:
-            any_failed = any(not c.passed for c in test_checks)
+            any(not c.passed for c in test_checks)
             # 只要有 failed 信号，验证就不通过
 
     def test_auto_with_shell_error_signal(self):
@@ -272,7 +269,7 @@ class TestAutoGenerateChecks:
         )
         exit_checks = [c for c in results.checks if c.strategy == "exit_code"]
         # 至少有一个失败检查
-        any_failed = any(not c.passed for c in exit_checks)
+        any(not c.passed for c in exit_checks)
 
 
 class TestIntegrationSWEAgent:
@@ -287,7 +284,7 @@ class TestIntegrationSWEAgent:
             passed=True,
             checks=[
                 VerificationCheck(
-                    name=f"文件存在: created.txt",
+                    name="文件存在: created.txt",
                     strategy="file_exists",
                     passed=True,
                     target="created.txt",
@@ -304,7 +301,7 @@ class TestIntegrationSWEAgent:
             passed=False,
             checks=[
                 VerificationCheck(
-                    name=f"文件存在: missing.txt",
+                    name="文件存在: missing.txt",
                     strategy="file_exists",
                     passed=False,
                     target="missing.txt",
@@ -329,8 +326,8 @@ class TestIntegrationSWEAgent:
         vresult = VerificationResult(
             passed=False,
             checks=[
-                VerificationCheck(name="文件存在", strategy="file_exists", passed=True, target="a.txt", evidence="存在"),
-                VerificationCheck(name="测试结果", strategy="test_output", passed=False, target="", evidence="FAILED", error="test failed"),
+                VerificationCheck(name="文件存在", strategy="file_exists", passed=True, target="a.txt", evidence="存在"),  # noqa: E501
+                VerificationCheck(name="测试结果", strategy="test_output", passed=False, target="", evidence="FAILED", error="test failed"),  # noqa: E501
             ],
             summary="1/2 通过",
         )
@@ -342,7 +339,7 @@ class TestIntegrationSWEAgent:
         # 模拟 finalize 检查
         vresult = VerificationResult(
             passed=False,
-            checks=[VerificationCheck(name="内容验证", strategy="file_content", passed=False, target="f.py", evidence="空文件", error="empty content")],
+            checks=[VerificationCheck(name="内容验证", strategy="file_content", passed=False, target="f.py", evidence="空文件", error="empty content")],  # noqa: E501
             summary="0/1 通过",
         )
         has_vresult = True
@@ -355,16 +352,16 @@ class TestVerificationEdgeCases:
 
     def test_verify_result_has_failed_checks(self):
         """failed_checks 正确返回。"""
-        check_pass = VerificationCheck(name="p1", strategy="file_exists", passed=True, target="f1", evidence="ok")
-        check_fail = VerificationCheck(name="p2", strategy="file_exists", passed=False, target="f2", evidence="no", error="not found")
+        check_pass = VerificationCheck(name="p1", strategy="file_exists", passed=True, target="f1", evidence="ok")  # noqa: E501
+        check_fail = VerificationCheck(name="p2", strategy="file_exists", passed=False, target="f2", evidence="no", error="not found")  # noqa: E501
         vr = VerificationResult(passed=False, checks=[check_pass, check_fail], summary="")
         assert len(vr.failed_checks) == 1
         assert vr.failed_checks[0].name == "p2"
 
     def test_verify_result_passed_checks(self):
         """passed_checks 正确返回。"""
-        check_pass = VerificationCheck(name="p1", strategy="file_exists", passed=True, target="f1", evidence="ok")
-        check_fail = VerificationCheck(name="p2", strategy="file_exists", passed=False, target="f2", evidence="no")
+        check_pass = VerificationCheck(name="p1", strategy="file_exists", passed=True, target="f1", evidence="ok")  # noqa: E501
+        check_fail = VerificationCheck(name="p2", strategy="file_exists", passed=False, target="f2", evidence="no")  # noqa: E501
         vr = VerificationResult(passed=False, checks=[check_pass, check_fail], summary="")
         assert len(vr.passed_checks) == 1
         assert vr.passed_checks[0].name == "p1"

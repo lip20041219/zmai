@@ -9,8 +9,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from zmai.swe.tools import EditTool, _normalize_new_lines
 from zmai.tool import ToolContext
 
@@ -40,7 +38,7 @@ def test_normalize_adds_trailing_newline():
 
 def test_replace_lines_no_join_bug(tmp_path):
     """replace_lines 替换单行时 new_text 无结尾换行，不得拼接下一行。"""
-    p = _write(tmp_path, "def add(a, b):\n    return a - b\n\n\ndef divide(a, b):\n    return a / b\n")
+    p = _write(tmp_path, "def add(a, b):\n    return a - b\n\n\ndef divide(a, b):\n    return a / b\n")  # noqa: E501
     tool = EditTool()
     r = tool.execute(_ctx(tmp_path), {
         "path": "f.py", "mode": "replace_lines",

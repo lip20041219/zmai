@@ -16,15 +16,15 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from zmai.context.window import RecentMessages
 from zmai.context.memory import SummaryMemory, _truncate
 from zmai.context.pruner import (
-    ContextPruner,
     DEFAULT_MAX_CHARS,
     DEFAULT_RECENT_WINDOW,
     DEFAULT_TOOL_RESULT_WINDOW,
+    ContextPruner,
     _estimate_tokens,
 )
+from zmai.context.window import RecentMessages
 
 logger = logging.getLogger("zmai.context.manager")
 
@@ -43,7 +43,7 @@ class ContextManager:
 
         self.max_chars: int = int(cfg.get("context.max_chars", DEFAULT_MAX_CHARS))
         self.recent_window: int = int(cfg.get("context.recent_window", DEFAULT_RECENT_WINDOW))
-        self.tool_result_window: int = int(cfg.get("context.tool_result_window", DEFAULT_TOOL_RESULT_WINDOW))
+        self.tool_result_window: int = int(cfg.get("context.tool_result_window", DEFAULT_TOOL_RESULT_WINDOW))  # noqa: E501
         self.tool_truncate: int = int(cfg.get("context.tool_truncate", 500))
 
         # 组件（使用 _recent_win 而非 _recent 避免与兼容属性冲突）
@@ -222,7 +222,7 @@ class ContextManager:
 
         logger.info(
             "Compact: size=%d, recent=%d, tools=%d",
-            self.estimate_size(), self._recent_win.message_count, len(self._recent_win.tool_results),
+            self.estimate_size(), self._recent_win.message_count, len(self._recent_win.tool_results),  # noqa: E501
         )
 
         try:

@@ -14,7 +14,6 @@ import json
 import logging
 import statistics
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -183,8 +182,8 @@ class ResultCollector:
         # Token usage
         total_input = sum(t.input_tokens for t in (token_logs or []))
         total_output = sum(t.output_tokens for t in (token_logs or []))
-        avg_input = statistics.mean([t.input_tokens for t in (token_logs or [])]) if token_logs else 0.0
-        avg_output = statistics.mean([t.output_tokens for t in (token_logs or [])]) if token_logs else 0.0
+        avg_input = statistics.mean([t.input_tokens for t in (token_logs or [])]) if token_logs else 0.0  # noqa: E501
+        avg_output = statistics.mean([t.output_tokens for t in (token_logs or [])]) if token_logs else 0.0  # noqa: E501
 
         # Cost estimate
         cost = _estimate_cost(total_input, total_output, self._model)

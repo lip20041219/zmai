@@ -18,8 +18,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -534,9 +532,10 @@ class TestSWETaskAgentExecution:
         project_dir = setup_task_workspace(task, tmp_path)
 
         # 运行 Agent
+        import asyncio
+
         from zmai.config import Config
         from zmai.runtime import Runtime
-        import asyncio
 
         config = Config()
         runtime = Runtime(config=config)

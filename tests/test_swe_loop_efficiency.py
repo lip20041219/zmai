@@ -14,13 +14,9 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Iterator
-
-import pytest
 
 from zmai.swe.failure import parse_test_failure
-from zmai.swe.tools import ReadFileTool, WriteFileTool
-
+from zmai.swe.tools import ReadFileTool
 
 # ═══════════════════════════════════════════════════════════════════
 # Case 1 + 2 — failure parser 推断候选业务文件与 expected/actual/line

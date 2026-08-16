@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -123,7 +122,8 @@ class IssueParser:
         self, url: str, owner: str, repo: str, number: int,
     ) -> IssueDescription:
         """从 GitHub API 获取 Issue 详情。"""
-        from zmai.swe.github import GitHubError, fetch_issue as _gh_fetch
+        from zmai.swe.github import GitHubError
+        from zmai.swe.github import fetch_issue as _gh_fetch
 
         try:
             gh_issue = _gh_fetch(url)

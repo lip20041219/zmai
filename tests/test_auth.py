@@ -9,7 +9,6 @@ import pytest
 
 from zmai.auth.store import AuthStore, _decrypt, _encrypt
 
-
 # ═══════════════════════════════════════════════════════════════
 # XOR obfuscation helpers (legacy, not encryption)
 # ═══════════════════════════════════════════════════════════════

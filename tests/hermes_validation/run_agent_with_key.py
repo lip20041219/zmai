@@ -26,9 +26,9 @@ def main() -> None:
     os.environ["ANTHROPIC_AUTH_TOKEN"] = backend["api_key"]
     # 与项目此前 claude CLI 用法保持一致（process_result.json 记录为 deepseek-v4-flash）
     os.environ["ANTHROPIC_MODEL"] = os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-flash")
-    os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-flash")
-    os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] = os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-flash")
-    os.environ["ANTHROPIC_SMALL_FAST_MODEL"] = os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-flash")
+    os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-flash")  # noqa: E501
+    os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] = os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-flash")  # noqa: E501
+    os.environ["ANTHROPIC_SMALL_FAST_MODEL"] = os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-flash")  # noqa: E501
     os.environ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
 
     # 调用真实 run_agent.py（透传所有 CLI 参数）

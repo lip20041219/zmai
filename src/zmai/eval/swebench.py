@@ -19,12 +19,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import subprocess
-import sys
-import tempfile
-import time
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -163,7 +159,7 @@ def _load_local(split: str) -> list[dict[str, Any]]:
     """Load SWE-bench instances from local cache."""
     local_file = SWEBENCH_DATA_DIR / f"{split}_instances.json"
     if local_file.exists():
-        with open(local_file, "r", encoding="utf-8") as f:
+        with open(local_file, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
             return list(data.values())

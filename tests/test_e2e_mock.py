@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
 
-from zmai.agent import AgentAction, AgentContext
+from zmai.agent import AgentContext
 from zmai.gateway.base import (
     Backend,
     BackendCapability,
@@ -16,7 +16,7 @@ from zmai.gateway.base import (
     TokenUsage,
 )
 from zmai.swe.agent import SWEAgent
-from zmai.tool import ToolContext, ToolRegistry
+from zmai.tool import ToolRegistry
 
 
 class MockBackend(Backend):
@@ -138,7 +138,7 @@ class TestSWEAgentMockConversation:
             ))
             names = {t.name for t in registry.list()}
             names = {t.name for t in registry.list()}
-            assert names == {"read_file", "write_file", "edit", "grep", "shell_exec", "git", "show_to_user", "open_in_browser"}
+            assert names == {"read_file", "write_file", "edit", "grep", "shell_exec", "git", "show_to_user", "open_in_browser"}  # noqa: E501
 
             result = await agent.finalize(AgentContext(
                 agent_id="swe_test_3", task="test", tools=registry,
