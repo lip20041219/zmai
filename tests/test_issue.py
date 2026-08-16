@@ -15,7 +15,7 @@ from zmai.issue.agent import IssueAgent, IssueResult
 class TestIssueParser:
     def test_parse_local_file(self):
         """解析本地 Markdown 文件。"""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:  # noqa: E501
             f.write("# Fix login bug\n\nThe login form crashes on submit.\n")
             tmp_path = f.name
         try:
@@ -30,7 +30,7 @@ class TestIssueParser:
 
     def test_parse_local_file_no_title(self):
         """没有标题的文件使用默认标题。"""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:  # noqa: E501
             f.write("Just some text without a heading.")
             tmp_path = f.name
         try:
@@ -115,7 +115,7 @@ class TestIssueParser:
 class TestIssueAgent:
     def test_run_local_file_plan_only(self):
         """本地文件 + --plan 返回计划结果。"""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:  # noqa: E501
             f.write("# Fix calculation error\n\nThe subtract function returns wrong results.\n")
             tmp_path = f.name
         try:
@@ -129,7 +129,7 @@ class TestIssueAgent:
 
     def test_run_local_file_dry_run(self):
         """本地文件 + --dry-run 返回模拟结果。"""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:  # noqa: E501
             f.write("# Add new feature\n\nWe need a new feature.\n")
             tmp_path = f.name
         try:
@@ -150,7 +150,7 @@ class TestIssueAgent:
 
     def test_run_local_file_with_modify(self):
         """本地文件运行完整工作流（Mock）。"""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:  # noqa: E501
             f.write("# Simple test issue\n\nNothing to fix really.\n")
             tmp_path = f.name
         try:
@@ -199,8 +199,8 @@ class TestIssueAgent:
 
     def test_build_summary(self):
         """_build_summary 构建摘要。"""
-        issue = IssueDescription(title="Test", body="Body", source="file", owner="o", repo="r", number=1)
-        result = IssueResult(issue=issue, workflow_status="completed", diff="+1 line\n-1 line", verification="✅ All good")
+        issue = IssueDescription(title="Test", body="Body", source="file", owner="o", repo="r", number=1)  # noqa: E501
+        result = IssueResult(issue=issue, workflow_status="completed", diff="+1 line\n-1 line", verification="✅ All good")  # noqa: E501
         agent = IssueAgent(work_dir=Path(tempfile.mkdtemp()))
         summary = agent._build_summary(result)
         assert "Test" in summary
@@ -220,7 +220,7 @@ class TestCLIIntegration:
     def test_cmd_issue_local_file_plan_only(self):
         """CLI issue 本地文件 + --plan。"""
         from zmai.cli.github_cmd import _cmd_issue
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:  # noqa: E501
             f.write("# CLI test\n\nTest issue.\n")
             tmp_path = f.name
         try:
@@ -232,7 +232,7 @@ class TestCLIIntegration:
     def test_cmd_issue_local_file_dry_run(self):
         """CLI issue 本地文件 + --dry-run。"""
         from zmai.cli.github_cmd import _cmd_issue
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:  # noqa: E501
             f.write("# Dry run test\n\nTest.\n")
             tmp_path = f.name
         try:
@@ -243,7 +243,7 @@ class TestCLIIntegration:
     def test_cmd_issue_local_file_json(self):
         """CLI issue 本地文件 + --json。"""
         from zmai.cli.github_cmd import _cmd_issue
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:  # noqa: E501
             f.write("# JSON test\n\nTest.\n")
             tmp_path = f.name
         try:

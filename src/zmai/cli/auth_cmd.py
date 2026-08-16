@@ -10,13 +10,9 @@ import os
 import sys
 import urllib.error as _urlerror
 import urllib.request as _urlrequest
-from pathlib import Path
-from typing import Any
 
 from zmai.cli.formatters import Theme, print_error, print_table, print_warning
-from zmai.config import Config
 from zmai.errors import CredentialError
-
 
 # ═══════════════════════════════════════════════════════════════
 # 首次配置向导
@@ -56,15 +52,15 @@ def first_run_wizard() -> bool:
 
     # ── Step 1: 选择模型 ──────────────────────────
     print(f"\n  {sep}", file=sys.stderr)
-    print(f"  ZMAI — 首次配置向导", file=sys.stderr)
-    print(f"", file=sys.stderr)
-    print(f"  请选择默认模型：\n", file=sys.stderr)
+    print("  ZMAI — 首次配置向导", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("  请选择默认模型：\n", file=sys.stderr)
     for i, (name, label, model) in enumerate(backend_list, 1):
         default_mark = "（默认）" if i == 1 else ""
         print(f"    [{i}] {label:12s} — {model}{default_mark}", file=sys.stderr)
 
-    print(f"", file=sys.stderr)
-    print(f"  请输入编号 [1-{len(backend_list)}]，直接回车选择 {backend_list[0][1]}：", file=sys.stderr)
+    print("", file=sys.stderr)
+    print(f"  请输入编号 [1-{len(backend_list)}]，直接回车选择 {backend_list[0][1]}：", file=sys.stderr)  # noqa: E501
     print(f"  {sep}", file=sys.stderr)
     try:
         sel = input("  ").strip()
@@ -84,7 +80,7 @@ def first_run_wizard() -> bool:
 
     # ── Step 2: 输入 API Key ───────────────────────
     print(f"  请输入 {label} API Key", file=sys.stderr)
-    print(f"  (支持粘贴，回车确认)", file=sys.stderr)
+    print("  (支持粘贴，回车确认)", file=sys.stderr)
     try:
         key = input("  ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -92,7 +88,7 @@ def first_run_wizard() -> bool:
     print(file=sys.stderr)
 
     if not key:
-        print(f"  API Key 为空，配置取消。\n", file=sys.stderr)
+        print("  API Key 为空，配置取消。\n", file=sys.stderr)
         return False
 
     # ── Step 3: 保存配置 ────────────────────────────
@@ -103,7 +99,7 @@ def first_run_wizard() -> bool:
         store = AuthStore()
     except CredentialError as e:
         print(f"  ⚠ 凭据文件存在问题: {e.reason}", file=sys.stderr)
-        print(f"  正在重置凭据文件...", file=sys.stderr)
+        print("  正在重置凭据文件...", file=sys.stderr)
         try:
             _CRED_FILE.unlink()
         except Exception:
@@ -121,7 +117,7 @@ def first_run_wizard() -> bool:
     )
 
     # ── 检测环境变量冲突 ────────────────────────────
-    from zmai.auth.resolver import CredentialResolver, _resolve_env_names
+    from zmai.auth.resolver import _resolve_env_names
     env_key, _ = _resolve_env_names(name)
     env_val = os.environ.get(env_key, "")
     conflict = bool(env_val and env_val != key)
@@ -129,26 +125,26 @@ def first_run_wizard() -> bool:
     # ── 完成 ──────────────────────────────────────────
     print(f"  {sep}", file=sys.stderr)
     if not conflict:
-        print(f"  ✓ 配置完成", file=sys.stderr)
-        print(f"", file=sys.stderr)
+        print("  ✓ 配置完成", file=sys.stderr)
+        print("", file=sys.stderr)
         print(f"  当前默认：{label} ({default_model})", file=sys.stderr)
-        print(f"  配置文件：~/.zmai/credentials", file=sys.stderr)
-        print(f"", file=sys.stderr)
-        print(f"  现在可以开始使用了：", file=sys.stderr)
-        print(f"    zmai \"你的任务描述\"", file=sys.stderr)
+        print("  配置文件：~/.zmai/credentials", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  现在可以开始使用了：", file=sys.stderr)
+        print("    zmai \"你的任务描述\"", file=sys.stderr)
     else:
-        print(f"  ✓ 已保存到凭据文件", file=sys.stderr)
-        print(f"", file=sys.stderr)
+        print("  ✓ 已保存到凭据文件", file=sys.stderr)
+        print("", file=sys.stderr)
         print(f"  ⚠ 检测到环境变量 {env_key} 使用不同的 Key。", file=sys.stderr)
-        print(f"", file=sys.stderr)
-        print(f"  运行时优先使用环境变量。", file=sys.stderr)
-        print(f"  要使用刚保存的 Key，请先清除环境变量：", file=sys.stderr)
-        print(f"", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  运行时优先使用环境变量。", file=sys.stderr)
+        print("  要使用刚保存的 Key，请先清除环境变量：", file=sys.stderr)
+        print("", file=sys.stderr)
         print(f"    PowerShell:  $env:{env_key}=\"\"", file=sys.stderr)
         print(f"    CMD:         set {env_key}=", file=sys.stderr)
         print(f"    Bash:        unset {env_key}", file=sys.stderr)
-        print(f"", file=sys.stderr)
-        print(f"  然后重新运行 zmai。", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  然后重新运行 zmai。", file=sys.stderr)
     print(f"  {sep}\n", file=sys.stderr)
 
     return True
@@ -193,7 +189,7 @@ def _run_auth_status() -> None:
         print(f"  {label}")
         if status.configured:
             src = source_label(status.source)
-            print(f"    Configured : Yes")
+            print("    Configured : Yes")
             print(f"    Source     : {src}")
 
             if status.conflict:
@@ -206,11 +202,11 @@ def _run_auth_status() -> None:
         else:
             file_st = status.credential_store_status
             if file_st in ("corrupted", "key_mismatch", "empty"):
-                print(f"    Configured : No")
+                print("    Configured : No")
                 print(f"    Status     : {file_st} (credentials file)")
             else:
-                print(f"    Configured : No")
-                print(f"    Source     : missing")
+                print("    Configured : No")
+                print("    Source     : missing")
         print()
 
     if not found:
@@ -239,13 +235,13 @@ def _run_auth_test(name: str) -> None:
     status = CredentialResolver().get_status(name)
 
     print(f"  Testing {label}...")
-    print(f"  ────────────────────────")
+    print("  ────────────────────────")
     print()
 
-    print(f"  Resolving credentials...")
+    print("  Resolving credentials...")
     if not status.configured:
-        print(f"    Source : None")
-        print(f"    Key    : -")
+        print("    Source : None")
+        print("    Key    : -")
         print()
         print(f"  No credentials configured for {name}.")
         print(f"  Run `zmai auth update {name}` to configure.")
@@ -272,14 +268,14 @@ def _run_auth_test(name: str) -> None:
             pass
 
     if not verify_url:
-        print(f"  Sending API request...")
-        print(f"    URL    : (not configured)")
+        print("  Sending API request...")
+        print("    URL    : (not configured)")
         print()
-        print(f"  Result : SKIP (no verification endpoint)")
+        print("  Result : SKIP (no verification endpoint)")
         print(f"  Model  : {status.model or plugin.default_model or '-'}")
         return
 
-    print(f"  Sending API request...")
+    print("  Sending API request...")
     print(f"    URL    : {verify_url}")
     print(f"    Method : {plugin.verify_method or 'GET'}")
     print()
@@ -316,22 +312,22 @@ def _run_auth_test(name: str) -> None:
             body = ""
     except _urlerror.URLError as e:
         reason = str(e.reason) if e.reason else "Unknown error"
-        print(f"  Result : FAIL")
-        print(f"  Reason : Network error")
+        print("  Result : FAIL")
+        print("  Reason : Network error")
         print(f"  Detail : {reason}")
         print()
-        print(f"  Check your network connection and proxy settings.")
+        print("  Check your network connection and proxy settings.")
         return
     except OSError as e:
-        print(f"  Result : FAIL")
-        print(f"  Reason : Network error")
+        print("  Result : FAIL")
+        print("  Reason : Network error")
         print(f"  Detail : {e}")
         print()
-        print(f"  Check your network connection.")
+        print("  Check your network connection.")
         return
 
     if http_code == 200 or http_code == 201:
-        print(f"  Result : PASS")
+        print("  Result : PASS")
         print(f"  Model  : {status.model or plugin.default_model or '-'}")
         try:
             from zmai.auth.store import AuthStore
@@ -351,18 +347,18 @@ def _run_auth_test(name: str) -> None:
             pass
     else:
         reason = _classify_http_error(http_code, body)
-        print(f"  Result : FAIL")
+        print("  Result : FAIL")
         print(f"  Status : {http_code} {reason}")
         if http_code == 401:
-            print(f"  Reason : API Key is invalid.")
+            print("  Reason : API Key is invalid.")
         elif http_code == 403:
             body_lower = body.lower()
             if any(kw in body_lower for kw in ("expired", "disabled", "deactivated")):
-                print(f"  Reason : API Key has expired or been disabled.")
+                print("  Reason : API Key has expired or been disabled.")
             else:
-                print(f"  Reason : API Key does not have permission.")
+                print("  Reason : API Key does not have permission.")
         elif http_code == 429:
-            print(f"  Reason : Rate limited.")
+            print("  Reason : Rate limited.")
         else:
             _safe_print_error_body(body)
         print()
@@ -436,7 +432,7 @@ def print_auth_debug(gateway) -> None:
     dim = "\033[2m"
     reset = "\033[0m"
 
-    sys.stderr.write(f"{dim}  Auth ─────────────────────────────────────────────────────────{reset}\n")
+    sys.stderr.write(f"{dim}  Auth ─────────────────────────────────────────────────────────{reset}\n")  # noqa: E501
     sys.stderr.write(f"{dim}    Backend:         {label}  ({active_src}){reset}\n")
     sys.stderr.write(
         f"{dim}    Credentials File: "
@@ -460,7 +456,7 @@ def print_auth_debug(gateway) -> None:
             f"Using {active_src}.{reset}\n"
         )
 
-    sys.stderr.write(f"{dim}  ────────────────────────────────────────────────────────────────{reset}\n")
+    sys.stderr.write(f"{dim}  ────────────────────────────────────────────────────────────────{reset}\n")  # noqa: E501
 
 
 def _find_auth_key(name: str, env_key_name: str = "") -> str:
@@ -526,7 +522,7 @@ def run_auth(argv: list[str]) -> None:
             sys.exit(1)
     elif sub == "update":
         if len(argv) < 2:
-            print("usage: zmai auth update <backend> [api_key] [model] [base_url] [timeout] [max_tokens] [temperature]", file=sys.stderr)
+            print("usage: zmai auth update <backend> [api_key] [model] [base_url] [timeout] [max_tokens] [temperature]", file=sys.stderr)  # noqa: E501
             sys.exit(1)
         name = argv[1]
         existing = store.get_backend(name) or {}
@@ -557,8 +553,8 @@ def run_auth(argv: list[str]) -> None:
         status = CredentialResolver().get_status(name)
         if status.conflict:
             print(f"  ⚠ 环境变量 {env_key} 使用不同的 Key。")
-            print(f"  当前运行时使用环境变量的 Key。")
-            print(f"  如需使用刚保存的 Key：")
+            print("  当前运行时使用环境变量的 Key。")
+            print("  如需使用刚保存的 Key：")
             print(f"    unset {env_key}")
     elif sub == "remove":
         if len(argv) < 2:
@@ -602,5 +598,5 @@ def run_auth(argv: list[str]) -> None:
 
     else:
         print(f"  Unknown subcommand: '{sub}'", file=sys.stderr)
-        print(f"  Usage: zmai auth <setup|status|list|update|switch|remove|test>", file=sys.stderr)
+        print("  Usage: zmai auth <setup|status|list|update|switch|remove|test>", file=sys.stderr)
         sys.exit(1)

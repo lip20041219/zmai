@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -166,7 +166,7 @@ class Tool(ABC):
                 if expected and val is not None:
                     if expected == "string" and not isinstance(val, str):
                         return False
-                    if expected in ("integer", "number") and not isinstance(val, (int, float)):
+                    if expected in ("integer", "number") and not isinstance(val, int | float):
                         return False
                     if expected == "boolean" and not isinstance(val, bool):
                         return False

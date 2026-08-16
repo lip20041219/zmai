@@ -20,14 +20,14 @@
     ├── error                ← 错误信息
     ├── duration_ms          ← 耗时
     └── metadata             ← 扩展属性
-"""
+"""  # noqa: E501
 
 from __future__ import annotations
 
 import json
 import logging
 import threading
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any

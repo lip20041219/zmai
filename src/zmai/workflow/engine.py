@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from zmai.workflow.base import StepStatus, WorkflowStatus, _now
 
@@ -80,7 +81,7 @@ class WorkflowEngine:
             if not step:
                 break
 
-            sr = StepResult(step_id=step.id, name=step.name, status=StepStatus.RUNNING, started_at=_now())
+            sr = StepResult(step_id=step.id, name=step.name, status=StepStatus.RUNNING, started_at=_now())  # noqa: E501
             step_results.append(sr)
 
             for attempt in range(step.max_retries + 1):
@@ -105,7 +106,7 @@ class WorkflowEngine:
                     current_id = step.next_on_success or default_next.get(step.id)
                     break
                 except Exception as e:
-                    logger.warning("Step %s 失败 (attempt %d/%d): %s", step.id, attempt + 1, step.max_retries + 1, e)
+                    logger.warning("Step %s 失败 (attempt %d/%d): %s", step.id, attempt + 1, step.max_retries + 1, e)  # noqa: E501
                     sr.retries = attempt
                     if attempt >= step.max_retries:
                         sr.status = StepStatus.FAILED

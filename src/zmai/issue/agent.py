@@ -19,14 +19,13 @@
 
 from __future__ import annotations
 
-import difflib
 import logging
 import os
 import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -62,7 +61,7 @@ class IssueResult:
     """Issue 工作流的完整结果。"""
 
     issue: IssueDescription
-    workflow_status: str  # "parsed" | "analyzed" | "planned" | "modified" | "tested" | "verified" | "completed"
+    workflow_status: str  # "parsed" | "analyzed" | "planned" | "modified" | "tested" | "verified" | "completed"  # noqa: E501
     plan: str = ""
     diff: str = ""
     test_output: str = ""
@@ -105,7 +104,7 @@ class IssueAgent:
         max_steps: int = 50,
         backend: str | None = None,
     ) -> None:
-        self._work_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="zmai_issue_"))
+        self._work_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="zmai_issue_"))  # noqa: E501
         self._max_steps = max_steps
         self._backend = backend or os.environ.get("ZMAI_ISSUE_BACKEND", "")
         self._parser = IssueParser()
@@ -274,6 +273,7 @@ class IssueAgent:
     def _modify(self, issue: IssueDescription, plan: str) -> dict[str, Any]:
         """使用 SWE Agent 执行修改。"""
         import asyncio
+
         from zmai.runtime import Runtime
 
         task_prompt = plan + "\n\n" + issue.format_for_agent()
@@ -341,7 +341,7 @@ class IssueAgent:
 
         return "\n\n".join(outputs)
 
-    def _verify(self, issue: IssueDescription, modify_result: dict[str, Any], test_output: str) -> str:
+    def _verify(self, issue: IssueDescription, modify_result: dict[str, Any], test_output: str) -> str:  # noqa: E501
         """验证修复结果。"""
         lines: list[str] = []
 
@@ -413,7 +413,7 @@ class IssueAgent:
             "## 完成摘要",
             "",
             f"Issue: {result.issue.title}",
-            f"状态: ✅ 已完成",
+            "状态: ✅ 已完成",
             f"耗时: {result.duration_seconds:.1f}s",
         ]
 
@@ -424,8 +424,8 @@ class IssueAgent:
 
         diff_lines = (result.diff or "").strip().split("\n")
         if diff_lines and len(diff_lines) > 1:
-            added = sum(1 for l in diff_lines if l.startswith("+") and not l.startswith("+++"))
-            removed = sum(1 for l in diff_lines if l.startswith("-") and not l.startswith("---"))
+            added = sum(1 for line in diff_lines if line.startswith("+") and not line.startswith("+++"))  # noqa: E501
+            removed = sum(1 for line in diff_lines if line.startswith("-") and not line.startswith("---"))  # noqa: E501
             lines.append(f"变更: +{added}/-{removed} 行")
             lines.append("")
             if result.verification:
@@ -450,7 +450,7 @@ class IssueAgent:
         if not issue.full_name:
             return None
 
-        from zmai.swe.github import clone_repo, GitHubError
+        from zmai.swe.github import GitHubError, clone_repo
 
         repo_dir = self._work_dir / issue.repo
         if repo_dir.exists():

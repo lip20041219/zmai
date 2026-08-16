@@ -130,6 +130,7 @@ class KeyringCredentialStore(CredentialStore):
             return None
         return self._from_blob(provider, blob)
 
+    def set(self, provider: str, credential: StoredCredential) -> None:
         """保存凭据。
 
         Args:

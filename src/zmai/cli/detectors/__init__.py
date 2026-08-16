@@ -19,7 +19,7 @@ class PackageInfo:
 class ProjectContext:
     root: Path
     name: str
-    type: str = "unknown"          # python | node | rust | go | java | csharp | docker | monorepo | unknown
+    type: str = "unknown"          # python | node | rust | go | java | csharp | docker | monorepo | unknown  # noqa: E501
     language_version: str = ""
     package_manager: str = ""
     test_framework: str = ""
@@ -52,7 +52,7 @@ class ProjectContext:
                 "src": self.src_dirs,
                 "tests": self.test_dirs,
                 "is_monorepo": self.is_monorepo,
-                "packages": [{"name": p.name, "path": p.path, "type": p.type} for p in self.packages],
+                "packages": [{"name": p.name, "path": p.path, "type": p.type} for p in self.packages],  # noqa: E501
             },
             "git": {
                 "branch": self.git_branch,

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from zmai.cli.detectors import Detector, _read_json, _read_toml, PackageInfo
+from zmai.cli.detectors import Detector, _read_json, _read_toml
 
 
 class MonorepoDetector(Detector):
@@ -42,7 +42,7 @@ class MonorepoDetector(Detector):
 
         # 目录结构启发式
         mono_dirs = [d for d in root.iterdir()
-                     if d.is_dir() and d.name in ("packages", "apps", "modules", "services", "crates")]
+                     if d.is_dir() and d.name in ("packages", "apps", "modules", "services", "crates")]  # noqa: E501
         if len(mono_dirs) >= 2:
             indicators.append("monorepo-structure")
         elif len(mono_dirs) == 1:
@@ -56,7 +56,7 @@ class MonorepoDetector(Detector):
             for d in root.iterdir():
                 if not d.is_dir() or d.name.startswith("."):
                     continue
-                if any((d / m).exists() for m in ("pyproject.toml", "package.json", "Cargo.toml", "go.mod")):
+                if any((d / m).exists() for m in ("pyproject.toml", "package.json", "Cargo.toml", "go.mod")):  # noqa: E501
                     sub_projects += 1
             if sub_projects >= 3:
                 indicators.append("multi-language")
@@ -104,7 +104,7 @@ class MonorepoDetector(Detector):
                 if mp.is_dir():
                     mcargo = _read_toml(mp / "Cargo.toml")
                     packages.append({
-                        "name": mcargo.get("package", {}).get("name", mp.name) if mcargo else mp.name,
+                        "name": mcargo.get("package", {}).get("name", mp.name) if mcargo else mp.name,  # noqa: E501
                         "path": member,
                         "type": "rust",
                     })

@@ -56,7 +56,7 @@ Plan the steps in order. Each step should have:
 - Max steps: $max_steps
 {% if additional_guidelines %}
 $additional_guidelines
-{% endif %}"""
+{% endif %}"""  # noqa: E501
 
 # ── Executor Prompt ───────────────────────────────────────────
 
@@ -109,7 +109,7 @@ $verification_criteria
 - Status: PASS / FAIL / NEEDS_REVIEW
 - Evidence: What confirms or contradicts success
 - Issues found (if any)
-- Recommended action: proceed / retry / escalate"""
+- Recommended action: proceed / retry / escalate"""  # noqa: E501
 
 # ── Report Prompt ─────────────────────────────────────────────
 

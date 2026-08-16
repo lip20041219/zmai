@@ -6,9 +6,7 @@
 
 from __future__ import annotations
 
-import os
-import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -70,9 +68,9 @@ class Doctor:
         cat = "Backend"
 
         try:
-            from zmai.gateway.plugin import PluginRegistry
             from zmai.auth.resolver import CredentialResolver
             from zmai.auth.status import source_label
+            from zmai.gateway.plugin import PluginRegistry
 
             reg = PluginRegistry()
             plugins = reg.list_plugins()
@@ -199,11 +197,17 @@ class Doctor:
         cat = "Tool"
 
         try:
-            from zmai.tool.registry import ToolRegistry
             from zmai.swe.tools import (
-                ShowToUserTool, OpenInBrowserTool, ReadFileTool,
-                WriteFileTool, EditTool, GrepTool, ShellTool, GitTool,
+                EditTool,
+                GitTool,
+                GrepTool,
+                OpenInBrowserTool,
+                ReadFileTool,
+                ShellTool,
+                ShowToUserTool,
+                WriteFileTool,
             )
+            from zmai.tool.registry import ToolRegistry
 
             tool_classes = [
                 ShowToUserTool, OpenInBrowserTool, ReadFileTool,

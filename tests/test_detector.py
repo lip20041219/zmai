@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from zmai.cli.detector import _find_root, _load_project_config, _resolve_workspace, detect
 
 

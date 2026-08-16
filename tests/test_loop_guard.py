@@ -11,20 +11,14 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
-from typing import Any
-
-import pytest
 
 from zmai.swe.loop_guard import (
-    LOOP_THRESHOLD,
     LoopGuard,
     LoopResult,
     _tool_call_signature,
     _tool_failure_signature,
     create_loop_guard,
 )
-
 
 # ═══════════════════════════════════════════════════════════════════
 # 辅助
@@ -566,14 +560,19 @@ class TestSWEAgentLoopGuardIntegration:
 
         使用一个总是返回相同工具的 Backend 来模拟循环。
         """
-        from zmai.agent import AgentContext, AgentAction
+        from collections.abc import Iterator
+
+        from zmai.agent import AgentContext
         from zmai.gateway.base import (
-            Backend, BackendCapability, BackendEvent,
-            BackendRequest, BackendResponse, TokenUsage,
+            Backend,
+            BackendCapability,
+            BackendEvent,
+            BackendRequest,
+            BackendResponse,
+            TokenUsage,
         )
         from zmai.swe.agent import SWEAgent
         from zmai.tool import ToolCall, ToolRegistry
-        from typing import Iterator
 
         class LoopBackend(Backend):
             """始终返回相同的失败 shell_exec 调用。"""
@@ -637,14 +636,19 @@ class TestSWEAgentLoopGuardIntegration:
 
     def test_no_loop_during_normal_operation(self):
         """正常的工具调用序列不应触发循环检测。"""
-        from zmai.agent import AgentContext, AgentAction
+        from collections.abc import Iterator
+
+        from zmai.agent import AgentContext
         from zmai.gateway.base import (
-            Backend, BackendCapability, BackendEvent,
-            BackendRequest, BackendResponse, TokenUsage,
+            Backend,
+            BackendCapability,
+            BackendEvent,
+            BackendRequest,
+            BackendResponse,
+            TokenUsage,
         )
         from zmai.swe.agent import SWEAgent
         from zmai.tool import ToolCall, ToolRegistry
-        from typing import Iterator
 
         class NormalBackend(Backend):
             """每次返回不同的工具调用。"""
@@ -654,7 +658,7 @@ class TestSWEAgentLoopGuardIntegration:
                 [ToolCall(id="c1", name="read_file", params={"path": "main.py"})],
                 [ToolCall(id="c2", name="grep", params={"pattern": "def "})],
                 [ToolCall(id="c3", name="shell_exec", params={"command": "echo ok"})],
-                [ToolCall(id="c4", name="write_file", params={"path": "main.py", "content": "fix"})],
+                [ToolCall(id="c4", name="write_file", params={"path": "main.py", "content": "fix"})],  # noqa: E501
                 [],  # 最终空调用 → complete
             ]
 

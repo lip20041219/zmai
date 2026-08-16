@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-from typing import Any
 
 from zmai.cli.formatters import Theme, print_table
 from zmai.config import Config

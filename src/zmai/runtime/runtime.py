@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
 from zmai.config import Config
-from zmai.errors import RuntimeError
 from zmai.gateway import Backend, PluginRegistry, ToolRouter
 from zmai.memory import MemoryManager
 from zmai.runtime.lifecycle import LifecycleManager
@@ -126,10 +126,10 @@ class Runtime:
           3. 确认后进入执行阶段
           4. 拒绝则返回 failed
         """
-        from zmai.agent import AgentContext, AgentAction, AgentState
+        from zmai.agent import AgentAction, AgentContext, AgentState
+        from zmai.runtime.preflight import check as preflight_check
         from zmai.swe.agent import SWEAgent
         from zmai.swe.scanner import RepositoryScanner
-        from zmai.runtime.preflight import check as preflight_check
 
         # Preflight Check — 在调用 Backend API 之前检查系统状态
         pf = preflight_check(backend, self._gateway, self._config)

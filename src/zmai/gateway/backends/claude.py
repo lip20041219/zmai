@@ -10,7 +10,8 @@ import logging
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 from zmai.errors import BackendError
 from zmai.gateway.base import (
@@ -27,6 +28,7 @@ from zmai.tool import ToolCall, ToolDefinition
 logger = logging.getLogger("zmai.gateway.backends.claude")
 
 CLAUDE_API_VERSION = "2023-06-01"
+CLAUDE_DEFAULT_MAX_TOKENS = 4096
 
 
 class ClaudeBackend(Backend):

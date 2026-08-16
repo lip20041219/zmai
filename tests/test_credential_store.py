@@ -8,13 +8,11 @@ import pytest
 
 from zmai.auth.store_base import (
     CredentialStore,
-    CredentialStoreError,
     CredentialStoreUnavailableError,
     NullCredentialStore,
     StoredCredential,
     get_default_credential_store,
 )
-
 
 # ═══════════════════════════════════════════════════════════════
 # StoredCredential
@@ -210,7 +208,7 @@ class TestWindowsCredentialStore:
         """API Key 不应出现在日志中。"""
         import logging
         caplog.set_level(logging.DEBUG)
-        store.set("__test_log", StoredCredential(provider="__test_log", api_key="sk-super-secret-key"))
+        store.set("__test_log", StoredCredential(provider="__test_log", api_key="sk-super-secret-key"))  # noqa: E501
         log_text = caplog.text
         assert "sk-super-secret-key" not in log_text
 

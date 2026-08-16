@@ -16,7 +16,8 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 from zmai.errors import BackendError
 from zmai.gateway.base import (
@@ -28,7 +29,6 @@ from zmai.gateway.base import (
     TokenUsage,
 )
 from zmai.tool import ToolCall
-
 
 # ── Helpers ─────────────────────────────────────────────────────────
 

@@ -200,7 +200,7 @@ _KNOWN_EXT = (".js", ".py", ".json", ".html", ".css", ".txt", ".csv",
               ".toml", ".ini", ".yaml", ".yml", ".xml", ".md")
 # 任意带已知扩展名、且不含空格的引号字符串（覆盖 os.path.join(...) 拼接写法，
 # 且避免把 "unbalanced braces in main.js" 这类句子误判为路径）
-_QUOTED_PATH_RE = re.compile(r"['\"]([^'\"\s]+\.(?:js|json|html|css|py|txt|csv|toml|ini|ya?ml|xml|md))['\"]",
+_QUOTED_PATH_RE = re.compile(r"['\"]([^'\"\s]+\.(?:js|json|html|css|py|txt|csv|toml|ini|ya?ml|xml|md))['\"]",  # noqa: E501
                              re.IGNORECASE)
 
 

@@ -17,20 +17,25 @@ import asyncio
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import pytest
 
 from zmai.agent import AgentContext
 from zmai.gateway.base import (
-    Backend, BackendCapability, BackendEvent,
-    BackendRequest, BackendResponse, TokenUsage,
+    Backend,
+    BackendCapability,
+    BackendEvent,
+    BackendRequest,
+    BackendResponse,
+    TokenUsage,
 )
 from zmai.swe.agent import SWEAgent
 from zmai.tool import ToolCall, ToolRegistry
 
-DEMO_DIR = Path(__file__).resolve().parents[1] / "examples" / "real_project_demos" / "zmai_demo_site" / "project"
+DEMO_DIR = Path(__file__).resolve().parents[1] / "examples" / "real_project_demos" / "zmai_demo_site" / "project"  # noqa: E501
 
 
 # ═══════════════════════════════════════════════════════════════════

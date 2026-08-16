@@ -16,11 +16,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from zmai.eval.collector import BenchmarkStats, ResultCollector, StepTokenUsage
+from zmai.eval.collector import BenchmarkStats, ResultCollector
 from zmai.eval.harness import EvalHarness, EvalResult, discover_tasks
 from zmai.eval.loader import BenchmarkTask, TaskLoader
 from zmai.eval.reporter import ScoreReporter
@@ -120,7 +119,7 @@ class BenchmarkRunner:
         except (RuntimeError, OSError, ConnectionError) as e:
             logger.warning("SWE-bench 不可用: %s", e)
             stats = BenchmarkStats()
-            stats.per_task = [{"task_id": "error", "status": "ERROR", "duration_s": 0, "steps": 0, "error": str(e)[:100], "agent_status": ""}]
+            stats.per_task = [{"task_id": "error", "status": "ERROR", "duration_s": 0, "steps": 0, "error": str(e)[:100], "agent_status": ""}]  # noqa: E501
             return stats
 
     def run_humaneval(
@@ -155,8 +154,13 @@ class BenchmarkRunner:
         for task in tasks:
             # 对于 swebench/humaneval 任务直接返回统计
             if task.source in ("swebench_lite", "swebench_verified", "humaneval"):
-                from zmai.eval.swebench import load_instances, evaluate_instance, setup_instance_repo
                 import tempfile
+
+                from zmai.eval.swebench import (
+                    evaluate_instance,
+                    load_instances,
+                    setup_instance_repo,
+                )
                 start = time.time()
                 try:
                     if task.source.startswith("swebench"):
@@ -181,10 +185,10 @@ class BenchmarkRunner:
                             config.set("runtime.max_iterations", self.max_steps)
                             rt = Runtime(config=config)
                             if self.backend == "mock":
-                                from zmai.gateway.base import Backend, BackendResponse, TokenUsage
+                                from zmai.gateway.base import Backend, BackendResponse
                                 class _MockBackend(Backend):
                                     name = "mock"
-                                    def invoke(self, request): return BackendResponse(content="处理中...")
+                                    def invoke(self, request): return BackendResponse(content="处理中...")  # noqa: E501
                                     def stream(self, request): raise NotImplementedError
                                     @property
                                     def capabilities(self): return set()
@@ -211,13 +215,13 @@ class BenchmarkRunner:
                                 agent_status=rdict.get("status", ""),
                             ))
                         else:
-                            results.append(EvalResult(task_id=task.id, status="ERROR", error="Instance not found"))
+                            results.append(EvalResult(task_id=task.id, status="ERROR", error="Instance not found"))  # noqa: E501
                     else:
-                        results.append(EvalResult(task_id=task.id, status="ERROR", error="HumanEval mock not implemented"))
+                        results.append(EvalResult(task_id=task.id, status="ERROR", error="HumanEval mock not implemented"))  # noqa: E501
                 except Exception as e:
                     logger.exception("Task %s failed", task.id)
                     dur = time.time() - start
-                    results.append(EvalResult(task_id=task.id, status="ERROR", error=str(e)[:200], duration=dur))
+                    results.append(EvalResult(task_id=task.id, status="ERROR", error=str(e)[:200], duration=dur))  # noqa: E501
             else:
                 # Custom 任务 → 用 EvalHarness 执行
                 result = harness.run_task(task.id)

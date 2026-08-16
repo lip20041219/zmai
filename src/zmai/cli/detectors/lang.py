@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from zmai.cli.detectors import Detector, _read_toml, _read_json
+from zmai.cli.detectors import Detector, _read_json, _read_toml
 
 
 class PythonDetector(Detector):
@@ -78,7 +78,7 @@ class PythonDetector(Detector):
 
         # 源目录
         if pyproject:
-            where = pyproject.get("tool", {}).get("setuptools", {}).get("packages", {}).get("where", [])
+            where = pyproject.get("tool", {}).get("setuptools", {}).get("packages", {}).get("where", [])  # noqa: E501
             if where:
                 result["src_dirs"] = where
         if not result["src_dirs"]:

@@ -7,7 +7,6 @@ from pathlib import Path
 
 from zmai.eval import EvalHarness, EvalResult
 
-
 # ═══════════════════════════════════════════════════════════════
 # EvalResult 数据结构
 # ═══════════════════════════════════════════════════════════════
@@ -179,8 +178,7 @@ class TestVerificationLogic:
 
     def test_verification_independent_of_agent(self):
         """验证逻辑独立于 Agent 结果。"""
-        from zmai.eval.harness import run_verification
-        from zmai.eval.harness import EvalTask, FIXTURES_ROOT
+        from zmai.eval.harness import FIXTURES_ROOT, EvalTask, run_verification
 
         task_dir = FIXTURES_ROOT / "task_001_fix_bug"
         task = EvalTask(task_dir)
@@ -209,7 +207,6 @@ class TestEvalReport:
         from zmai.eval.harness import _RESULTS_FILE
         _orig = _RESULTS_FILE
         try:
-            import zmai.eval.harness as mod
             test_path = tmp_path / "test_results.json"
             # 直接用 EvalReport to_dict 写文件
             test_path.write_text(
@@ -227,7 +224,7 @@ class TestEvalReport:
     def test_load_nonexistent_report(self):
         report = EvalHarness.load_report()
         # 可能为 None（无报告时）
-        assert report is None or isinstance(report, __import__("zmai.eval", fromlist=["EvalReport"]).EvalReport)
+        assert report is None or isinstance(report, __import__("zmai.eval", fromlist=["EvalReport"]).EvalReport)  # noqa: E501
 
     def test_report_structure(self):
         h = EvalHarness(backend_name="mock", max_steps=2)

@@ -15,9 +15,8 @@ Rules for a fresh green result:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import logging
+from dataclasses import dataclass, field
 
 logger = logging.getLogger("zmai.swe.completion")
 

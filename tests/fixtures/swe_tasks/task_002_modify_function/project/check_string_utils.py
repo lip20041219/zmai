@@ -1,6 +1,6 @@
 """Tests — includes a test for the missing is_palindrome function."""
 
-from string_utils import reverse, count_vowels, to_upper, to_lower, remove_whitespace, is_palindrome
+from string_utils import count_vowels, is_palindrome, remove_whitespace, reverse, to_lower, to_upper
 
 
 def test_reverse():

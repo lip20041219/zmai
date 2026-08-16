@@ -13,19 +13,21 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
-
-import pytest
+from typing import Any
 
 from zmai.agent import AgentContext
 from zmai.gateway.base import (
-    Backend, BackendCapability, BackendEvent,
-    BackendRequest, BackendResponse, TokenUsage,
+    Backend,
+    BackendCapability,
+    BackendEvent,
+    BackendRequest,
+    BackendResponse,
+    TokenUsage,
 )
 from zmai.swe.agent import SWEAgent
 from zmai.tool import ToolCall, ToolRegistry
-
 
 # ═══════════════════════════════════════════════════════════════════
 # 辅助: 搭建一个缺失 @app.route 的 Flask 项目
@@ -109,7 +111,7 @@ class _ScriptedBackend(Backend):
         return {BackendCapability.TOOL_USE}
 
 
-async def _run_agent(project_dir: Path, backend: Backend, max_steps: int = 12) -> tuple[AgentContext, Any]:
+async def _run_agent(project_dir: Path, backend: Backend, max_steps: int = 12) -> tuple[AgentContext, Any]:  # noqa: E501
     agent = SWEAgent("fix_drive_test")
     registry = ToolRegistry()
     ctx = AgentContext(
@@ -170,7 +172,8 @@ class TestFlaskFixEndToEnd:
         assert APP_FIXED_MARKER in app_text, "app.py 应包含 @app.route('/')"
 
         # 3) 真实 pytest 通过（用与 agent 相同的解释器 sys.executable）
-        import subprocess, sys
+        import subprocess
+        import sys
         r = subprocess.run([sys.executable, "-m", "pytest", "-q"],
                            cwd=str(project), capture_output=True, text=True,
                            timeout=60, encoding="utf-8", errors="replace")
@@ -180,7 +183,7 @@ class TestFlaskFixEndToEnd:
         calls = backend.calls_seen
         assert "edit" in calls, f"应调用 edit 修改文件: {calls}"
         # edit 必须在第二次 pytest 之前
-        assert calls.index("edit") < calls.index("shell_exec", calls.index("edit")), "edit 应在重测前"
+        assert calls.index("edit") < calls.index("shell_exec", calls.index("edit")), "edit 应在重测前"  # noqa: E501
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -509,7 +512,8 @@ class TestFixDrivingStickyEscape:
         assert action.type == "complete", f"应 complete, 实际 {action.type}: {action.output}"
 
         # 4) 真实 pytest 全绿
-        import subprocess, sys
+        import subprocess
+        import sys
         r = subprocess.run([sys.executable, "-m", "pytest", "-q"],
                            cwd=str(project), capture_output=True, text=True,
                            timeout=60, encoding="utf-8", errors="replace")

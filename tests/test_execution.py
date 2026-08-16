@@ -5,11 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from zmai.execution import ExecutionLog, StepRecord, truncate_output
-from zmai.execution.log import _sanitize_params, _SENSITIVE_MASK
-
+from zmai.execution.log import _SENSITIVE_MASK, _sanitize_params
 
 # ═══════════════════════════════════════════════════════════════
 # 辅助函数

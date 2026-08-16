@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import pytest
 
@@ -21,8 +22,8 @@ from zmai.swe.models import (
     MAX_REPLANS,
     Plan,
     PlanStep,
-    validate_plan_dict,
     format_plan_summary,
+    validate_plan_dict,
 )
 from zmai.swe.planner import generate_plan, parse_plan_response
 
@@ -66,7 +67,7 @@ class PlanMockBackend(Backend):
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self._config = config or {}
         self.invoke_count = 0
-        self._plan_json: str = config.get("plan_json", _VALID_PLAN_JSON) if config else _VALID_PLAN_JSON
+        self._plan_json: str = config.get("plan_json", _VALID_PLAN_JSON) if config else _VALID_PLAN_JSON  # noqa: E501
         self._fail_on: int = config.get("fail_on", 0) if config else 0
 
     def invoke(self, request: BackendRequest) -> BackendResponse:

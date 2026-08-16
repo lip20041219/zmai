@@ -6,11 +6,8 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from zmai.cli.doctor import CheckResult, Doctor
 from zmai.cli.formatters import Theme
-
 
 # ============================================================
 # CheckResult

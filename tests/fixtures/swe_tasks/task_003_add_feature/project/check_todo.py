@@ -1,6 +1,5 @@
 """Tests for TodoList — includes a test for the missing clear_done feature."""
 
-import json
 from pathlib import Path
 
 from todo import TodoList

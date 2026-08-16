@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from zmai.auth.status import CredentialStatus, ConflictDetail, mask_key, source_label
+from zmai.auth.status import ConflictDetail, CredentialStatus, mask_key, source_label
 from zmai.auth.store import AuthStore
 from zmai.errors import CredentialError
 

@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import sys
 from typing import Any
 
@@ -51,11 +50,11 @@ class PreflightResult:
             return
         sep = "━" * 50
         print(f"\n  {sep}", file=sys.stderr)
-        print(f"  Preflight Check 失败", file=sys.stderr)
-        print(f"", file=sys.stderr)
+        print("  Preflight Check 失败", file=sys.stderr)
+        print("", file=sys.stderr)
         for line in self.message.split("\n"):
             print(f"  {line}", file=sys.stderr)
-        print(f"", file=sys.stderr)
+        print("", file=sys.stderr)
         print(f"  {sep}\n", file=sys.stderr)
 
 
@@ -223,13 +222,13 @@ def _missing_key_result(
         f"当前 Backend：{label}",
         f"未检测到 {env_key_name}。",
         "",
-        f"  请执行：",
+        "  请执行：",
         f"    zmai auth update {name}",
     ]
     if others:
         lines += [
             "",
-            f"  或者切换到其他 Backend：",
+            "  或者切换到其他 Backend：",
         ]
         for alt in others:
             lines.append(f"    zmai --backend {alt} <task>")

@@ -18,7 +18,7 @@ from zmai.swe.tools import (
     ShellTool,
     WriteFileTool,
 )
-from zmai.tool import ToolContext, ToolResult
+from zmai.tool import ToolContext
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -144,6 +144,8 @@ class TestSWEAgentNoBackend:
 
     def test_step_with_backend_does_not_fail(self):
         """有 Backend 时 step 不应直接 fail。"""
+        from collections.abc import Iterator
+
         from zmai.agent import AgentContext
         from zmai.gateway.base import (
             Backend,
@@ -154,7 +156,6 @@ class TestSWEAgentNoBackend:
             TokenUsage,
         )
         from zmai.swe.agent import SWEAgent
-        from typing import Iterator
 
         class MinimalBackend(Backend):
             name = "minimal"
@@ -199,6 +200,8 @@ class TestEmptyAssistantMessage:
 
     def test_no_empty_assistant_on_tool_only(self):
         """当 Backend 只返回 tool_calls 时不应有空的 assistant 消息。"""
+        from collections.abc import Iterator
+
         from zmai.agent import AgentContext
         from zmai.gateway.base import (
             Backend,
@@ -210,7 +213,6 @@ class TestEmptyAssistantMessage:
         )
         from zmai.swe.agent import SWEAgent
         from zmai.tool import ToolCall, ToolRegistry
-        from typing import Iterator
 
         class ToolBackend(Backend):
             name = "tooler"
@@ -219,7 +221,7 @@ class TestEmptyAssistantMessage:
             def invoke(self, request: BackendRequest) -> BackendResponse:
                 return BackendResponse(
                     content="",  # 空内容
-                    tool_calls=[ToolCall(id="call_1", name="shell_exec", params={"command": "echo hi"})],
+                    tool_calls=[ToolCall(id="call_1", name="shell_exec", params={"command": "echo hi"})],  # noqa: E501
                     usage=TokenUsage(input_tokens=10, output_tokens=5),
                     stop_reason="tool_use",
                 )
@@ -256,13 +258,15 @@ class TestEmptyAssistantMessage:
                     )
             # 应有工具调用结果消息
             user_msgs = [m for m in msgs if m.get("role") == "user"]
-            tool_result_msgs = [m for m in user_msgs if "工具" in m.get("content", "") or "Tool" in m.get("content", "")]
+            tool_result_msgs = [m for m in user_msgs if "工具" in m.get("content", "") or "Tool" in m.get("content", "")]  # noqa: E501
             assert len(tool_result_msgs) >= 1, "应有工具调用结果消息"
 
         asyncio.run(run())
 
     def test_assistant_message_with_content_preserved(self):
         """当 Backend 返回文本内容时，assistant 消息应正常保留。"""
+        from collections.abc import Iterator
+
         from zmai.agent import AgentContext
         from zmai.gateway.base import (
             Backend,
@@ -274,7 +278,6 @@ class TestEmptyAssistantMessage:
         )
         from zmai.swe.agent import SWEAgent
         from zmai.tool import ToolRegistry
-        from typing import Iterator
 
         class TextBackend(Backend):
             name = "texter"
@@ -323,6 +326,8 @@ class TestStepCountTracking:
     """SWEAgent.step() 应递增 context.step_count。"""
 
     def test_step_count_incremented(self):
+        from collections.abc import Iterator
+
         from zmai.agent import AgentContext
         from zmai.gateway.base import (
             Backend,
@@ -334,7 +339,6 @@ class TestStepCountTracking:
         )
         from zmai.swe.agent import SWEAgent
         from zmai.tool import ToolRegistry
-        from typing import Iterator
 
         class SimpleBackend(Backend):
             name = "simple"

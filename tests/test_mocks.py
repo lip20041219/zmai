@@ -12,21 +12,9 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Iterator
+from typing import Any
 
 import pytest
-
-from zmai.config.config import Config
-from zmai.errors import BackendError
-from zmai.gateway.base import (
-    Backend,
-    BackendCapability,
-    BackendRequest,
-    BackendResponse,
-    TokenUsage,
-)
-from zmai.gateway.registry import BackendRegistry
-from zmai.runtime import Runtime
 
 from tests.mocks import (
     AuthErrorBackend,
@@ -37,7 +25,15 @@ from tests.mocks import (
     SuccessBackend,
     TimeoutBackend,
 )
-
+from zmai.config.config import Config
+from zmai.errors import BackendError
+from zmai.gateway.base import (
+    Backend,
+    BackendCapability,
+    BackendRequest,
+    BackendResponse,
+)
+from zmai.runtime import Runtime
 
 # ═════════════════════════════════════════════════════════════════════
 # 辅助

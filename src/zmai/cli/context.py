@@ -5,13 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from zmai.cli.detectors import Detector, ProjectContext
+from zmai.cli.detectors import Detector, PackageInfo, ProjectContext
 from zmai.cli.detectors.docker_detector import DockerDetector
 from zmai.cli.detectors.git_detector import GitDetector
 from zmai.cli.detectors.lang import GoDetector, NodeDetector, PythonDetector, RustDetector
 from zmai.cli.detectors.monorepo import MonorepoDetector
-from zmai.cli.detectors import PackageInfo
-
 
 _DETECTORS: list[Detector] = [
     MonorepoDetector(),

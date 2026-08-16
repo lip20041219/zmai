@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import pytest
-from zmai.context.window import SlidingWindow, RecentMessages
 from zmai.context.memory import SummaryMemory
 from zmai.context.pruner import ContextPruner, PruneAction
+from zmai.context.window import RecentMessages, SlidingWindow
 
 
 class TestSlidingWindow:

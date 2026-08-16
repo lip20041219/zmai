@@ -73,7 +73,7 @@ class TemplateEngine:
         list_name = match.group(2)
         body = match.group(3)
         items = variables.get(list_name, [])
-        if not isinstance(items, (list, tuple)):
+        if not isinstance(items, list | tuple):
             return ""
         parts: list[str] = []
         for item in items:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -13,7 +12,6 @@ import pytest
 from zmai.errors import WorkspaceError
 from zmai.workspace import Workspace
 from zmai.workspace.workspace import (
-    FILE_CATEGORIES,
     AgentWorkspaceState,
     FileEntry,
     GlobalWorkspaceState,
@@ -21,7 +19,6 @@ from zmai.workspace.workspace import (
     _classify_file,
     _guess_mime,
 )
-
 
 # ── Fixtures ──────────────────────────────────────────────────
 
@@ -68,7 +65,7 @@ class TestWorkspaceInit:
         assert ws._root.exists()
 
     def test_init_creates_state_and_manifest(self, tmp_root: Path) -> None:
-        ws = Workspace(root=tmp_root)
+        Workspace(root=tmp_root)
         assert (tmp_root / "state.json").exists()
         assert (tmp_root / "manifest.json").exists()
 
@@ -225,7 +222,6 @@ class TestFileOperations:
         assert "a.txt" in paths
         assert "b.txt" in paths
         # 跨平台：使用 PurePath 比较
-        from pathlib import PurePosixPath, PureWindowsPath
         assert any("sub/c.txt" in str(p) or "sub\\c.txt" in str(p) for p in files)
 
     def test_list_excludes_state(
@@ -324,10 +320,9 @@ class TestPathSecurity:
         ws = Workspace(root=tmp_root)
         ws.prepare("agent_1")
         # agent_1-secret 不是 agent_1 的子目录
-        path = "x"  # 任何路径都不应存在于 agent_1-secret 下
         # 尝试写入一个看似合法但前缀不同 agent 的路径
         with pytest.raises(WorkspaceError, match="路径穿越"):
-            ws.write("agent_1", f"../agent_1-secret/file.txt", b"data")
+            ws.write("agent_1", "../agent_1-secret/file.txt", b"data")
 
     def test_short_prefix_not_subpath(self, tmp_root: Path) -> None:
         """/ws/a 不得允许访问 /ws/a-extra。"""
@@ -807,7 +802,7 @@ class TestFileTypeSupport:
 
         manifest = ws.get_manifest(agent_id)
         assert manifest is not None
-        assert manifest.file_count >= len(files) - 1  # temp 中的不计数，但 manifest 中排除 .state 但不排除 temp
+        assert manifest.file_count >= len(files) - 1  # temp 中的不计数，但 manifest 中排除 .state 但不排除 temp  # noqa: E501
 
 
 # ── 测试: 并发安全 ────────────────────────────────────────────

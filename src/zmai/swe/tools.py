@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
+import logging
+import re
 import shlex
 import subprocess
-import re
 import sys
 import time
-import logging
 from pathlib import Path
 from typing import Any
 
 from zmai.tool import Tool, ToolContext, ToolResult
-from zmai.tool.base import ToolContext as _ToolContext
 
 logger = logging.getLogger("zmai.swe.tools")
 
@@ -32,7 +31,7 @@ def _emit_tool_result(tool_name: str, context: ToolContext,
     status = "SUCCESS" if result.success else "FAIL"
     log_lines = [
         f"[{tool_name}]",
-        f"  Target:   {params.get('path') or params.get('command') or params.get('args') or params.get('pattern', '')}",
+        f"  Target:   {params.get('path') or params.get('command') or params.get('args') or params.get('pattern', '')}",  # noqa: E501
         f"  Workspace: {context.workspace_path}",
         f"  Project:  {context.project_path or '(same as workspace)'}",
         f"  Result:   {status} ({elapsed:.2f}s)",
@@ -203,14 +202,17 @@ class OpenInBrowserTool(Tool):
         path = params.get("path", "")
         if not path:
             result = ToolResult.err("path required")
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
         is_safe, full, err_msg = _resolve_tool_path(context, path)
         if not is_safe:
             result = ToolResult.err(err_msg)
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
         if not full.exists():
             result = ToolResult.err(f"文件不存在: {full}")
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
         abs_path = str(full.resolve())
         try:
             if sys.platform == "win32":
@@ -221,16 +223,17 @@ class OpenInBrowserTool(Tool):
                 if r.returncode != 0:
                     detail = r.stderr.strip() or r.stdout.strip() or f"exit {r.returncode}"
                     result = ToolResult.err(f"浏览器打开失败: {detail[:200]}")
-                    _emit_tool_result(self.name, context, params, result, _st); return result
+                    _emit_tool_result(self.name, context, params, result, _st)
+                    return result
             elif sys.platform == "darwin":
                 subprocess.run(["open", abs_path], timeout=10)
             else:
                 subprocess.run(["xdg-open", abs_path], timeout=10)
             result = ToolResult.ok(output=f"opened: {abs_path}")
         except subprocess.TimeoutExpired:
-            result = ToolResult.err(f"浏览器打开超时")
+            result = ToolResult.err("浏览器打开超时")
         except FileNotFoundError:
-            result = ToolResult.err(f"未找到浏览器程序（缺少 open/xdg-open 命令）")
+            result = ToolResult.err("未找到浏览器程序（缺少 open/xdg-open 命令）")
         except Exception as e:
             result = ToolResult.err(f"浏览器打开失败: {type(e).__name__}: {e}")
         _emit_tool_result(self.name, context, params, result, _st)
@@ -263,14 +266,17 @@ class ReadFileTool(Tool):
         path = params.get("path", "")
         if not path:
             result = ToolResult.err("path required")
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
         is_safe, full, err_msg = _resolve_tool_path(context, path)
         if not is_safe:
             result = ToolResult.err(err_msg)
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
         if not full.exists():
             result = ToolResult.err(f"not found: {path}")
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
 
         # ── 读取缓存命中判定（文件自上次读取以来未变化）──
         agent = getattr(context, "agent_id", "?")
@@ -288,7 +294,8 @@ class ReadFileTool(Tool):
                 ),
                 metadata={"cached": True, "line_count": _line_count, "size": _size},
             )
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
 
         fsize = full.stat().st_size
         if fsize > self._MAX_TEXT_SIZE:
@@ -296,7 +303,8 @@ class ReadFileTool(Tool):
                 f"文件过大 ({fsize} bytes)，超过 10MB 限制。"
                 f"如需查看请使用 shell_exec 命令。"
             )
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
 
         # 检测二进制文件：读取前 8KB，如果有 null 字节则判为二进制
         try:
@@ -305,10 +313,12 @@ class ReadFileTool(Tool):
                 result = ToolResult.err(
                     f"二进制文件，无法以文本方式读取 ({path})"
                 )
-                _emit_tool_result(self.name, context, params, result, _st); return result
+                _emit_tool_result(self.name, context, params, result, _st)
+                return result
         except OSError as e:
             result = ToolResult.err(f"read error: {e}")
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
 
         # 尝试 UTF-8 读取，失败时 fallback 到系统编码
         try:
@@ -320,14 +330,15 @@ class ReadFileTool(Tool):
                 text = full.read_text(encoding=enc, errors="replace")
             except Exception as e:
                 result = ToolResult.err(f"read error: {e}")
-                _emit_tool_result(self.name, context, params, result, _st); return result
+                _emit_tool_result(self.name, context, params, result, _st)
+                return result
 
         lines = text.splitlines(keepends=True)
         start = params.get("start_line", 1)
         end = params.get("end_line", len(lines))
         selected = lines[max(0, start - 1):end]
         total = len(lines)
-        numbered = "".join(f"{i+1:>4}|{l}" for i, l in enumerate(selected))
+        numbered = "".join(f"{i+1:>4}|{line}" for i, line in enumerate(selected))
         # 记录读取缓存（供后续重复读命中）
         if cache_key is not None:
             self._read_cache[cache_key] = (total, fsize)
@@ -363,23 +374,27 @@ class WriteFileTool(Tool):
         content = params.get("content", "")
         if not path:
             result = ToolResult.err("path required")
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
         is_safe, full, err_msg = _resolve_tool_path(context, path)
         if not is_safe:
             result = ToolResult.err(err_msg)
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
 
         # 测试文件只读保护：禁止写入/覆盖测试文件（含新建 tests/ 下文件）
         if _is_test_file(full, Path(context.project_path or context.workspace_path)):
             result = ToolResult.err(_test_file_guard_msg(full))
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
 
         # 检查文件大小
         if len(content) > self._MAX_WRITE_SIZE:
             result = ToolResult.err(
-                f"写入内容过大 ({len(content)} bytes)，超过 {self._MAX_WRITE_SIZE // (1024*1024)}MB 限制"
+                f"写入内容过大 ({len(content)} bytes)，超过 {self._MAX_WRITE_SIZE // (1024*1024)}MB 限制"  # noqa: E501
             )
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
 
         # 检查 symlink 逃逸: 如果目标已是 symlink 且指向外部，拒绝写入
         if full.is_symlink():
@@ -392,14 +407,16 @@ class WriteFileTool(Tool):
                 result = ToolResult.err(
                     f"拒绝写入: {path} 是指向 workspace 外部的 symlink ({resolved_link})"
                 )
-                _emit_tool_result(self.name, context, params, result, _st); return result
+                _emit_tool_result(self.name, context, params, result, _st)
+                return result
 
         # 确保父目录存在
         try:
             full.parent.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            result = ToolResult.err(f"无法创建目录 {full.parent} (OS error {e.errno}): {e.strerror}")
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            result = ToolResult.err(f"无法创建目录 {full.parent} (OS error {e.errno}): {e.strerror}")  # noqa: E501
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
 
         errors = []
 
@@ -454,7 +471,7 @@ class EditTool(Tool):
         "type": "object",
         "properties": {
             "path": {"type": "string"},
-            "mode": {"type": "string", "enum": ["replace_lines", "regex_replace", "insert", "append"]},
+            "mode": {"type": "string", "enum": ["replace_lines", "regex_replace", "insert", "append"]},  # noqa: E501
             "start_line": {"type": "integer"},
             "end_line": {"type": "integer"},
             "old_text": {"type": "string"},
@@ -474,26 +491,31 @@ class EditTool(Tool):
         new_text = params.get("new_text", "")
         if not path:
             result = ToolResult.err("path required")
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
         is_safe, full, err_msg = _resolve_tool_path(context, path)
         if not is_safe:
             result = ToolResult.err(err_msg)
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
 
         # 测试文件只读保护：禁止编辑/删除/放宽断言/跳过测试
         if _is_test_file(full, Path(context.project_path or context.workspace_path)):
             result = ToolResult.err(_test_file_guard_msg(full))
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
 
         # 文件大小限制：禁止写入超限内容（与 WriteFileTool 一致）
         if len(new_text) > self._MAX_EDIT_SIZE:
             result = ToolResult.err(
-                f"编辑内容过大 ({len(new_text)} bytes)，超过 {self._MAX_EDIT_SIZE // (1024*1024)}MB 限制"
+                f"编辑内容过大 ({len(new_text)} bytes)，超过 {self._MAX_EDIT_SIZE // (1024*1024)}MB 限制"  # noqa: E501
             )
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
         if not full.exists() and mode != "append":
             result = ToolResult.err(f"not found: {path}")
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
 
         # 备份原始内容（用于编辑失败时恢复）
         original_content = None
@@ -516,7 +538,8 @@ class EditTool(Tool):
                 with full.open("a", encoding="utf-8") as f:
                     f.write(new_text)
                 result = ToolResult.ok(output=f"appended {path}")
-                _emit_tool_result(self.name, context, params, result, _st); return result
+                _emit_tool_result(self.name, context, params, result, _st)
+                return result
 
             lines = full.read_text(encoding="utf-8").splitlines(keepends=True)
 
@@ -525,31 +548,37 @@ class EditTool(Tool):
                 end = params.get("end_line", len(lines))
                 if start < 1 or start > len(lines):
                     result = ToolResult.err(f"start_line {start} out of range (1-{len(lines)})")
-                    _emit_tool_result(self.name, context, params, result, _st); return result
+                    _emit_tool_result(self.name, context, params, result, _st)
+                    return result
                 if end < start:
                     result = ToolResult.err(f"end_line {end} < start_line {start}")
-                    _emit_tool_result(self.name, context, params, result, _st); return result
+                    _emit_tool_result(self.name, context, params, result, _st)
+                    return result
                 new_items = _normalize_new_lines(new_text)
                 lines[start-1:end] = new_items
                 full.write_text("".join(lines), encoding="utf-8")
                 result = ToolResult.ok(output=f"replaced {path}:{start}-{end}")
-                _emit_tool_result(self.name, context, params, result, _st); return result
+                _emit_tool_result(self.name, context, params, result, _st)
+                return result
 
             if mode == "regex_replace":
                 old = params.get("old_text", "")
                 if not old:
                     result = ToolResult.err("old_text required")
-                    _emit_tool_result(self.name, context, params, result, _st); return result
+                    _emit_tool_result(self.name, context, params, result, _st)
+                    return result
                 flags = re.IGNORECASE if params.get("ignore_case") else 0
                 count = params.get("count", 0) or 0
                 try:
-                    new_content, n = re.subn(old, new_text, "".join(lines), count=count, flags=flags)
+                    new_content, n = re.subn(old, new_text, "".join(lines), count=count, flags=flags)  # noqa: E501
                 except re.error as e:
                     result = ToolResult.err(f"regex error: {e}")
-                    _emit_tool_result(self.name, context, params, result, _st); return result
+                    _emit_tool_result(self.name, context, params, result, _st)
+                    return result
                 full.write_text(new_content, encoding="utf-8")
                 result = ToolResult.ok(output=f"replaced {n} matches in {path}")
-                _emit_tool_result(self.name, context, params, result, _st); return result
+                _emit_tool_result(self.name, context, params, result, _st)
+                return result
 
             if mode == "insert":
                 ln = params.get("start_line", 1)
@@ -557,7 +586,8 @@ class EditTool(Tool):
                 lines[ln-1:ln-1] = ins
                 full.write_text("".join(lines), encoding="utf-8")
                 result = ToolResult.ok(output=f"inserted at {path}:{ln}")
-                _emit_tool_result(self.name, context, params, result, _st); return result
+                _emit_tool_result(self.name, context, params, result, _st)
+                return result
 
             result = ToolResult.err(f"unknown mode: {mode}")
         except Exception as e:
@@ -585,19 +615,21 @@ class GrepTool(Tool):
         pattern = params.get("pattern", "")
         if not pattern:
             result = ToolResult.err("pattern required")
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
         flags = re.IGNORECASE if params.get("ignore_case") else 0
         try:
             regex = re.compile(pattern, flags)
         except re.error as e:
             result = ToolResult.err(f"regex error: {e}")
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
 
         # project_path/workspace_path 可能是 str，统一转 Path（否则 root.glob 崩溃）
         root = Path(context.project_path or context.workspace_path)
         results = []
         total = 0
-        _IGNORE_DIRS = {".git", "node_modules", "__pycache__",
+        _ignore_dirs = {".git", "node_modules", "__pycache__",
                         ".venv", "venv", ".tox", "build", "dist",
                         ".egg-info", ".mypy_cache", ".pytest_cache"}
 
@@ -610,10 +642,10 @@ class GrepTool(Tool):
             # 检查所有路径段，包括根目录级
             parts = rel.split("/")
             # 检查文件路径中所有目录段，防止 .git/config 等被忽略
-            if any(part in _IGNORE_DIRS for part in parts[:-1]):
+            if any(part in _ignore_dirs for part in parts[:-1]):
                 continue
             try:
-                for i, line in enumerate(f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                for i, line in enumerate(f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):  # noqa: E501
                     if regex.search(line):
                         results.append(f"{rel}:{i}:{line.rstrip()[:200]}")
                         total += 1
@@ -714,7 +746,8 @@ class ShellTool(Tool):
         cmd = params.get("command", "")
         if not cmd:
             result = ToolResult.err("command required")
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
         cmd = _translate_cmd(cmd)
         # 测试文件只读保护：拦截 shell 对测试文件的删除/移动/重命名（绕过写工具）
         if _shell_attempts_test_mutation(cmd):
@@ -723,11 +756,13 @@ class ShellTool(Tool):
                 "测试文件是只读验收标准，禁止删除、移走或跳过测试。"
                 "请修改业务代码让测试通过。"
             )
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
         confirm_fn = context.config.get("on_confirm")
         if confirm_fn and not confirm_fn("shell_exec", cmd):
             result = ToolResult.ok(output="cancelled by user")
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
         timeout = params.get("timeout", context.timeout or 30)
         stdin_input = params.get("input")
         try:
@@ -771,11 +806,13 @@ class GitTool(Tool):
         args = params.get("args", "")
         if not args:
             result = ToolResult.err("args required")
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
         confirm_fn = context.config.get("on_confirm")
         if confirm_fn and not confirm_fn("git", args):
             result = ToolResult.ok(output="cancelled by user")
-            _emit_tool_result(self.name, context, params, result, _st); return result
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
         timeout = params.get("timeout", context.timeout or 30)
         try:
             # 安全: 使用 list args 而非 shell=True + 字符串拼接，

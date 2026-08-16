@@ -4,12 +4,12 @@
 修复后: 4 个用例全部通过。
 """
 
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
-from calculator import add, subtract, multiply, divide
+from calculator import add, divide, multiply, subtract
 
 
 def test_add():

@@ -8,8 +8,7 @@ from pathlib import Path
 import pytest
 
 from zmai.errors import ToolError
-from zmai.tool import Tool, ToolCall, ToolContext, ToolDefinition, ToolResult, ToolRegistry
-
+from zmai.tool import Tool, ToolCall, ToolContext, ToolDefinition, ToolRegistry, ToolResult
 
 # ── 测试用 Tool 实现 ──────────────────────────────────────────
 
@@ -217,7 +216,7 @@ class TestToolRegistry:
         with pytest.raises(ToolError, match="工具未注册"):
             tool_registry.get("nonexistent")
 
-    def test_register_overwrite(self, tool_registry: ToolRegistry, caplog: pytest.LogCaptureFixture) -> None:
+    def test_register_overwrite(self, tool_registry: ToolRegistry, caplog: pytest.LogCaptureFixture) -> None:  # noqa: E501
         tool_registry.register(EchoTool())
         tool_registry.register(EchoTool())  # 覆盖应记录 warning
         assert any("将被覆盖" in msg for msg in caplog.messages)
@@ -245,7 +244,7 @@ class TestToolRegistry:
         assert result.success
         assert result.output == "echo: hello"
 
-    def test_execute_nonexistent(self, tool_registry: ToolRegistry, tool_context: ToolContext) -> None:
+    def test_execute_nonexistent(self, tool_registry: ToolRegistry, tool_context: ToolContext) -> None:  # noqa: E501
         with pytest.raises(ToolError, match="工具未注册"):
             tool_registry.execute("nonexistent", {}, tool_context)
 

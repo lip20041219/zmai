@@ -13,7 +13,6 @@ from typing import Any
 
 from zmai.memory.base import Memory, MemoryEntry, _now
 
-
 _TOMBSTONE = "__tombstone__"
 
 

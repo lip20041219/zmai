@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
-from zmai.memory.base import MemoryEntry
 from zmai.memory.long_term import LongTermMemory
 from zmai.memory.working import WorkingMemory
 

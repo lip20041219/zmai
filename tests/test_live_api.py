@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.request
 import urllib.error
-from typing import Any, Iterator
+import urllib.request
+from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
@@ -19,10 +20,7 @@ from zmai.gateway.base import (
     TokenUsage,
 )
 from zmai.swe.agent import SWEAgent
-from zmai.tool import ToolContext, ToolRegistry
-
-
-import os
+from zmai.tool import ToolRegistry
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE = "https://api.deepseek.com/v1"
@@ -151,7 +149,6 @@ def test_deepseek_simple_chat():
 
 def test_deepseek_with_tools():
     """测试 DeepSeek 工具调用能力。"""
-    from zmai.swe.tools import ReadFileTool, ShellTool
     from zmai.tool import ToolDefinition
 
     backend = DeepSeekBackend()
