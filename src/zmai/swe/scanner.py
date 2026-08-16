@@ -309,7 +309,7 @@ class RepositoryScanner:
                 continue
 
             # 跳过隐藏文件（以 '.' 开头的文件，白名单除外）
-            if entry.name.startswith(".") and entry.name not in {".github", ".claude", ".gitignore", ".env"}:
+            if entry.name.startswith(".") and entry.name not in {".github", ".claude", ".gitignore", ".env"}:  # noqa: E501
                 continue
 
             if not entry.is_file():

@@ -23,11 +23,12 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-import os
 import logging
+import os
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from zmai.errors import BackendError, CredentialError
 from zmai.gateway.base import Backend
@@ -151,7 +152,7 @@ def discover_plugins(
     seen: set[str] = set()
 
     # 1. Official built-in backends
-    from zmai.gateway.backends import BACKEND_METADATA, BACKEND_DEFAULT_CONFIG
+    from zmai.gateway.backends import BACKEND_METADATA
     for name in BACKEND_METADATA:
         if name not in seen:
             seen.add(name)
@@ -197,7 +198,7 @@ def _load_plugin_file(path: Path) -> BackendPlugin | None:
 
 def _builtin_plugin(name: str) -> BackendPlugin:
     """从 BACKEND_METADATA 构造内置 Backend 的插件描述符。"""
-    from zmai.gateway.backends import BACKEND_METADATA, BACKEND_DEFAULT_CONFIG
+    from zmai.gateway.backends import BACKEND_DEFAULT_CONFIG, BACKEND_METADATA
     info = BACKEND_METADATA[name]
     cfg = BACKEND_DEFAULT_CONFIG.get(name, {})
 

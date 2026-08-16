@@ -17,19 +17,22 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import pytest
 
 from zmai.agent import AgentContext
 from zmai.gateway.base import (
-    Backend, BackendCapability, BackendEvent,
-    BackendRequest, BackendResponse, TokenUsage,
+    Backend,
+    BackendCapability,
+    BackendEvent,
+    BackendRequest,
+    BackendResponse,
+    TokenUsage,
 )
 from zmai.swe.agent import SWEAgent
 from zmai.tool import ToolCall, ToolRegistry
-
 
 # ═══════════════════════════════════════════════════════════════════
 # 辅助
@@ -136,7 +139,7 @@ class TestMaxStepsTermination:
 # 5. 提高 max_steps 后 FixDriving 完整修复闭环仍工作
 # ═══════════════════════════════════════════════════════════════════
 
-APP_BUGGY = "from flask import Flask\napp = Flask(__name__)\n\n\ndef index():\n    return \"Hello\"\n"
+APP_BUGGY = "from flask import Flask\napp = Flask(__name__)\n\n\ndef index():\n    return \"Hello\"\n"  # noqa: E501
 TEST_APP = (
     "from app import app\n"
     "def test_home():\n"

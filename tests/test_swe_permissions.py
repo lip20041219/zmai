@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from zmai.tool import ToolContext
 from zmai.swe.tools import EditTool, WriteFileTool
+from zmai.tool import ToolContext
 
 _ROOT = Path(__file__).resolve().parents[1]
 

@@ -23,7 +23,6 @@ import json
 import logging
 import sys
 from ctypes import wintypes
-from typing import Any
 
 from zmai.auth.store_base import (
     CredentialStore,

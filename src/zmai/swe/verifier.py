@@ -14,13 +14,12 @@ Architecture:
   3. exit_code     — command exit code
   4. test_output   — test result parsing
   5. git_diff      — Git change inspection
-"""
+"""  # noqa: E501
 
 from __future__ import annotations
 
 import logging
 import subprocess
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,7 +38,7 @@ class VerificationCheck:
         target: The target being checked (file path, command, etc.).
         evidence: Observed facts (basis for pass/fail judgment).
         error: Error message on failure.
-    """
+    """  # noqa: E501
 
     name: str
     strategy: str
@@ -385,7 +384,7 @@ def verify_git_diff(workspace: Path | None = None) -> VerificationCheck:
             errors="replace",
         )
         diff_output = (r.stdout or "").strip()
-        has_diff = len(diff_output) > 0
+        len(diff_output) > 0
         return VerificationCheck(
             name="Git diff check",
             strategy="git_diff",

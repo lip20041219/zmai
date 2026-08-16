@@ -33,19 +33,21 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
-
-import pytest
+from typing import Any
 
 from zmai.agent import AgentContext
 from zmai.gateway.base import (
-    Backend, BackendCapability, BackendEvent,
-    BackendRequest, BackendResponse, TokenUsage,
+    Backend,
+    BackendCapability,
+    BackendEvent,
+    BackendRequest,
+    BackendResponse,
+    TokenUsage,
 )
 from zmai.swe.agent import SWEAgent
 from zmai.tool import ToolCall, ToolRegistry
-
 
 # ═══════════════════════════════════════════════════════════════════
 # 4-bug Flask 项目 fixture
@@ -131,7 +133,7 @@ _FIXES: list[tuple[str, dict[str, str]]] = [
     # Bug 2: CSS 缺失 —— append 一个路由
     ("bug2", {"mode": "append",
               "new_text": '\n\n@app.route("/static/style.css")\ndef style():\n'
-                          '    return "body { color: #333; }", 200, {"Content-Type": "text/css"}\n'}),
+                          '    return "body { color: #333; }", 200, {"Content-Type": "text/css"}\n'}),  # noqa: E501
 ]
 
 
@@ -184,7 +186,7 @@ class _ScriptedBackend(Backend):
         return {BackendCapability.TOOL_USE}
 
 
-async def _run_agent(project_dir: Path, backend: Backend, max_steps: int = 9) -> tuple[AgentContext, Any]:
+async def _run_agent(project_dir: Path, backend: Backend, max_steps: int = 9) -> tuple[AgentContext, Any]:  # noqa: E501
     agent = SWEAgent("flask_demo")
     ctx = AgentContext(
         agent_id="flask_demo",

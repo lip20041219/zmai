@@ -16,7 +16,7 @@ from zmai.swe.tools import (
     ShowToUserTool,
     WriteFileTool,
 )
-from zmai.tool import ToolContext, ToolResult
+from zmai.tool import ToolContext
 
 
 @pytest.fixture
@@ -243,8 +243,9 @@ class TestResolveToolPath:
 
     def test_absolute_path_outside_rejected(self, ctx: ToolContext) -> None:
         """workspace 外部的绝对路径应被拒绝。"""
-        from zmai.swe.tools import _resolve_tool_path
         import sys
+
+        from zmai.swe.tools import _resolve_tool_path
         if sys.platform == "win32":
             outside = "C:\\Windows\\System32\\drivers\\etc\\hosts"
         else:

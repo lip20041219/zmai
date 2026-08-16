@@ -24,10 +24,10 @@ from zmai.agent import AgentContext
 from zmai.errors import BackendError
 from zmai.gateway.base import Backend, BackendRequest, BackendResponse
 from zmai.swe._async_utils import run_sync
-from zmai.swe.models import Plan, MAX_REPLANS, validate_plan_dict
+from zmai.swe.models import Plan, validate_plan_dict
 from zmai.swe.plan_guard import PlanModeGuard
 from zmai.swe.scanner import RepositoryInfo, RepositoryScanner
-from zmai.tool import ToolRegistry, ToolContext as _ToolContext
+from zmai.tool import ToolRegistry
 
 logger = logging.getLogger("zmai.swe.plan_agent")
 
@@ -72,9 +72,9 @@ _PLANNER_SYSTEM_PROMPT = """You are a software engineering planner. Your task is
 - steps: at least 1, at most 10.
 - Each action must be executable and verifiable.
 - Explicitly list all files that need to be modified.
-- verification_strategy must be realistic and actionable."""
+- verification_strategy must be realistic and actionable."""  # noqa: E501
 
-_FALLBACK_PLAN_PROMPT = """Generate an execution plan based on the task description. Output JSON directly without analysis."""
+_FALLBACK_PLAN_PROMPT = """Generate an execution plan based on the task description. Output JSON directly without analysis."""  # noqa: E501
 
 
 class PlanAgent:
@@ -244,14 +244,14 @@ class PlanAgent:
         plan = self._plan
         lines = [
             "━" * 50,
-            f"  Plan",
+            "  Plan",
             "━" * 50,
-            f"",
+            "",
             f"  Objective: {plan.goal}",
             f"  Complexity: {plan.estimated_complexity}  |  Steps: {len(plan.steps)}",
         ]
         if plan.assumptions:
-            lines.append(f"  Assumptions:")
+            lines.append("  Assumptions:")
             for a in plan.assumptions:
                 lines.append(f"    • {a}")
         if plan.files_to_modify:
@@ -261,11 +261,11 @@ class PlanAgent:
         if plan.verification_strategy:
             lines.append(f"  Verification: {plan.verification_strategy[:200]}")
         if plan.risks:
-            lines.append(f"  Risks:")
+            lines.append("  Risks:")
             for r in plan.risks:
                 lines.append(f"    ⚠ {r}")
         lines.append("")
-        lines.append(f"  Steps:")
+        lines.append("  Steps:")
         for s in plan.steps:
             tool_str = f" [{s.tool}]" if s.tool else ""
             lines.append(f"    {s.id}. {s.action}{tool_str}")

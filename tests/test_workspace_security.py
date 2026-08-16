@@ -19,16 +19,13 @@ from pathlib import Path
 import pytest
 
 from zmai.swe.tools import (
-    EditTool,
     GitTool,
-    GrepTool,
-    OpenInBrowserTool,
     ReadFileTool,
     ShellTool,
     WriteFileTool,
     _resolve_tool_path,
 )
-from zmai.tool import ToolContext, ToolResult
+from zmai.tool import ToolContext
 
 
 @pytest.fixture
@@ -99,7 +96,7 @@ class TestPathTraversal:
 
 def _can_symlink() -> bool:
     """检查当前平台是否支持创建 symlink。"""
-    import os, tempfile
+    import tempfile
     try:
         with tempfile.NamedTemporaryFile(delete=False) as f:
             tmp = Path(f.name)

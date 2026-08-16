@@ -10,12 +10,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 import sys
-import tempfile
-from pathlib import Path
 
 from zmai.cli.formatters import Theme, print_error, print_info, print_success
 
@@ -82,9 +78,9 @@ def _cmd_issue(argv: list[str]) -> None:
 
     print(f"  Issue 工作流开始: {input_str}")
     if plan_only:
-        print(f"  模式: 仅计划 (--plan)")
+        print("  模式: 仅计划 (--plan)")
     elif dry_run:
-        print(f"  模式: 模拟 (--dry-run)")
+        print("  模式: 模拟 (--dry-run)")
     print()
 
     result = agent.run(
@@ -103,7 +99,7 @@ def _output_console(result, theme) -> None:
     """控制台输出。"""
     from zmai.issue.agent import IssueResult
     if not isinstance(result, IssueResult):
-        print(json.dumps(result if isinstance(result, dict) else result.to_dict(), indent=2, ensure_ascii=False))
+        print(json.dumps(result if isinstance(result, dict) else result.to_dict(), indent=2, ensure_ascii=False))  # noqa: E501
         return
 
     # 错误处理
@@ -117,13 +113,13 @@ def _output_console(result, theme) -> None:
     print()
     print(f"  {theme.highlight(issue.title)}")
     if issue.full_name:
-        print(f"  {theme.dim(f'{issue.full_name}' + (f' #{issue.number}' if issue.number else ''))}")
+        print(f"  {theme.dim(f'{issue.full_name}' + (f' #{issue.number}' if issue.number else ''))}")  # noqa: E501
     print()
 
     # 计划
     if result.plan:
         print(f"  {theme.dim('─' * 50)}")
-        print(f"  📋 修复计划")
+        print("  📋 修复计划")
         print(f"  {theme.dim('─' * 50)}")
         for line in result.plan.split("\n"):
             print(f"  {line}")
@@ -152,7 +148,7 @@ def _output_console(result, theme) -> None:
     if result.test_output:
         lines = result.test_output.strip().split("\n")
         print(f"  {theme.dim('─' * 50)}")
-        print(f"  🧪 测试输出")
+        print("  🧪 测试输出")
         print(f"  {theme.dim('─' * 50)}")
         for line in lines[:15]:
             clean = line.strip()
@@ -165,7 +161,7 @@ def _output_console(result, theme) -> None:
     # 验证
     if result.verification:
         print(f"  {theme.dim('─' * 50)}")
-        print(f"  ✅ 验证结果")
+        print("  ✅ 验证结果")
         print(f"  {theme.dim('─' * 50)}")
         for line in result.verification.split("\n"):
             print(f"  {line}")
@@ -174,14 +170,14 @@ def _output_console(result, theme) -> None:
     # 完成摘要
     if result.summary:
         print(f"  {theme.dim('─' * 50)}")
-        print(f"  📊 摘要")
+        print("  📊 摘要")
         print(f"  {theme.dim('─' * 50)}")
         for line in result.summary.split("\n"):
             print(f"  {line}")
         print()
 
     # 元信息
-    print(f"  {theme.dim(f'耗时: {result.duration_seconds:.1f}s  |  状态: {result.workflow_status}')}")
+    print(f"  {theme.dim(f'耗时: {result.duration_seconds:.1f}s  |  状态: {result.workflow_status}')}")  # noqa: E501
 
 
 def _output_json(result) -> None:
@@ -227,7 +223,7 @@ def _cmd_pr(argv: list[str]) -> None:
         print_error("Not in a git repository or no remote 'origin'")
         sys.exit(1)
 
-    from zmai.swe.github import parse_repo_url, create_pull_request
+    from zmai.swe.github import create_pull_request, parse_repo_url
 
     try:
         owner, repo = parse_repo_url(remote_url)

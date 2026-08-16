@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import json
-import logging
-import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
-
-import urllib.request
-from unittest.mock import MagicMock, patch
 
 from zmai.errors import BackendError, BackendInvalidResponse
 from zmai.gateway import (
@@ -26,8 +23,7 @@ from zmai.gateway import (
     ToolRouter,
 )
 from zmai.gateway.backends import ClaudeBackend, DeepSeekBackend, GeminiBackend
-from zmai.tool import Tool, ToolCall, ToolContext, ToolDefinition, ToolResult, ToolRegistry
-
+from zmai.tool import Tool, ToolCall, ToolContext, ToolDefinition, ToolRegistry, ToolResult
 
 # ── Mock Backend ──────────────────────────────────────────────
 
@@ -211,7 +207,7 @@ class TestToolRouter:
         assert result.success
         assert result.output == "echo: hello"
 
-    def test_execute_nonexistent_tool(self, tool_router: ToolRouter, tool_context: ToolContext) -> None:
+    def test_execute_nonexistent_tool(self, tool_router: ToolRouter, tool_context: ToolContext) -> None:  # noqa: E501
         tc = ToolCall(id="c1", name="nonexistent", params={})
         with pytest.raises(BackendError, match="工具未注册"):
             tool_router.execute(tc, tool_context)
@@ -226,7 +222,7 @@ class TestToolRouter:
         result = tool_router.execute_with_timeout(tc, tool_context, timeout=5)
         assert result.success
 
-    def test_execute_records_duration(self, tool_router: ToolRouter, tool_context: ToolContext) -> None:
+    def test_execute_records_duration(self, tool_router: ToolRouter, tool_context: ToolContext) -> None:  # noqa: E501
         tc = ToolCall(id="c1", name="echo", params={"text": "timing"})
         result = tool_router.execute(tc, tool_context)
         assert result.duration_ms >= 0
@@ -274,7 +270,7 @@ class TestClaudeBackend:
         req = BackendRequest(
             messages=[{"role": "user", "content": "hi"}],
             system_prompt="You are a helpful assistant.",
-            tools=[ToolDefinition(name="echo", description="Echo", input_schema={"type": "object"})],
+            tools=[ToolDefinition(name="echo", description="Echo", input_schema={"type": "object"})],  # noqa: E501
             max_tokens=2048,
             temperature=0.5,
             stop_sequences=["\n\n"],
@@ -385,7 +381,7 @@ class TestDataClasses:
         assert d["total"] == 150
 
     def test_token_usage_with_cache(self) -> None:
-        u = TokenUsage(input_tokens=100, output_tokens=50, cache_read_tokens=20, cache_write_tokens=10)
+        u = TokenUsage(input_tokens=100, output_tokens=50, cache_read_tokens=20, cache_write_tokens=10)  # noqa: E501
         assert u.total == 150
         assert u.cache_read_tokens == 20
 
@@ -407,11 +403,11 @@ class TestToolRouterIntegration:
         defs = router.definitions()
         assert len(defs) == 1
 
-    def test_multiple_tools_route(self, tool_registry: ToolRegistry, tool_context: ToolContext) -> None:
+    def test_multiple_tools_route(self, tool_registry: ToolRegistry, tool_context: ToolContext) -> None:  # noqa: E501
         class _AddTool(Tool):
             name = "add"
             description = "Add"
-            parameters = {"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}}
+            parameters = {"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}}  # noqa: E501
             def execute(self, context: ToolContext, params: dict) -> ToolResult:
                 return ToolResult.ok(str(params.get("a", 0) + params.get("b", 0)))
 
@@ -510,8 +506,8 @@ class TestDeepSeekBackend:
 
     def test_invoke_http_error(self):
         backend = DeepSeekBackend(config={"api_key": "bad-key"})
-        from zmai.gateway.base import BackendRequest
         from zmai.errors import BackendError
+        from zmai.gateway.base import BackendRequest
         req = BackendRequest(messages=[{"role": "user", "content": "hi"}])
         with pytest.raises(BackendError, match="KEY_INVALID|401|API Key"):
             backend.invoke(req)
@@ -678,7 +674,7 @@ class TestBackendInvalidResponse:
 
     def test_claude_missing_content(self):
         backend = ClaudeBackend(config={"api_key": "test"})
-        backend._post = MagicMock(return_value={"id": "msg_1", "usage": {}, "stop_reason": "end_turn"})
+        backend._post = MagicMock(return_value={"id": "msg_1", "usage": {}, "stop_reason": "end_turn"})  # noqa: E501
         req = BackendRequest(messages=[{"role": "user", "content": "hi"}])
         with pytest.raises(BackendInvalidResponse, match="缺少必要字段"):
             backend.invoke(req)

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from zmai.cli.formatters import Theme, print_error, print_info, print_success
+from zmai.cli.formatters import print_error
 
 logger = logging.getLogger("zmai.cli.eval")
 

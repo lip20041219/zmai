@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from zmai.cli.context import build_context
 from zmai.cli.detectors.docker_detector import DockerDetector
 from zmai.cli.detectors.git_detector import GitDetector
@@ -15,7 +13,7 @@ from zmai.cli.detectors.monorepo import MonorepoDetector
 
 class TestPythonDetector:
     def test_pyproject(self, tmp_path: Path):
-        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\nrequires-python = '>=3.11'\n")
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\nrequires-python = '>=3.11'\n")  # noqa: E501
         r = PythonDetector().detect(tmp_path)
         assert r and r["type"] == "python"
         assert r["language_version"] == "3.11"
@@ -95,8 +93,8 @@ class TestGitDetector:
     def test_with_git(self, tmp_path: Path):
         import subprocess
         subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
-        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=str(tmp_path), capture_output=True)
-        subprocess.run(["git", "config", "user.name", "Test"], cwd=str(tmp_path), capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=str(tmp_path), capture_output=True)  # noqa: E501
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=str(tmp_path), capture_output=True)  # noqa: E501
         (tmp_path / "f.py").write_text("x = 1")
         subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
         subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), capture_output=True)
@@ -144,7 +142,7 @@ class TestMonorepoDetector:
 
 class TestBuildContext:
     def test_python_project(self, tmp_path: Path):
-        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\nrequires-python = '>=3.11'\n")
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\nrequires-python = '>=3.11'\n")  # noqa: E501
         (tmp_path / "src").mkdir()
         (tmp_path / "tests").mkdir()
         ctx = build_context(tmp_path)
@@ -168,7 +166,7 @@ class TestBuildContext:
         import subprocess
         (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
         subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
-        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(tmp_path), capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(tmp_path), capture_output=True)  # noqa: E501
         subprocess.run(["git", "config", "user.name", "T"], cwd=str(tmp_path), capture_output=True)
         (tmp_path / "x.py").write_text("")
         subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)

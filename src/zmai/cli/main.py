@@ -12,28 +12,36 @@ import time
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
 from zmai import __version__ as zmai_version
-from zmai.cli.context import build_context
-from zmai.cli.detector import _find_root as find_project_root
-from zmai.cli.formatters import Theme, print_error, print_json, print_info, print_success
 from zmai.cli.auth_cmd import (
     first_run_wizard as _first_run_wizard,
+)
+from zmai.cli.auth_cmd import (
     offer_auth_fix as _offer_auth_fix,
+)
+from zmai.cli.auth_cmd import (
     print_auth_debug as _print_auth_debug,
+)
+from zmai.cli.auth_cmd import (
     run_auth as _run_auth,
+)
+from zmai.cli.auth_cmd import (
     should_show_wizard as _should_show_wizard,
 )
 from zmai.cli.config_cmd import run_config as _run_config
+from zmai.cli.context import build_context
+from zmai.cli.detector import _find_root as find_project_root
 from zmai.cli.eval_cmd import run_benchmark as _run_benchmark
 from zmai.cli.eval_cmd import run_eval as _run_eval
+from zmai.cli.formatters import Theme, print_error, print_info, print_json, print_success
 from zmai.cli.github_cmd import run_github as _run_github
 from zmai.cli.plugin_cmd import run_plugin as _run_plugin
 from zmai.config import Config
 from zmai.config.sources import CLISource, EnvSource, FileSource
 from zmai.runtime import Runtime
 from zmai.swe.planner import generate_plan
+
+logger = logging.getLogger(__name__)
 
 SESSION_DIR = Path.home() / ".zmai" / "sessions"
 HISTORY_FILE = Path.home() / ".zmai" / "history"
@@ -100,7 +108,7 @@ def _cleanup_old_workspaces(workspace_root: Path, max_age_days: int = 7) -> int:
         ws = Workspace(root=str(workspace_root))
         cleaned = 0
         now = time.time()
-        for aid in agents:
+        for aid in ws.list_agents():
             state = ws.get_state(aid)
             if not state:
                 continue
@@ -109,7 +117,7 @@ def _cleanup_old_workspaces(workspace_root: Path, max_age_days: int = 7) -> int:
             try:
                 updated = state.updated_at
                 if updated:
-                    from datetime import datetime, timezone
+                    from datetime import datetime
                     age = now - datetime.fromisoformat(updated.replace("Z", "+00:00")).timestamp()
                     if age > max_age_days * 86400:
                         ws.remove(aid)
@@ -167,7 +175,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="json output")
     p.add_argument("--no-color", action="store_true", help="disable color")
     p.add_argument("--backend", help="backend name (see zmai auth list for available)")
-    p.add_argument("--plan", action="store_true", help="auto plan mode: generate plan before execution")
+    p.add_argument("--plan", action="store_true", help="auto plan mode: generate plan before execution")  # noqa: E501
     p.add_argument("--max-steps", type=int, default=None,
                    help="max agent steps before forced stop (default 300, e.g. 100/300/500/1000)")
     p.add_argument("task", nargs="*", help="task description")
@@ -281,22 +289,22 @@ def _run_plan_only(task_args: list[str]) -> None:
     print(f"  {sep}")
     print(f"  {theme.highlight('Plan')}")
     print(f"  {sep}")
-    print(f"")
+    print("")
     print(f"  {theme.bold('目标:')} {plan.goal}")
     print(f"  {theme.dim(f'复杂度: {plan.estimated_complexity}  |  步骤: {len(plan.steps)} 步')}")
-    print(f"")
+    print("")
     print(f"  {theme.bold('执行步骤:')}")
     for s in plan.steps:
         tool_str = f"  [{theme.dim(s.tool)}]" if s.tool else ""
         print(f"    {s.id}. {s.action}{tool_str}")
         if s.expected_outcome:
             print(f"       {theme.dim('→ ' + s.expected_outcome[:120])}")
-    print(f"")
+    print("")
     if plan.risks:
         print(f"  {theme.bold('风险:')}")
         for r in plan.risks:
             print(f"    {theme.warning('⚠')} {r}")
-        print(f"")
+        print("")
     print(f"  {sep}")
     plan_hint = 'Use zmai --plan "<task>" to auto-plan and execute'
     print(f"  {theme.dim(plan_hint)}")
@@ -552,7 +560,7 @@ def main(argv: list[str] | None = None) -> None:
         if getattr(args, "max_steps", None) is not None:
             config.set("runtime.max_iterations", args.max_steps)
         runtime = Runtime(config=config)
-        theme = _get_theme(args, config)
+        _get_theme(args, config)
 
         # Workspace 清理
         ws_root = config.get("workspace.root", "./workspace")
@@ -563,7 +571,7 @@ def main(argv: list[str] | None = None) -> None:
         # 启动信息
         if not getattr(args, "json", False) and sys.stderr.isatty():
             if project_ctx:
-                sys.stderr.write(f"\033[2mzmai  {project_ctx.summary()}  [{runtime._gateway.default_name or ''}]\033[0m\n")
+                sys.stderr.write(f"\033[2mzmai  {project_ctx.summary()}  [{runtime._gateway.default_name or ''}]\033[0m\n")  # noqa: E501
             else:
                 sys.stderr.write("\033[2mzmai  (chat mode)\033[0m\n")
             _print_auth_debug(runtime._gateway)

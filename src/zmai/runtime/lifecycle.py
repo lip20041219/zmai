@@ -24,10 +24,8 @@
 from __future__ import annotations
 
 import threading
-from typing import Any
 
 from zmai.errors import RuntimeError
-
 
 _TRANSITIONS: dict[tuple[str, str], bool] = {
     # ── CREATED → 活跃态 ──────────────────────────

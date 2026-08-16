@@ -4,12 +4,11 @@
 用于验证: 不可完成任务会被 max_iterations 截断，绝不无限循环。
 """
 
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
-from string_utils import to_upper
 
 try:
     from string_utils import transform_external_ai  # noqa: F401

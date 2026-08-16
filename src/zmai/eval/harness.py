@@ -21,12 +21,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -318,7 +317,8 @@ class EvalHarness:
         # 注册 Backend
         if self.backend_name == "mock":
             from zmai.gateway.base import (
-                Backend, BackendCapability, BackendResponse, TokenUsage,
+                Backend,
+                BackendResponse,
             )
 
             class _MockEvalBackend(Backend):

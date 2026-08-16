@@ -10,7 +10,7 @@ Fix Planner 是修复闭环的"计划"环节：解析失败（failure.py）后�
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from zmai.swe.failure import FailureIssue
 

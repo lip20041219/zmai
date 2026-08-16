@@ -12,7 +12,6 @@ import pytest
 from zmai.config.config import Config
 from zmai.config.sources import CLISource, EnvSource, FileSource, _flatten
 
-
 # ═══════════════════════════════════════════════════════════════
 # _flatten
 # ═══════════════════════════════════════════════════════════════

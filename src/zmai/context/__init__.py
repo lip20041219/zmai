@@ -8,10 +8,10 @@ Components:
   - ContextManager:   统一 Facade（与旧 API 兼容）
 """
 
-from zmai.context.window import SlidingWindow, RecentMessages
+from zmai.context.manager import ContextManager
 from zmai.context.memory import SummaryMemory
 from zmai.context.pruner import ContextPruner, PruneAction
-from zmai.context.manager import ContextManager
+from zmai.context.window import RecentMessages, SlidingWindow
 
 __all__ = [
     "SlidingWindow", "RecentMessages",

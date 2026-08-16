@@ -17,20 +17,21 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
-
-import pytest
 
 from zmai.agent import AgentContext
 from zmai.gateway.base import (
-    Backend, BackendCapability, BackendEvent,
-    BackendRequest, BackendResponse, TokenUsage,
+    Backend,
+    BackendCapability,
+    BackendEvent,
+    BackendRequest,
+    BackendResponse,
+    TokenUsage,
 )
 from zmai.swe.agent import SWEAgent
 from zmai.swe.tools import EditTool, WriteFileTool
 from zmai.tool import ToolCall, ToolContext, ToolRegistry
-
 
 # ═══════════════════════════════════════════════════════════════════
 # 夹具：业务 Bug 项目（test_app.py 为严格验收标准）

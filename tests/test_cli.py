@@ -7,7 +7,15 @@ import sys
 
 import pytest
 
-from zmai.cli.formatters import Theme, print_error, print_info, print_json, print_success, print_table, print_warning
+from zmai.cli.formatters import (
+    Theme,
+    print_error,
+    print_info,
+    print_json,
+    print_success,
+    print_table,
+    print_warning,
+)
 
 
 class TestTheme:
@@ -161,34 +169,38 @@ class TestCLIParsing:
 
 class TestThemeFromConfig:
     def test_light_from_config(self):
+        import argparse
+
         from zmai.cli.main import _get_theme
         from zmai.config import Config
-        import argparse
         c = Config()
         c.set("cli.theme", "light")
         t = _get_theme(argparse.Namespace(no_color=False), c)
         assert isinstance(t, Theme)
 
     def test_plain_from_config(self):
+        import argparse
+
         from zmai.cli.main import _get_theme
         from zmai.config import Config
-        import argparse
         c = Config()
         c.set("cli.theme", "plain")
         t = _get_theme(argparse.Namespace(no_color=False), c)
         assert t.enabled is False
 
     def test_dark_default(self):
+        import argparse
+
         from zmai.cli.main import _get_theme
         from zmai.config import Config
-        import argparse
         t = _get_theme(argparse.Namespace(no_color=False), Config())
         assert t.enabled is True
 
     def test_no_color_disables(self):
+        import argparse
+
         from zmai.cli.main import _get_theme
         from zmai.config import Config
-        import argparse
         t = _get_theme(argparse.Namespace(no_color=True), Config())
         assert t.enabled is False
 

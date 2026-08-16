@@ -11,13 +11,8 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
-from typing import Any, Iterator
-
-import pytest
 
 from zmai.swe.agent import _BASE_SYSTEM_PROMPT, _build_system_prompt
-
 
 # ═══════════════════════════════════════════════════════════════════
 # 测试: 系统提示包含 5 阶段工作流
@@ -137,8 +132,11 @@ class TestReadLimitEnforcement:
         """未运行测试时，read_file 调用增加 reads_without_test。"""
         from zmai.agent import AgentContext
         from zmai.gateway.base import (
-            Backend, BackendCapability, BackendEvent,
-            BackendRequest, BackendResponse, TokenUsage,
+            Backend,
+            BackendCapability,
+            BackendEvent,
+            BackendResponse,
+            TokenUsage,
         )
         from zmai.swe.agent import SWEAgent
         from zmai.tool import ToolCall, ToolRegistry
@@ -190,8 +188,11 @@ class TestReadLimitEnforcement:
         """超过读取限制（未运行测试）应触发阻断消息。"""
         from zmai.agent import AgentContext
         from zmai.gateway.base import (
-            Backend, BackendCapability, BackendEvent,
-            BackendRequest, BackendResponse, TokenUsage,
+            Backend,
+            BackendCapability,
+            BackendEvent,
+            BackendResponse,
+            TokenUsage,
         )
         from zmai.swe.agent import SWEAgent
         from zmai.tool import ToolCall, ToolRegistry
@@ -244,8 +245,11 @@ class TestReadLimitEnforcement:
         """运行 pytest 后读取计数应重置为 0。"""
         from zmai.agent import AgentContext
         from zmai.gateway.base import (
-            Backend, BackendCapability, BackendEvent,
-            BackendRequest, BackendResponse, TokenUsage,
+            Backend,
+            BackendCapability,
+            BackendEvent,
+            BackendResponse,
+            TokenUsage,
         )
         from zmai.swe.agent import SWEAgent
         from zmai.tool import ToolCall, ToolRegistry
@@ -315,8 +319,11 @@ class TestReadLimitEnforcement:
         """非 read_file 工具不应增加读取计数。"""
         from zmai.agent import AgentContext
         from zmai.gateway.base import (
-            Backend, BackendCapability, BackendEvent,
-            BackendRequest, BackendResponse, TokenUsage,
+            Backend,
+            BackendCapability,
+            BackendEvent,
+            BackendResponse,
+            TokenUsage,
         )
         from zmai.swe.agent import SWEAgent
         from zmai.tool import ToolCall, ToolRegistry
@@ -382,8 +389,11 @@ class TestNormalOperation:
         """读→测试→写→读 的正常流程。"""
         from zmai.agent import AgentContext
         from zmai.gateway.base import (
-            Backend, BackendCapability, BackendEvent,
-            BackendRequest, BackendResponse, TokenUsage,
+            Backend,
+            BackendCapability,
+            BackendEvent,
+            BackendResponse,
+            TokenUsage,
         )
         from zmai.swe.agent import SWEAgent
         from zmai.tool import ToolCall, ToolRegistry
@@ -481,8 +491,10 @@ class TestEdgeCases:
         """空工具调用列表不应影响计数。"""
         from zmai.agent import AgentContext
         from zmai.gateway.base import (
-            Backend, BackendCapability, BackendEvent,
-            BackendRequest, BackendResponse, TokenUsage,
+            Backend,
+            BackendEvent,
+            BackendResponse,
+            TokenUsage,
         )
         from zmai.swe.agent import SWEAgent
         from zmai.tool import ToolRegistry

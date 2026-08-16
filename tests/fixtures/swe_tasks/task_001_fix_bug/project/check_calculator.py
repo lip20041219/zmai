@@ -1,6 +1,6 @@
 """Tests for calculator — one test will fail until the bug is fixed."""
 
-from calculator import add, subtract, multiply, divide, power, sqrt
+from calculator import add, divide, multiply, power, sqrt, subtract
 
 
 def test_add():

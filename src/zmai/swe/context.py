@@ -5,12 +5,12 @@
 """
 
 from zmai.context.manager import ContextManager
+from zmai.context.memory import _estimate_tokens, _truncate
 from zmai.context.pruner import (
     DEFAULT_MAX_CHARS,
     DEFAULT_RECENT_WINDOW,
     DEFAULT_TOOL_RESULT_WINDOW,
 )
-from zmai.context.memory import _estimate_tokens, _truncate
 
 __all__ = [
     "ContextManager",

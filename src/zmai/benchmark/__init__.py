@@ -9,13 +9,13 @@
 from __future__ import annotations
 
 from zmai.benchmark.runner import (
-    BenchmarkRunner,
-    BenchmarkResult,
     BenchmarkReport,
+    BenchmarkResult,
+    BenchmarkRunner,
     MockBenchmarkBackend,
-    format_report,
-    find_task,
     discover_tasks,
+    find_task,
+    format_report,
 )
 
 __all__ = [

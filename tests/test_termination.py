@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Iterator
+from collections.abc import Iterator
 
 from zmai.agent import AgentContext, AgentState
 from zmai.gateway.base import (

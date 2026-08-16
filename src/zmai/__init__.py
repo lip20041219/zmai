@@ -19,9 +19,9 @@ from zmai.gateway import (
     Backend,
     BackendCapability,
     BackendEvent,
+    BackendRegistry,
     BackendRequest,
     BackendResponse,
-    BackendRegistry,
     MCPClient,
     TokenUsage,
     ToolRouter,
@@ -29,8 +29,8 @@ from zmai.gateway import (
 from zmai.memory import Memory, MemoryManager
 from zmai.prompt import PromptEngine, PromptRole, PromptType
 from zmai.runtime import Runtime
-from zmai.tool import Tool, ToolCall, ToolContext, ToolDefinition, ToolResult, ToolRegistry
-from zmai.workflow import WorkflowEngine, Workflow, WorkflowStep
+from zmai.tool import Tool, ToolCall, ToolContext, ToolDefinition, ToolRegistry, ToolResult
+from zmai.workflow import Workflow, WorkflowEngine, WorkflowStep
 
 __all__ = [
     "Agent",

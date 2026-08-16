@@ -16,10 +16,11 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
-from zmai.context.memory import SummaryMemory, _truncate
+from zmai.context.memory import SummaryMemory
 from zmai.context.window import RecentMessages
 
 logger = logging.getLogger("zmai.context.pruner")
@@ -115,7 +116,7 @@ class ContextPruner:
             return False
 
         # 收集要压缩的旧消息
-        old_messages: list[dict[str, Any]] = recent.messages[:remove_count] if remove_count > 0 else []
+        old_messages: list[dict[str, Any]] = recent.messages[:remove_count] if remove_count > 0 else []  # noqa: E501
         old_tools: list[dict[str, Any]] = []
 
         # 限制工具结果窗口
@@ -135,7 +136,6 @@ class ContextPruner:
 
         # 简化：直接操作内部
         try:
-            from zmai.context.window import SlidingWindow
             # 重建窗口以保留最近消息
             kept_msgs = recent.messages[-keep:] if keep > 0 else []
             kept_tools = recent.tool_results[-self.tool_window:] if self.tool_window > 0 else []

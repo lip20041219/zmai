@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from zmai.tool import ToolContext
 from zmai.swe.tools import EditTool, WriteFileTool
+from zmai.tool import ToolContext
 
 
 @pytest.fixture

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from zmai.memory.base import MemoryEntry
 from zmai.memory.long_term import LongTermMemory
 from zmai.memory.manager import MemoryManager
@@ -29,7 +27,7 @@ class TestMemoryEntry:
         assert d["namespace"] == "ns"
 
     def test_from_dict(self):
-        d = {"key": "k", "value": 42, "namespace": "ns", "created_at": "", "updated_at": "", "ttl": None}
+        d = {"key": "k", "value": 42, "namespace": "ns", "created_at": "", "updated_at": "", "ttl": None}  # noqa: E501
         e = MemoryEntry.from_dict(d)
         assert e.key == "k"
         assert e.value == 42

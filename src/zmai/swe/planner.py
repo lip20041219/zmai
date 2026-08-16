@@ -59,7 +59,7 @@ Requirements:
 - Each action must be executable and verifiable.
 - verification_strategy must be realistic (e.g. "file_exists", "grep pattern", "shell_exec exit 0").
 - If multiple files are involved, distribute across different steps.
-- Do NOT combine verification and delivery into the same step."""
+- Do NOT combine verification and delivery into the same step."""  # noqa: E501
 
 
 def generate_plan(task: str, backend: Backend, config: dict[str, Any] | None = None) -> Plan:

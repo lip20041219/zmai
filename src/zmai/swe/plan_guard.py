@@ -155,7 +155,7 @@ class PlanModeGuard:
         for kw in dangerous_keywords:
             if kw in lower:
                 return ToolResult.err(
-                    f"PlanModeGuard: Command contains potentially dangerous operation '{kw.strip()}', "
+                    f"PlanModeGuard: Command contains potentially dangerous operation '{kw.strip()}', "  # noqa: E501
                     f"denied before Plan confirmation."
                 )
 

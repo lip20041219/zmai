@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from zmai.tool import ToolDefinition, ToolResult
+from zmai.tool import ToolResult
 
 logger = logging.getLogger("zmai.gateway.mcp")
 
@@ -164,8 +164,8 @@ class MCPClient:
         Raises:
             MCPConnectionError: 连接失败时抛出。
         """
-        import urllib.request
         import urllib.error
+        import urllib.request
 
         url = f"{self._server_url}/{method.replace('/', '.')}"
         body = json.dumps({

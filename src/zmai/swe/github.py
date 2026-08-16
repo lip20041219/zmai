@@ -14,9 +14,8 @@ import logging
 import os
 import re
 import subprocess
-import sys
-import urllib.request
 import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -230,7 +229,7 @@ def fetch_issue(url: str, token: str | None = None) -> GitHubIssue:
             "body": c.get("body", "")[:2000],
         })
 
-    labels = [l.get("name", "") for l in issue_data.get("labels", [])]
+    labels = [label.get("name", "") for label in issue_data.get("labels", [])]
 
     return GitHubIssue(
         owner=owner,

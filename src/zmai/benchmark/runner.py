@@ -22,23 +22,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from zmai.config import Config
-from zmai.config.sources import CLISource, EnvSource, FileSource
 from zmai.gateway.base import (
     Backend,
     BackendCapability,
-    BackendEvent,
     BackendRequest,
     BackendResponse,
     TokenUsage,
@@ -49,7 +45,7 @@ logger = logging.getLogger("zmai.benchmark")
 
 # ── Fixtures 路径 ──────────────────────────────────────────
 
-FIXTURES_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "tests" / "fixtures" / "swe_tasks"
+FIXTURES_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "tests" / "fixtures" / "swe_tasks"  # noqa: E501
 
 _SESSION_DIR = Path.home() / ".zmai" / "benchmark"
 _RESULTS_FILE = _SESSION_DIR / "latest_results.json"
@@ -504,7 +500,7 @@ def format_report(report: BenchmarkReport) -> str:
             f"  {r.task_id:<30} {status_tag:<10} {r.steps:<8} {r.duration:.1f}s"
         )
     lines.append("  " + "-" * 56)
-    lines.append(f"")
+    lines.append("")
     lines.append(f"  Success Rate: {report.success_rate}% ({report.passed}/{report.total})")
     lines.append("=" * 60)
     return "\n".join(lines)

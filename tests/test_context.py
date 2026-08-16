@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import pytest
-
 from zmai.swe.context import (
-    ContextManager,
     DEFAULT_MAX_CHARS,
     DEFAULT_RECENT_WINDOW,
     DEFAULT_TOOL_RESULT_WINDOW,
+    ContextManager,
     _truncate,
-    _estimate_tokens,
 )
 
 
@@ -308,7 +305,6 @@ class TestContextCompaction:
         cm.add_message("assistant", "hello")
 
         # 模拟 _do_compact 异常
-        original = cm._do_compact
         def broken():
             raise ValueError("模拟错误")
         cm._do_compact = broken
