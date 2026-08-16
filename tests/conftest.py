@@ -17,9 +17,45 @@ from pathlib import Path
 
 import pytest
 
-# mock backend 的 Preflight 检查需要 MOCK_API_KEY；测试环境统一注入，
+# mock backend 的 Preflight 检查需要各 <NAME>_API_KEY；测试环境统一注入，
 # 保证本地与 CI 行为一致（mock backend 不发起真实 HTTP 请求）。
-os.environ.setdefault("MOCK_API_KEY", "sk-mock")
+# 覆盖 tests/ 中所有注册的 mock backend 名（含注册别名）。
+_MOCK_BACKENDS = [
+    "mock",
+    "ok",
+    "state_ok",
+    "success",
+    "auth_error",
+    "connection_error",
+    "timeout",
+    "invalid_response",
+    "flaky",
+    "infinite",
+    "infinite_loop",
+    "fail_tool",
+    "all_fail",
+    "fail_once",
+    "slow",
+    "state_test",
+    "autostop_ever_loops",
+    "ever_loops",
+    "plan_mock",
+    "loop_backend",
+    "normal_backend",
+    "toolmock",
+    "cancel_mock",
+    "step_recovery",
+    "retry_agent",
+    "demo_fix",
+    "e2e_fix",
+    "scripted_fix",
+    "scripted_flask_demo",
+    "read_loop",
+    "requirements_run",
+    "echo",
+]
+for _name in _MOCK_BACKENDS:
+    os.environ.setdefault(f"{_name.upper()}_API_KEY", "sk-mock")
 
 
 def _remove_dead_symlinks(base: Path) -> None:
