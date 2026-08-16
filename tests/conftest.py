@@ -12,9 +12,14 @@ tmp 工厂，使后续 cleanup 无死链、且 ExitStack.close() 幂等不再抛
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
+
+# mock backend 的 Preflight 检查需要 MOCK_API_KEY；测试环境统一注入，
+# 保证本地与 CI 行为一致（mock backend 不发起真实 HTTP 请求）。
+os.environ.setdefault("MOCK_API_KEY", "sk-mock")
 
 
 def _remove_dead_symlinks(base: Path) -> None:

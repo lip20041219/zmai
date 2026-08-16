@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -396,6 +397,10 @@ class TestPathSecurity:
 
     # ── 回归测试：Windows 大小写不敏感 ────────────────────
 
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="大小写不敏感行为仅 Windows 存在（Unix 大小写敏感）",
+    )
     def test_case_difference_on_windows(self, tmp_root: Path) -> None:
         """Windows 上大小写不同但实际相同的路径应允许。"""
         ws = Workspace(root=tmp_root)

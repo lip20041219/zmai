@@ -153,7 +153,7 @@ class TestDoctorRun:
     def test_no_http_requests(self):
         """Doctor never makes HTTP requests."""
         d = Doctor()
-        with patch("zmai.cli.doctor.os.environ.get", return_value=""):
+        with patch("os.environ.get", return_value=""):
             d.run()
         # Pass if we get here without HTTPError
 

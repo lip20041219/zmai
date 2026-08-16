@@ -32,7 +32,9 @@ class MemoryEntry:
         if self.ttl is None:
             return False
         from datetime import datetime, timezone
-        created = datetime.fromisoformat(self.created_at)
+
+        # Python 3.10 的 fromisoformat 不认 'Z' 后缀（3.11+ 才支持）
+        created = datetime.fromisoformat(self.created_at.replace("Z", "+00:00"))
         delta = (datetime.now(timezone.utc) - created).total_seconds()
         return delta > self.ttl
 

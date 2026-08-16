@@ -105,12 +105,15 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 def _read_toml(path: Path) -> dict[str, Any] | None:
     try:
         if path.exists() and path.stat().st_size > 0:
-            import tomllib
+            try:
+                import tomllib
+            except ModuleNotFoundError:  # Python 3.10 及以下
+                import tomli as tomllib  # type: ignore[no-redef]
+
             return tomllib.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
     return None
-
 
 def _run_git(root: Path, cmd: str) -> str:
     import subprocess

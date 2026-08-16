@@ -127,7 +127,9 @@ class TestSymlinkEscape:
         tool = WriteFileTool()
         result = tool.execute(ctx, {"path": "evil_link", "content": "hacked"})
         assert result.success is False
-        assert "symlink" in (result.error or "").lower()
+        # symlink 指向工作区外，被路径安全检查拒绝（错误信息可能为
+        # "不在工作区内"或含 "symlink" 字样的专用提示，二者皆可）
+        assert ("symlink" in (result.error or "").lower()) or ("不在工作区" in (result.error or ""))
 
     def test_symlink_outside_read_rejected(self, ctx):
         """读取指向外部的 symlink 被拒绝。"""
@@ -159,6 +161,10 @@ class TestSymlinkEscape:
 class TestWindowsPath:
     """Windows 路径兼容性测试。"""
 
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="反斜杠路径语义仅 Windows 存在（Unix 上反斜杠是普通字符）",
+    )
     def test_windows_backslash_rejected_if_relative(self, ctx):
         """反斜杠相对路径（Windows 风格的 ../..\\）。"""
         safe, _, err = _resolve_tool_path(ctx, "..\\..\\etc\\passwd")
@@ -166,6 +172,10 @@ class TestWindowsPath:
         # 实际 Windows 上 pathlib 会正确解析
         assert safe is False
 
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="大小写不敏感仅 Windows 存在（Unix 上 testcase.txt 是合法工作区内路径）",
+    )
     def test_windows_case_insensitive_allowed(self, ctx):
         """Windows 路径大小写不敏感，在 workspace 内应允许。"""
         test_file = ctx.workspace_path / "TestCase.txt"

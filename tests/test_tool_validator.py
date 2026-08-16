@@ -88,7 +88,8 @@ class TestToolNotFound:
 class TestValidToolExecution:
     def test_shell_exec_normal(self, registry, ctx, ws: Path):
         (ws / "hello.txt").write_text("hi\n", encoding="utf-8")
-        result = registry.execute_tool("shell_exec", {"command": "type hello.txt"}, ctx)
+        # 跨平台：Windows cmd 用 type，bash 用 cat（CI 的 ubuntu runner 无 type）
+        result = registry.execute_tool("shell_exec", {"command": "cat hello.txt"}, ctx)
         assert result.success
         assert "hi" in result.output
 
@@ -115,7 +116,7 @@ class TestAgentRecovery:
         available = bad.metadata.get("available_tools", [])
         assert "shell_exec" in available
 
-        good = registry.execute_tool("shell_exec", {"command": "type data.txt"}, ctx)
+        good = registry.execute_tool("shell_exec", {"command": "cat data.txt"}, ctx)
         assert good.success
         assert "recover-me" in good.output
 
