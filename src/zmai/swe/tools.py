@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import shlex
@@ -258,7 +259,7 @@ class ReadFileTool(Tool):
     # 读取缓存：按 (agent_id, 解析后绝对路径, mtime, size) 缓存，同一任务重复读
     # 同一未变化文件时返回"复用提示"而非重新读盘 —— 既省 token 又暴露无意义重复读取。
     # 实例级缓存天然按任务隔离（每个 SWEAgent 注册独立的 ReadFileTool 实例）。
-    _read_cache: dict[tuple, tuple[int, int]] = {}
+    _read_cache: dict[tuple, tuple[int, int, str]] = {}
     _read_cache_order: list[tuple] = []
 
     def execute(self, context: ToolContext, params: dict[str, Any]) -> ToolResult:
@@ -286,16 +287,25 @@ class ReadFileTool(Tool):
         except OSError:
             cache_key = None
         if cache_key is not None and cache_key in self._read_cache:
-            _line_count, _size = self._read_cache[cache_key]
-            result = ToolResult.ok(
-                output=(
-                    f"[ReadCache] {path} 已在当前修复上下文读取过，内容未变化。\n"
-                    f"请复用之前的读取结果，不要重复读取 —— 直接基于已读内容分析并修改代码。"
-                ),
-                metadata={"cached": True, "line_count": _line_count, "size": _size},
-            )
-            _emit_tool_result(self.name, context, params, result, _st)
-            return result
+            _line_count, _size, _cached_hash = self._read_cache[cache_key]
+            # Windows/文件系统时间戳精度问题：文件已修改但 mtime_ns 可能未刷新
+            # （NTFS 元数据延迟），仅凭 mtime+size 会误判"未变化"。用内容指纹
+            # 二次确认：指纹一致才算缓存命中，否则视为已修改、重新读盘。
+            try:
+                cur_hash = hashlib.sha256(full.read_bytes()).hexdigest()
+            except OSError:
+                cur_hash = ""
+            if cur_hash == _cached_hash:
+                result = ToolResult.ok(
+                    output=(
+                        f"[ReadCache] {path} 已在当前修复上下文读取过，内容未变化。\n"
+                        f"请复用之前的读取结果，不要重复读取 —— 直接基于已读内容分析并修改代码。"
+                    ),
+                    metadata={"cached": True, "line_count": _line_count, "size": _size},
+                )
+                _emit_tool_result(self.name, context, params, result, _st)
+                return result
+            # 内容已变化 → 缓存失效，走正常读取路径
 
         fsize = full.stat().st_size
         if fsize > self._MAX_TEXT_SIZE:
@@ -341,7 +351,11 @@ class ReadFileTool(Tool):
         numbered = "".join(f"{i+1:>4}|{line}" for i, line in enumerate(selected))
         # 记录读取缓存（供后续重复读命中）
         if cache_key is not None:
-            self._read_cache[cache_key] = (total, fsize)
+            try:
+                content_hash = hashlib.sha256(full.read_bytes()).hexdigest()
+            except OSError:
+                content_hash = ""
+            self._read_cache[cache_key] = (total, fsize, content_hash)
             self._read_cache_order.append(cache_key)
             if len(self._read_cache_order) > 400:  # 简单 LRU 上限，防无限增长
                 oldest = self._read_cache_order.pop(0)
