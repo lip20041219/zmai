@@ -67,3 +67,6 @@ benchmarks/results/swebench_lite/*/_eval/
 benchmarks/results/swebench_lite/*/result.json
 benchmarks/results/swebench_lite/*/git.diff
 benchmarks/results/swebench_lite/*/*.log
+
+# SWE-bench smoke run logs
+benchmarks/results/swebench_lite/_run_*.log
