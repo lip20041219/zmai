@@ -192,6 +192,19 @@ def load_instances(
     """
     raw_instances = download_instances(split)
 
+    def _parse_test_list(val: Any) -> list[str]:
+        """FTP / PTP 在 JSON 中可能存为 JSON 字符串，也可能已是列表。"""
+        if isinstance(val, list):
+            return val
+        if isinstance(val, str):
+            val = val.strip()
+            if val.startswith("["):
+                try:
+                    return json.loads(val)
+                except json.JSONDecodeError:
+                    pass
+        return []
+
     instances: list[SWEBenchInstance] = []
     for raw in raw_instances:
         inst = SWEBenchInstance(
@@ -202,8 +215,8 @@ def load_instances(
             hints_text=raw.get("hints_text", ""),
             patch=raw.get("patch", ""),
             test_patch=raw.get("test_patch", ""),
-            FAIL_TO_PASS=raw.get("FAIL_TO_PASS", []),
-            PASS_TO_PASS=raw.get("PASS_TO_PASS", []),
+            FAIL_TO_PASS=_parse_test_list(raw.get("FAIL_TO_PASS", [])),
+            PASS_TO_PASS=_parse_test_list(raw.get("PASS_TO_PASS", [])),
         )
         if repos and inst.repo not in repos:
             continue
@@ -314,11 +327,9 @@ def run_tests(
         return True, "No tests to run"
 
     repo_path = Path(repo_path)
-    test_args = " ".join(test_files)
 
     result = subprocess.run(
-        f"python -m pytest {test_args} -x -q --no-header 2>&1 || true",
-        shell=True,
+        ["python", "-m", "pytest", *test_files, "-x", "-q", "--no-header", "-p", "no:cacheprovider"],  # noqa: E501
         cwd=str(repo_path),
         capture_output=True, text=True, timeout=timeout,
     )

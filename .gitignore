@@ -58,3 +58,12 @@ zmai_doc_*.txt
 # Hermes validation runtime outputs
 tests/hermes_validation/*.txt
 tests/hermes_validation/*.json
+
+# SWE-bench benchmark runtime outputs (clone repos / per-instance results / pycache)
+benchmarks/results/swebench_lite/__pycache__/
+benchmarks/results/swebench_lite/repos/
+benchmarks/results/swebench_lite/*/_test_before/
+benchmarks/results/swebench_lite/*/_eval/
+benchmarks/results/swebench_lite/*/result.json
+benchmarks/results/swebench_lite/*/git.diff
+benchmarks/results/swebench_lite/*/*.log
