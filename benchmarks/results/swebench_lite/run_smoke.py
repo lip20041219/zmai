@@ -48,11 +48,13 @@ def sh(
     cmd: list[str],
     cwd: Path | None = None,
     timeout: int = 300,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess:
     """运行命令，返回 CompletedProcess。"""
     return subprocess.run(
         cmd, cwd=str(cwd) if cwd else None,
         capture_output=True, text=True, timeout=timeout,
+        input=input_text,
     )
 
 
@@ -61,11 +63,13 @@ def run_tests_independent(
     test_ids: list[str],
     timeout: int = 300,
 ) -> tuple[bool, str]:
-    """在 repo 上跑 pytest（node id 列表），返回 (passed, output)。"""
+    """在 repo 上跑 pytest（node id 列表），返回 (passed, output)。
+    使用 Anaconda Python（pytest 8.4）以兼容 monkeypatch.notset 等旧 API。
+    """
     if not test_ids:
         return True, "no tests"
     r = subprocess.run(
-        ["python", "-m", "pytest", *test_ids, "-q", "--no-header", "-p", "no:cacheprovider"],
+        ["/d/anaconada/python.exe", "-m", "pytest", *test_ids, "-q", "--no-header", "-p", "no:cacheprovider"],
         cwd=str(repo_path), capture_output=True, text=True, timeout=timeout,
     )
     out = (r.stdout or "") + (r.stderr or "")
@@ -79,7 +83,8 @@ def run_tests_independent(
 
 def apply_patch(repo: Path, patch_text: str) -> tuple[bool, str]:
     """git apply 一个 patch。返回 (成功, 错误信息)。"""
-    r = sh(["git", "-C", str(repo), "apply", "-"], timeout=60)
+    r = sh(["git", "-C", str(repo), "apply", "-"], timeout=60,
+           input_text=patch_text)
     if r.returncode != 0:
         return False, (r.stderr or r.stdout)[:500]
     return True, ""
