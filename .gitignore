@@ -70,3 +70,12 @@ benchmarks/results/swebench_lite/*/*.log
 
 # SWE-bench smoke run logs
 benchmarks/results/swebench_lite/_run_*.log
+
+# SWE-bench eval venv
+benchmarks/results/swebench_lite/_evalenv/
+
+# SWE-bench agent workspaces + worktrees + env-check scratch
+benchmarks/results/swebench_lite/workspace/
+benchmarks/results/swebench_lite/_wt/
+benchmarks/results/swebench_lite/_check_*.py
+benchmarks/results/swebench_lite/_prefetch.log

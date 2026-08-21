@@ -20,7 +20,9 @@ import asyncio
 import io
 import json
 import logging
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,14 +33,43 @@ from pathlib import Path
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-# 项目根
-ROOT = Path(__file__).resolve().parents[2]
+# 项目根：run_smoke.py 位于 benchmarks/results/swebench_lite/，向上 3 层到项目根
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("smoke")
 
 RESULT_DIR = Path(__file__).resolve().parent
+
+# 独立判定使用的 Python：隔离 venv（pytest 8.4，兼容 monkeypatch.notset 等旧 API）
+EVAL_PYTHON = str(Path(__file__).resolve().parent / "_evalenv" / "Scripts" / "python.exe")
+
+
+def repo_src_path(repo_path: Path) -> str:
+    """返回仓库源码目录（绝对路径）：src-layout（如 flask 的 src/）用
+    <repo>/src，扁平 layout（如 requests/pylint）用 repo 根目录。
+    必须绝对化——PYTHONPATH 会在子进程 cwd（repo 本身）下解析。"""
+    src = repo_path / "src"
+    return str((src if src.is_dir() else repo_path).resolve())
+
+
+def parse_pytest_counts(output: str) -> dict:
+    """从 pytest 输出解析 passed/failed/errors 计数（G5：tests_* 出计数而非原文）。"""
+    counts = {"passed": 0, "failed": 0, "errors": 0}
+    if not output:
+        return counts
+    m = re.search(r"(\d+) passed", output)
+    if m:
+        counts["passed"] = int(m.group(1))
+    m = re.search(r"(\d+) failed", output)
+    if m:
+        counts["failed"] = int(m.group(1))
+    m = re.search(r"(\d+) errors", output)
+    if m:
+        counts["errors"] = int(m.group(1))
+    return counts
 
 
 # ── 辅助函数 ────────────────────────────────────────────────
@@ -64,13 +95,19 @@ def run_tests_independent(
     timeout: int = 300,
 ) -> tuple[bool, str]:
     """在 repo 上跑 pytest（node id 列表），返回 (passed, output)。
-    使用 Anaconda Python（pytest 8.4）以兼容 monkeypatch.notset 等旧 API。
+
+    关键：通过 PYTHONPATH 指向仓库源码目录（src-layout 或扁平布局），
+    确保测试导入的是仓库自己的源码，而非全局安装的包。
+    使用隔离 venv（pytest 8.4）以兼容 monkeypatch.notset 等旧 API。
     """
     if not test_ids:
         return True, "no tests"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = repo_src_path(repo_path)
     r = subprocess.run(
-        ["/d/anaconada/python.exe", "-m", "pytest", *test_ids, "-q", "--no-header", "-p", "no:cacheprovider"],
+        [EVAL_PYTHON, "-m", "pytest", *test_ids, "-q", "--no-header", "-p", "no:cacheprovider"],
         cwd=str(repo_path), capture_output=True, text=True, timeout=timeout,
+        env=env,
     )
     out = (r.stdout or "") + (r.stderr or "")
     m = re.search(r"(\d+)\s+failed", out)
@@ -91,7 +128,13 @@ def apply_patch(repo: Path, patch_text: str) -> tuple[bool, str]:
 
 
 def collect_agent_metrics(agent_id: str, ws_path: Path | None) -> dict:
-    """从 ExecutionLog 采集 agent 指标。"""
+    """从 ExecutionLog 采集 agent 指标。
+
+    ExecutionLog 由 Runtime 落盘到 <workspace.root>/<agent_id>/.state/execution_log.json
+    （workspace.root 默认 ./workspace，即运行 CWD 下的 workspace/ 目录）。
+    注意：每条工具调用在日志中产生 tool_call + tool_result 两条记录，
+    tool_calls 计数应只按 phase == "tool_call" 统计，否则会翻倍。
+    """
     metrics: dict = {}
     if ws_path:
         log_file = ws_path / ".state" / "execution_log.json"
@@ -100,11 +143,12 @@ def collect_agent_metrics(agent_id: str, ws_path: Path | None) -> dict:
                 data = json.loads(log_file.read_text(encoding="utf-8"))
                 steps = data.get("steps", [])
                 metrics["steps"] = len(steps)
-                tool_calls = [s for s in steps if s.get("phase") == "tool"]
+                tool_calls = [s for s in steps if s.get("phase") == "tool_call"]
                 metrics["tool_calls"] = len(tool_calls)
                 pytest_calls = [
                     s for s in steps
-                    if s.get("tool_name") == "shell_exec"
+                    if s.get("phase") == "tool_call"
+                    and s.get("tool_name") == "shell_exec"
                     and "pytest" in str(s.get("tool_input", {}))
                 ]
                 metrics["test_runs"] = len(pytest_calls)
@@ -193,11 +237,31 @@ def run_instance(instance, repo_dir: Path, args) -> dict:
             ftp_before, out_before = run_tests_independent(before_repo, instance.FAIL_TO_PASS)
             result["ftp_before"] = "PASS(异常)" if ftp_before else "FAIL(符合预期)"
             result["tests_before"] = out_before
+            result["ftp_before_counts"] = parse_pytest_counts(out_before)
             (inst_dir / "test_before.log").write_text(out_before, encoding="utf-8")
 
-        # ── 3. 启动 Agent ─────────────────────────────
+        # ── 3. 应用 test_patch 到 agent 工作仓库 ──────────────
+        # 让 agent 能看到 FAIL_TO_PASS 测试失败，否则 base_commit 上
+        # 根本没有这些测试，agent 永远看不到失败信号。
+        ok, err = apply_patch(repo_dir, instance.test_patch)
+        if not ok:
+            logger.warning("[%s] test_patch apply 失败（agent 工作区）: %s",
+                          instance.instance_id, err)
+            result["failure_category"] = "patch_failure"
+            result["failure_reason"] = f"test_patch apply failed: {err}"
+            return finalize(result, start)
+        logger.info("[%s] test_patch applied to agent workspace", instance.instance_id)
+
+        # ── 4. 启动 Agent ─────────────────────────────
         from zmai.config import Config
         from zmai.runtime import Runtime
+
+        # agent 的 shell 测试环境：使用隔离 venv 的 python + PYTHONPATH 指向仓库源码。
+        # 否则 agent 用全局 python（3.13）跑测试会因 requests 旧代码 import cgi 而
+        # ImportError，看不到真实的 FTP 失败信号（与 flask harness 修复同理）。
+        _eval_bin = str(Path(EVAL_PYTHON).parent)
+        os.environ["PYTHONPATH"] = repo_src_path(repo_dir)
+        os.environ["PATH"] = _eval_bin + os.pathsep + os.environ.get("PATH", "")
 
         agent_id = f"eval_{instance.instance_id}"
         config = Config(sources=[])
@@ -207,23 +271,58 @@ def run_instance(instance, repo_dir: Path, args) -> dict:
             agent_id=agent_id,
             task=instance.format_task(),
             backend=args.backend,
-            config={"project_path": str(repo_dir)},
+            config={
+                "project_path": str(repo_dir),
+                # SWE-bench eval 守卫：未修改任何源码不得因现有测试全绿而完成
+                "eval.require_code_change": "true",
+            },
         ))
 
         result["status"] = rdict.get("status", "")
         result["steps"] = rdict.get("steps", 0)
         result["error"] = (rdict.get("error") or "")[:500]
 
+        # ── Token 用量 + 模块触发计数（G1/G3/G5）──
+        # Runtime.run() 现在透出 finalize 的 metadata（swe_stats + token_usage）。
+        _meta = rdict.get("metadata") or {}
+        _tok = _meta.get("token_usage") or {}
+        result["input_tokens"] = _tok.get("input_tokens", 0) or 0
+        result["output_tokens"] = _tok.get("output_tokens", 0) or 0
+        result["total_tokens"] = result["input_tokens"] + result["output_tokens"]
+        _swe = _meta.get("swe_stats") or {}
+        result["failure_parser_used"] = int(_swe.get("failure_parser_used", 0) or 0)
+        result["loop_guard_triggered"] = bool(_swe.get("loopguard_blocks", 0))
+        result["test_guard_triggered"] = bool(_swe.get("test_guard_triggered", 0))
+
         # Agent workspace 指标
-        try:
-            ws = Path(tempfile.gettempdir()) / agent_id
-        except Exception:
-            ws = None
+        # ExecutionLog 由 Runtime 写入 workspace.root/<agent_id>/.state/，
+        # workspace.root 默认 ./workspace（相对运行 CWD），即 RESULT_DIR/workspace。
+        ws = RESULT_DIR / "workspace" / agent_id
         metrics = collect_agent_metrics(agent_id, ws)
         result["tool_calls"] = metrics.get("tool_calls")
         result["test_runs"] = metrics.get("test_runs")
 
+        # ── 基础设施失败：backend 调用错误（如 HTTP 402/限流/网络）──
+        # agent 根本没机会执行 → 标记 infrastructure_failure，不判 no_change/test_failure。
+        # 这类失败反映的是环境/API 状态，不是 agent 修复能力。
+        if result["error"] and any(
+            k in result["error"].upper()
+            for k in ("HTTP 4", "HTTP 5", "BACKEND_ERROR", "TIMEOUT", "RATE-LIMIT", "RATE_LIMIT")
+        ):
+            result["failure_category"] = "infrastructure_failure"
+            result["failure_reason"] = f"Backend/API 错误，agent 未能执行: {result['error'][:200]}"
+            result["status"] = "error"
+            result["success"] = False
+            return finalize(result, start)
+
         # ── 4. 保存 git.diff ──────────────────────────
+        # 先剥离预应用的 test_patch：checkout 恢复 test_patch 涉及的文件到 base_commit。
+        # 否则 agent 的 git diff 会包含预应用测试改动 → eval 重复应用冲突 + 误判 test_tampering。
+        _tp_files = _test_patch_files(instance)
+        if _tp_files:
+            sh(["git", "-C", str(repo_dir), "checkout", "--"] + _tp_files)
+            logger.info("[%s] test_patch files reverted before diff: %s",
+                        instance.instance_id, _tp_files)
         r = sh(["git", "-C", str(repo_dir), "diff"], timeout=60)
         git_diff = r.stdout or ""
         (inst_dir / "git.diff").write_text(git_diff, encoding="utf-8")
@@ -290,6 +389,8 @@ def run_instance(instance, repo_dir: Path, args) -> dict:
         result["ftp_after"] = "PASS" if ftp_after else "FAIL"
         result["ptp_after"] = "PASS" if ptp_after else "FAIL"
         result["tests_after"] = out_ftp
+        result["ftp_after_counts"] = parse_pytest_counts(out_ftp)
+        result["ptp_after_counts"] = parse_pytest_counts(out_ptp)
         (inst_dir / "test_after_ftp.log").write_text(out_ftp, encoding="utf-8")
         (inst_dir / "test_after_ptp.log").write_text(out_ptp, encoding="utf-8")
 
@@ -334,6 +435,15 @@ def _classify_error(msg: str) -> str:
     if "api" in low or "key" in low or "backend" in low:
         return "model_api"
     return "unknown"
+
+
+def _test_patch_files(instance) -> list[str]:
+    """从 test_patch 提取修改的文件路径列表。"""
+    files = []
+    for line in instance.test_patch.splitlines():
+        if line.startswith("--- a/"):
+            files.append(line[6:])
+    return files
 
 
 def finalize(result: dict, start: float) -> dict:

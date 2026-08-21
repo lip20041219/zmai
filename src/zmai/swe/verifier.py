@@ -365,6 +365,33 @@ def verify_test_output(test_output: str) -> VerificationCheck:
     )
 
 
+def validate_python_syntax(file_path: str | Path) -> tuple[bool, dict[str, Any]]:
+    """Validate a Python file's syntax using compile().
+
+    Equivalent to ``python -m py_compile <file>`` but in-process (no subprocess).
+    Returns (valid, info). On failure, info contains error_type / line / message
+    so the caller can build a structured EDIT_VALIDATION_FAILED signal.
+
+    Non-Python files and unreadable files are treated as valid (skip).
+    """
+    p = Path(file_path)
+    if p.suffix.lower() != ".py":
+        return True, {}
+    try:
+        src = p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return True, {}
+    try:
+        compile(src, str(p), "exec")
+        return True, {}
+    except SyntaxError as e:  # IndentationError is a subclass
+        return False, {
+            "error_type": type(e).__name__,
+            "line": e.lineno or 0,
+            "message": str(e).splitlines()[0][:300] if str(e) else type(e).__name__,
+        }
+
+
 def verify_git_diff(workspace: Path | None = None) -> VerificationCheck:
     """Git diff verification.
 

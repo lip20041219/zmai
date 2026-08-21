@@ -332,7 +332,7 @@ def run_tests(
     repo_path = Path(repo_path)
 
     result = subprocess.run(
-        ["/d/anaconada/python.exe", "-m", "pytest", *test_files, "-x", "-q", "--no-header", "-p", "no:cacheprovider"],  # noqa: E501
+        ["D:/anaconada/python.exe", "-m", "pytest", *test_files, "-x", "-q", "--no-header", "-p", "no:cacheprovider"],  # noqa: E501
         cwd=str(repo_path),
         capture_output=True, text=True, timeout=timeout,
     )

@@ -261,7 +261,12 @@ class Runtime:
                 try:
                     if ws_path:
                         _log.record_step(phase="finalize", action="agent_finalize",
-                                         success=True, metadata={"status": result_obj.status.value})
+                                         success=True,
+                                         metadata={
+                                             "status": result_obj.status.value,
+                                             "swe_stats": result_obj.metadata.get("swe_stats", {}),
+                                             "token_usage": result_obj.metadata.get("token_usage", {}),
+                                         })
                         _log.persist(str(ws_path / ".state" / "execution_log.json"))
                 except Exception:
                     pass
@@ -274,6 +279,7 @@ class Runtime:
                         "status": "completed", "agent_id": agent_id,
                         "output": output or (result_obj.output if result_obj else ""),
                         "steps": step_count,
+                        "metadata": result_obj.metadata,
                     }
                 elif result_obj.status == AgentState.TIMEOUT:
                     self._lifecycle.timeout(agent_id)
@@ -282,6 +288,7 @@ class Runtime:
                         "status": "timeout", "agent_id": agent_id,
                         "error": f"达到最大执行步数 ({ctx.max_steps})，任务未完成",
                         "steps": step_count,
+                        "metadata": result_obj.metadata,
                     }
                 else:  # FAILED 或其他
                     self._lifecycle.fail(agent_id)
@@ -291,6 +298,7 @@ class Runtime:
                         "status": "failed", "agent_id": agent_id,
                         "error": error_msg,
                         "steps": step_count,
+                        "metadata": result_obj.metadata,
                     }
 
             except asyncio.CancelledError:

@@ -38,6 +38,11 @@ from zmai.tool import ToolContext, ToolResult
 
 logger = logging.getLogger("zmai.swe.agent")
 
+# 语法验证失败后的有限修复重试上限（Phase 3）
+# 超限后升级为强制整文件重写，避免原地补丁死循环消耗 benchmark steps。
+# 可用 config["edit.repair_attempts"] 覆盖。
+MAX_EDIT_REPAIR_ATTEMPTS = 2
+
 
 def _now_ms() -> int:
     """当前时间戳（毫秒）。"""
@@ -62,6 +67,29 @@ def _log_stop() -> None:
     logger.info("[ZMAI] Task completed.")
     logger.info("[ZMAI] Stopping execution loop.")
     logger.info("[ZMAI] No further tool calls allowed.")
+
+
+def _eval_blocking_completion(context: AgentContext) -> bool:
+    """SWE-bench eval 模式下，未做任何代码修改时拦截完成判定。
+
+    SWE-bench 的 FAIL_TO_PASS 测试只存在于 test_patch，base_commit 上并不存在。
+    agent 在 base 仓库跑现有测试必然全绿 → CompletionState 会把 objective_met
+    置 True → 零修改即宣布完成（如 requests-3362 2 步 no_change）。
+
+    本守卫：当 config.eval.require_code_change=true 且 agent 从未成功产生
+    edit/write_file 时，即使测试全绿也返回 True（需注入提示并 return cont，
+    强制 agent 先做出修改）。
+    """
+    cfg = context.config or {}
+    if str(cfg.get("eval.require_code_change", "false")).lower() != "true":
+        return False
+    if context.metadata.get("ever_modified", False):
+        return False
+    completion = context.metadata.get("completion")
+    green_once = context.metadata.get("test_success_count", 0) >= 1
+    if not (completion and (completion.should_complete() or green_once)):
+        return False
+    return True
 
 
 def _build_platform_prompt() -> str:
@@ -366,6 +394,24 @@ class SWEAgent(Agent):
             completion = CompletionState()
             context.metadata["completion"] = completion
         # ── 硬终止（最高优先级，进入本步即先判）：完成状态已满足 → 立即 return，不再调用 backend ──
+        # eval 守卫优先：SWE-bench 模式下未修改代码不得因"现有测试全绿"完成。
+        if _eval_blocking_completion(context):
+            logger.info(
+                "[EvalGuard] Completion blocked: no code modification yet, "
+                "forcing fix before completing (%s, step %d)",
+                context.agent_id, context.step_count,
+            )
+            cm.add_message("user",
+                "[EvalGuard] 当前仓库的现有测试通过，但这不能证明任务已解决——"
+                "SWE-bench 的验证测试（FAIL_TO_PASS）不在当前仓库中，需要通过修改源码实现。\n"
+                "请仔细阅读任务描述定位 bug 根因，然后用 `edit` 或 `write_file` 修改源码。\n"
+                "修改后再运行测试验证。未修改任何源码前不得完成任务。"
+            )
+            context.metadata["messages"] = cm.get_context()
+            return AgentAction.cont(
+                output="EvalGuard: must make a code change before completing"
+            )
+
         _green_once = context.metadata.get("test_success_count", 0) >= 1
         if completion and (completion.should_complete() or _green_once):
             logger.info(
@@ -516,6 +562,20 @@ class SWEAgent(Agent):
                     pass
             return AgentAction.fail(str(last_error or "Backend produced no response"))
 
+        # ── Token 用量累积（G1）──────────────────────────
+        # Backend 已解析 usage（input/output/cache），逐轮累加进 metadata。
+        # finalize() 将其透出到 AgentResult，Runtime.run() 再透出给 Runner，
+        # 供 result.json 统计整体 token 消耗。
+        if response.usage:
+            _tok = context.metadata.setdefault("token_usage", {
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_write_tokens": 0,
+            })
+            _tok["input_tokens"] += response.usage.input_tokens
+            _tok["output_tokens"] += response.usage.output_tokens
+            _tok["cache_read_tokens"] += response.usage.cache_read_tokens
+            _tok["cache_write_tokens"] += response.usage.cache_write_tokens
+
         if response.content:
             cm.add_message("assistant", response.content)
 
@@ -574,6 +634,8 @@ class SWEAgent(Agent):
                     step_tool_ok += 1
                     if tc.name in ("write_file", "edit", "git"):
                         had_modification = True
+                        # 记录真实代码修改：eval 守卫据此放行完成判定
+                        context.metadata["ever_modified"] = True
                         # 修改成功 → 退出修复态（已产生进展），进入"修改"阶段
                         test_failed = False
                         reads_after_fail = 0
@@ -624,6 +686,7 @@ class SWEAgent(Agent):
                                 "partial green, forcing full-suite re-run",
                                 _total_tests, _baseline,
                             )
+                            _stats(context, test_guard_triggered=1)
                             _scope_complete = False
                         if completion:
                             completion.record_test_result(
@@ -702,6 +765,7 @@ class SWEAgent(Agent):
                                         context.config.get("project_path"),
                                     )
                                     if _issue is not None:
+                                        _stats(context, failure_parser_used=1)
                                         _plan = generate_fix_plan(_issue)
                                         context.metadata["last_failure_issue"] = _issue
                                         _plan_msg = "\n" + format_failure(_issue) \
@@ -793,6 +857,37 @@ class SWEAgent(Agent):
                     output=result.output or "",
                     error=result.error,
                 )
+                # ── Edit syntax validation feedback + limited repair ──
+                # 语法验证失败的编辑：结构化错误已随工具结果进入上下文（含
+                # action_required: repair_the_previous_edit），Agent 利用现有 loop
+                # 自行修复。这里只做两件事：
+                #   1) 计数修复尝试（edit_repair_attempts），供审计与上限判定
+                #   2) 预算耗尽（默认 2 次）后升级为强制整文件重写，避免原地补丁死循环
+                if tc.name in ("edit", "write_file") and not result.success \
+                        and result.error and "EDIT_VALIDATION_FAILED" in result.error:
+                    _repair_attempts = context.metadata.get("edit_repair_attempts", 0) + 1
+                    context.metadata["edit_repair_attempts"] = _repair_attempts
+                    _max_repair = int(context.config.get(
+                        "edit.repair_attempts", MAX_EDIT_REPAIR_ATTEMPTS))
+                    _stats(context, edit_validation_failures=1)
+                    _err_type = next(
+                        (ln.split(":", 1)[1].strip() for ln in (result.error or "").splitlines()
+                         if ln.startswith("error_type:")),
+                        "SyntaxError",
+                    )
+                    logger.warning(
+                        "[EDIT_VALIDATION_FAIL] file=%s attempt=%d/%d error=%s",
+                        tc.params.get("path", ""), _repair_attempts, _max_repair, _err_type,
+                    )
+                    if _repair_attempts >= _max_repair:
+                        context.metadata["force_edit"] = True
+                        context.metadata["repair_phase"] = "plan"
+                        cm.add_message("user",
+                            f"[EDIT_REPAIR] 语法修复尝试已达上限（{_repair_attempts}/{_max_repair}）。\n"
+                            "反复对同一文件打小补丁仍产生语法错误。停止原地补丁——\n"
+                            "先用 `read_file` 读完整文件，再用 `write_file` 一次性重写该文件的正确版本。\n"
+                            f"最近一次语法错误 ({_err_type}) 详见上一条工具结果。"
+                        )
             # ── LoopGuard: track no-modification steps ──
             if guard and not had_modification:
                 guard.record_no_modification()
@@ -809,6 +904,25 @@ class SWEAgent(Agent):
             #   1) CompletionState.should_complete()（全绿 + exit0 + 无后续修改）
             #   2) 防御机制：test_success_count >= 1 —— 已有一次全绿即强制停止，
             #      杜绝 success → success → success 无限循环。
+            # eval 守卫优先：SWE-bench 模式下未修改代码不得因"现有测试全绿"完成。
+            if _eval_blocking_completion(context):
+                logger.info(
+                    "[EvalGuard] Post-tool completion blocked: no code modification yet "
+                    "(%s, step %d)",
+                    context.agent_id, context.step_count,
+                )
+                # 已有 force_edit 或 LoopRecovery 时不需要重复注入，否则紧耦合注入
+                if not context.metadata.get("force_edit"):
+                    cm.add_message("user",
+                        "[EvalGuard] 当前仓库的现有测试通过，但这不能证明任务已解决——"
+                        "SWE-bench 的验证测试（FAIL_TO_PASS）不在当前仓库中，需要通过修改源码实现。\n"
+                        "请仔细阅读任务描述定位 bug 根因，然后用 `edit` 或 `write_file` 修改源码。\n"
+                        "修改后再运行测试验证。未修改任何源码前不得完成任务。"
+                    )
+                context.metadata["messages"] = cm.get_context()
+                return AgentAction.cont(
+                    output="EvalGuard: must make a code change before completing"
+                )
             _green_once = context.metadata.get("test_success_count", 0) >= 1
             if completion and (completion.should_complete() or _green_once):
                 context.metadata["tests_passed"] = True
@@ -1203,7 +1317,14 @@ class SWEAgent(Agent):
             output=context.metadata.get("output", ""),
             steps=context.step_count,
             error=error,
-            metadata={"swe_stats": context.metadata.get("swe_stats", {})},
+            metadata={
+                "swe_stats": context.metadata.get("swe_stats", {}),
+                "token_usage": context.metadata.get("token_usage", {}),
+                "ever_modified": context.metadata.get("ever_modified", False),
+                "test_success_count": context.metadata.get("test_success_count", 0),
+                "edit_repair_attempts": context.metadata.get("edit_repair_attempts", 0),
+                "edit_validation_failures": context.metadata.get("swe_stats", {}).get("edit_validation_failures", 0),
+            },
         )
         logger.info(
             "SWEAgent finished: %s (%d steps, status=%s)",

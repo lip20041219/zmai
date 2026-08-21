@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from zmai.tool import Tool, ToolContext, ToolResult
+from zmai.swe.verifier import validate_python_syntax
 
 logger = logging.getLogger("zmai.swe.tools")
 
@@ -43,6 +44,59 @@ def _emit_tool_result(tool_name: str, context: ToolContext,
         log_lines.append(f"  Output:   {result.output[:200]}")
     sys.stderr.write("\n".join(log_lines) + "\n")
     sys.stderr.flush()
+
+
+def _validate_written_py(full: Path) -> tuple[bool, str]:
+    """Validate a .py file's syntax after a write/edit.
+
+    Returns (is_valid, structured_message). When invalid, the message follows
+    the EDIT_VALIDATION_FAILED format so the agent can repair the previous edit.
+    Non-.py files are always valid (skipped).
+    """
+    if full.suffix.lower() != ".py":
+        return True, ""
+    valid, info = validate_python_syntax(full)
+    if valid:
+        return True, ""
+    error_type = info.get("error_type", "SyntaxError")
+    line = info.get("line", 0)
+    message = info.get("message", "")
+    structured = (
+        "EDIT_VALIDATION_FAILED\n"
+        f"file: {full}\n"
+        f"error_type: {error_type}\n"
+        f"line: {line}\n"
+        f"message: {message}\n"
+        "action_required: repair_the_previous_edit"
+    )
+    return False, structured
+
+
+def _write_checked(full: Path, content: str, orig_text: str, label: str) -> tuple[bool, str]:
+    """写入前做 diff 安全检查，写入后做 Python 语法验证。
+
+    返回 (ok, error_message)。ok=False 时 error 为结构化消息，包括：
+      - EDIT_NO_CHANGE: 新内容与原内容相同 → 空 diff，不得计入真实修改
+      - EDIT_TRUNCATION: 原内容非空但新内容为空 → 明显截断/清空文件
+      - EDIT_VALIDATION_FAILED: 写出的 .py 无法通过语法验证
+    """
+    if content == orig_text:
+        return False, (
+            "[EDIT_NO_CHANGE] 修改未产生任何实际变化（新内容与文件当前内容完全相同）。\n"
+            "action_required: 检查 old_text/start_line/end_line 是否指向正确的目标，"
+            "或修改不同的代码行。空 diff 不会被计为代码修改。"
+        )
+    if orig_text and not content:
+        return False, (
+            "[EDIT_TRUNCATION] 编辑结果为空——原文件有内容，修改后却为空。\n"
+            "这很可能是替换范围过大或行号错误导致的误删。\n"
+            f"action_required: 不要清空整个文件，重新用 {label} 修改目标代码片段。"
+        )
+    try:
+        full.write_text(content, encoding="utf-8")
+    except OSError as e:
+        return False, f"[EDIT_WRITE_ERROR] 写入失败: {e}"
+    return _validate_written_py(full)
 
 
 def _resolve_tool_path(context: ToolContext, user_path: str) -> tuple[bool, Path, str]:
@@ -432,11 +486,42 @@ class WriteFileTool(Tool):
             _emit_tool_result(self.name, context, params, result, _st)
             return result
 
+        # 读取当前文件内容（用于 diff 安全检查）
+        orig_text = ""
+        if full.exists():
+            try:
+                orig_text = full.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+        # ── diff 安全检查（写盘前，无需写文件）──
+        # 空 diff / 截断必须先于任何写操作拦截：这两种情况下文件根本不该被写，
+        # 也绝不能计入"真实代码修改"（had_modification / ever_modified）。
+        if orig_text and content == orig_text:
+            result = ToolResult.err(
+                "[EDIT_NO_CHANGE] 写入内容与文件当前内容完全相同——空 diff。\n"
+                "action_required: 不要重复写入相同内容，确认你要写的是新版本代码。"
+            )
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
+        if orig_text and not content:
+            result = ToolResult.err(
+                "[EDIT_TRUNCATION] 写入内容为空，但文件已有内容——疑似误删整个文件。\n"
+                "action_required: 不要清空文件，重新写入包含正确代码的完整版本。"
+            )
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
+
         errors = []
 
         # ── Attempt 1: Path.write_text() ──
         try:
             full.write_text(content, encoding="utf-8")
+            valid, verr = _validate_written_py(full)
+            if not valid:
+                result = ToolResult.err(verr)
+                _emit_tool_result(self.name, context, params, result, _st)
+                return result
             result = ToolResult.ok(output=f"written {path} ({len(content)} chars)")
             _emit_tool_result(self.name, context, params, result, _st)
             return result
@@ -447,6 +532,11 @@ class WriteFileTool(Tool):
         try:
             with open(str(full), "w", encoding="utf-8", errors="strict") as f:
                 f.write(content)
+            valid, verr = _validate_written_py(full)
+            if not valid:
+                result = ToolResult.err(verr)
+                _emit_tool_result(self.name, context, params, result, _st)
+                return result
             result = ToolResult.ok(output=f"written (open) {path} ({len(content)} chars)")
             _emit_tool_result(self.name, context, params, result, _st)
             return result
@@ -549,13 +639,19 @@ class EditTool(Tool):
         try:
             if mode == "append":
                 full.parent.mkdir(parents=True, exist_ok=True)
-                with full.open("a", encoding="utf-8") as f:
-                    f.write(new_text)
+                orig_text = full.read_text(encoding="utf-8") if full.exists() else ""
+                new_content = orig_text + new_text
+                ok, msg = _write_checked(full, new_content, orig_text, "edit")
+                if not ok:
+                    result = ToolResult.err(msg)
+                    _emit_tool_result(self.name, context, params, result, _st)
+                    return result
                 result = ToolResult.ok(output=f"appended {path}")
                 _emit_tool_result(self.name, context, params, result, _st)
                 return result
 
             lines = full.read_text(encoding="utf-8").splitlines(keepends=True)
+            orig_text = "".join(lines)
 
             if mode == "replace_lines":
                 start = params.get("start_line", 1)
@@ -570,7 +666,11 @@ class EditTool(Tool):
                     return result
                 new_items = _normalize_new_lines(new_text)
                 lines[start-1:end] = new_items
-                full.write_text("".join(lines), encoding="utf-8")
+                ok, msg = _write_checked(full, "".join(lines), orig_text, "edit")
+                if not ok:
+                    result = ToolResult.err(msg)
+                    _emit_tool_result(self.name, context, params, result, _st)
+                    return result
                 result = ToolResult.ok(output=f"replaced {path}:{start}-{end}")
                 _emit_tool_result(self.name, context, params, result, _st)
                 return result
@@ -589,7 +689,11 @@ class EditTool(Tool):
                     result = ToolResult.err(f"regex error: {e}")
                     _emit_tool_result(self.name, context, params, result, _st)
                     return result
-                full.write_text(new_content, encoding="utf-8")
+                ok, msg = _write_checked(full, new_content, orig_text, "edit")
+                if not ok:
+                    result = ToolResult.err(msg)
+                    _emit_tool_result(self.name, context, params, result, _st)
+                    return result
                 result = ToolResult.ok(output=f"replaced {n} matches in {path}")
                 _emit_tool_result(self.name, context, params, result, _st)
                 return result
@@ -599,6 +703,11 @@ class EditTool(Tool):
                 ins = _normalize_new_lines(new_text)
                 lines[ln-1:ln-1] = ins
                 full.write_text("".join(lines), encoding="utf-8")
+                ok, msg = _write_checked(full, "".join(lines), orig_text, "edit")
+                if not ok:
+                    result = ToolResult.err(msg)
+                    _emit_tool_result(self.name, context, params, result, _st)
+                    return result
                 result = ToolResult.ok(output=f"inserted at {path}:{ln}")
                 _emit_tool_result(self.name, context, params, result, _st)
                 return result

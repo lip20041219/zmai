@@ -142,7 +142,7 @@ class TestEditTool:
         assert "line4" in content
 
     def test_regex_replace(self, ctx, ws: Path):
-        (ws / "f.py").write_text("foo bar\nfoo baz\n")
+        (ws / "f.py").write_text("foo = 1\nfoo = 2\n")
         t = EditTool()
         r = t.execute(ctx, {"path": "f.py", "mode": "regex_replace",
                             "old_text": "foo", "new_text": "qux", "count": 1})
