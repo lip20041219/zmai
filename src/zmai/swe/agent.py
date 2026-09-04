@@ -883,9 +883,11 @@ class SWEAgent(Agent):
                         context.metadata["force_edit"] = True
                         context.metadata["repair_phase"] = "plan"
                         cm.add_message("user",
-                            f"[EDIT_REPAIR] 语法修复尝试已达上限（{_repair_attempts}/{_max_repair}）。\n"
+                            f"[EDIT_REPAIR] 语法修复尝试已达上限"
+                            f"（{_repair_attempts}/{_max_repair}）。\n"
                             "反复对同一文件打小补丁仍产生语法错误。停止原地补丁——\n"
-                            "先用 `read_file` 读完整文件，再用 `write_file` 一次性重写该文件的正确版本。\n"
+                            "先用 `read_file` 读完整文件，再用 `write_file` "
+                            "一次性重写该文件的正确版本。\n"
                             f"最近一次语法错误 ({_err_type}) 详见上一条工具结果。"
                         )
             # ── LoopGuard: track no-modification steps ──
@@ -915,8 +917,10 @@ class SWEAgent(Agent):
                 if not context.metadata.get("force_edit"):
                     cm.add_message("user",
                         "[EvalGuard] 当前仓库的现有测试通过，但这不能证明任务已解决——"
-                        "SWE-bench 的验证测试（FAIL_TO_PASS）不在当前仓库中，需要通过修改源码实现。\n"
-                        "请仔细阅读任务描述定位 bug 根因，然后用 `edit` 或 `write_file` 修改源码。\n"
+                        "SWE-bench 的验证测试（FAIL_TO_PASS）不在当前仓库中，"
+                        "需要通过修改源码实现。\n"
+                        "请仔细阅读任务描述定位 bug 根因，然后用 `edit` 或 "
+                        "`write_file` 修改源码。\n"
                         "修改后再运行测试验证。未修改任何源码前不得完成任务。"
                     )
                 context.metadata["messages"] = cm.get_context()
@@ -1323,7 +1327,9 @@ class SWEAgent(Agent):
                 "ever_modified": context.metadata.get("ever_modified", False),
                 "test_success_count": context.metadata.get("test_success_count", 0),
                 "edit_repair_attempts": context.metadata.get("edit_repair_attempts", 0),
-                "edit_validation_failures": context.metadata.get("swe_stats", {}).get("edit_validation_failures", 0),
+                "edit_validation_failures": context.metadata.get(
+                    "swe_stats", {}
+                ).get("edit_validation_failures", 0),
             },
         )
         logger.info(

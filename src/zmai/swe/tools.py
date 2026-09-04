@@ -12,8 +12,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from zmai.tool import Tool, ToolContext, ToolResult
 from zmai.swe.verifier import validate_python_syntax
+from zmai.tool import Tool, ToolContext, ToolResult
 
 logger = logging.getLogger("zmai.swe.tools")
 

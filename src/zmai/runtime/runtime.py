@@ -265,7 +265,9 @@ class Runtime:
                                          metadata={
                                              "status": result_obj.status.value,
                                              "swe_stats": result_obj.metadata.get("swe_stats", {}),
-                                             "token_usage": result_obj.metadata.get("token_usage", {}),
+                                             "token_usage": result_obj.metadata.get(
+                                                "token_usage", {}
+                                            ),
                                          })
                         _log.persist(str(ws_path / ".state" / "execution_log.json"))
                 except Exception:
