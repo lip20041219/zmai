@@ -375,6 +375,7 @@ class IssueAgent:
                 ["git", "diff"],
                 cwd=project_path,
                 capture_output=True, text=True, timeout=30,
+                encoding="utf-8", errors="replace",
             )
             diff = result.stdout or ""
             if not diff:
@@ -383,6 +384,7 @@ class IssueAgent:
                     ["git", "diff", "--cached"],
                     cwd=project_path,
                     capture_output=True, text=True, timeout=30,
+                    encoding="utf-8", errors="replace",
                 )
                 diff = result.stdout or ""
             return diff[:10000]

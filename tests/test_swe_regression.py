@@ -437,11 +437,12 @@ class TestEditToolEdgeCases:
         assert not r.success, "负数 start_line 应失败"
 
     def test_append_empty_content(self, ctx: ToolContext, ws: Path):
-        """追加空内容到已存在的文件。"""
+        """追加空内容到已存在的文件：空 diff → 空追加无实际变化，应失败。"""
         (ws / "f.txt").write_text("hello")
         t = EditTool()
         r = t.execute(ctx, {"path": "f.txt", "mode": "append", "new_text": ""})
-        assert r.success
+        assert not r.success, "空 diff 追加不应成功"
+        assert "EDIT_NO_CHANGE" in r.error or "未产生任何实际变化" in r.error
         # 空追加不应改变文件
         assert (ws / "f.txt").read_text() == "hello", (
             "空追加不应修改文件内容"
