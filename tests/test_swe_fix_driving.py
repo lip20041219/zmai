@@ -68,11 +68,31 @@ def test_home_returns_200(client):
 '''
 
 
+HELPERS = '''\
+"""与 bug 无关的旁支模块：让"读取 N 个不同文件"能真实发生。"""
+
+DEFAULT_TIMEOUT = 30
+'''
+
+
 def _write_flask_project(project_dir: Path) -> None:
     """写入一个缺失 @app.route 的 Flask 项目（测试先失败）。"""
     project_dir.mkdir(parents=True, exist_ok=True)
     (project_dir / "app.py").write_text(APP_BUGGY, encoding="utf-8")
     (project_dir / "test_app.py").write_text(TEST_APP, encoding="utf-8")
+    # 第三个文件：同一文件重复读取会被 ReadCache 判定为无新信息、不再计入
+    # reads_after_fail，因此"攒满读取阈值"必须靠读取不同文件。
+    (project_dir / "helpers.py").write_text(HELPERS, encoding="utf-8")
+
+
+def _read_file(path: str, tid: str = "r") -> ToolCall:
+    return ToolCall(id=tid, name="read_file", params={"path": path})
+
+
+def _diagnostic_reads() -> list[ToolCall]:
+    """3 次读取不同文件的诊断读取 → 攒满 fix.read_limit（默认 3）。"""
+    return [_read_file("app.py", "r1"), _read_file("test_app.py", "r2"),
+            _read_file("helpers.py", "r3")]
 
 
 class _ScriptedBackend(Backend):
@@ -197,14 +217,15 @@ class TestFixDrivingEnforcement:
         project = tmp_path / "flask_app2"
         _write_flask_project(project)
 
-        # 脚本: pytest(失败) → 反复 read_file 不修改
+        # 脚本: pytest(失败) → 反复 read_file 不修改（读取不同文件，才有诊断信息量）
         script: list[list[ToolCall] | None] = [
             [ToolCall(id="1", name="shell_exec",
                       params={"command": "python -m pytest -q"})],
         ]
-        for i in range(6):  # 连续 6 个 step 只读
+        for i in range(6):  # 连续 6 个 step 只读，不修改
+            name = ["app.py", "test_app.py", "helpers.py"][i % 3]
             script.append([ToolCall(id=f"r{i}", name="read_file",
-                                    params={"path": "app.py"})])
+                                    params={"path": name})])
         script.append(None)
         backend = _ScriptedBackend(script)
         ctx, action = asyncio.run(_run_agent(project, backend))
@@ -400,6 +421,48 @@ class TestFixStateDirective:
         assert "(dynamic, act on this now)" not in backend.system_prompts[0], \
             "未进入修复态前不应注入动态修复指令"
 
+    def test_force_edit_phase_declares_reads_disabled(self, tmp_path: Path):
+        """force_edit 置位后，模型必须被告知"读取已被禁用"。
+
+        真实故障（e2e_run_after_fix2，agent_7068）：FixDriving 拦截 read 并把它
+        的计数清零（这是刻意的，防止拦截反过来喂数），但动态状态块仍然照读
+        reads_after_fail，于是每步都告诉模型 "you have used 0/3 reads since the
+        failure"。模型据此认为诊断预算还满着 → 反复 read/shell 被拒 → 8 步零修改
+        → Force-edit 预算耗尽。拦截是硬性的，但模型看到的状态不是。
+        """
+        project = tmp_path / "flask_app12"
+        _write_flask_project(project)
+
+        script: list[list[ToolCall] | None] = [
+            [ToolCall(id="1", name="shell_exec",
+                      params={"command": "python -m pytest -q"})],
+            _diagnostic_reads(),            # 攒满阈值 → 本步结束时 force_edit=True
+            [_read_file("app.py")],         # force_edit 生效 → 被拒绝
+            None,
+        ]
+        backend = _CaptureBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend, max_steps=4))
+
+        assert ctx.metadata["force_edit"] is True, "本用例必须真的进入强制修改期"
+
+        # 1) 拒绝结果必须让模型知道这是结构性禁用，而不是一次可重试的失败
+        rejected = _messages_text(ctx)
+        assert "[FixDriving]" in rejected
+        assert "DISABLED" in rejected, "被拒的调用必须显式说明读取已被禁用"
+        assert "重复调用不会成功" in rejected, \
+            "必须说明重复调用不会成功（否则模型只会换个参数重试）"
+
+        # 2) force_edit 生效后的每个 system prompt 都必须声明禁用，
+        #    且不得再宣称还剩读取预算（幽灵预算正是空转的燃料）
+        armed = backend.system_prompts[2:]
+        assert armed, "force_edit 生效后应至少还有一次 backend 调用"
+        for prompt in armed:
+            assert "(dynamic, act on this now)" in prompt, "强制期仍应有动态状态块"
+            assert "DISABLED" in prompt, \
+                f"强制期的 system prompt 必须声明读取已禁用:\n{prompt[-600:]}"
+            assert "reads since the failure" not in prompt, \
+                "读取已被结构性拒绝，不得再向模型宣称还有读取预算"
+
 
 # ═══════════════════════════════════════════════════════════════════
 # 测试 5: 修改后不重测 → 不得错误判定 completed（release-readiness 审计项）
@@ -432,8 +495,11 @@ class TestNoFalseCompletionAfterEdit:
         # 关键断言：绝不 claim 完成（测试从未全绿）
         assert action.type != "complete", \
             f"测试从未全绿却误判 completed: {action.output}"
-        # 应进入 continue（强制重测）
-        assert action.type == "continue"
+        # 且必须注入"强制重测"指令（而不是放行完成）
+        assert "全绿运行" in _messages_text(ctx), \
+            "应注入 [Workflow] 强制重测提示"
+        # 反复拦截而模型始终不推进 → 有界失败（不空转到 max_steps 伪装成 timeout）
+        assert action.type == "fail", f"应明确失败: {action.type}"
 
     def test_edit_then_green_retest_completes(self, tmp_path: Path):
         """对比：edit 后【重测全绿】→ 正常 complete（正向闭环不被破坏）。"""
@@ -463,16 +529,19 @@ class TestNoFalseCompletionAfterEdit:
 # 测试 6: FixDriving 粘性 —— 失败 pytest 重跑不能逃逸强制修改
 # ═══════════════════════════════════════════════════════════════════
 #
-# 真实故障：force_edit 只拦 read_file/grep 时，执着的 LLM 可反复用
-# shell_exec 重跑失败的 pytest 来"逃逸"（失败重跑会清零 reads_after_fail），
-# 导致 agent 无限 read/重跑、永远不到 edit，直到 LoopGuard → 超时。
-# 本测试证明：force_edit 激活后，shell_exec pytest 重跑同样被拦截，
-# agent 被确定性地逼入 edit/write_file，最终修复并全绿完成。
+# 真实故障：执着的 LLM 可反复用 shell_exec 重跑失败的 pytest 来"逃逸"
+# （失败重跑会清零 reads_after_fail），导致 agent 无限 read/重跑、
+# 永远不到 edit，直到 LoopGuard → 超时。
+#
+# 逃逸的封堵方式随 RC-3 调整：force_edit 不再拦截 pytest 重跑（完成守卫要求
+# "修改后重跑验证"，两条指令必须能同时满足），改为**状态层面**封堵 ——
+# 重跑既不解除 force_edit，也不重置读取计数，因此不会重新触发 FixDriving，
+# agent 仍被确定性地逼入 edit/write_file，最终修复并全绿完成。
 
 
 class TestFixDrivingStickyEscape:
-    def test_failing_pytest_rerun_blocked_after_force_edit(self, tmp_path: Path):
-        """force_edit 后重跑失败 pytest 被拦截 → agent 只能 edit → 全绿完成。"""
+    def test_failing_pytest_rerun_cannot_escape_force_edit(self, tmp_path: Path):
+        """force_edit 下重跑失败 pytest 允许执行但无法逃逸 → 仍被逼入 edit。"""
         project = tmp_path / "flask_app11"
         _write_flask_project(project)
 
@@ -482,9 +551,7 @@ class TestFixDrivingStickyEscape:
         script: list[list[ToolCall] | None] = [
             [ToolCall(id="1", name="shell_exec",
                       params={"command": "python -m pytest -q"})],
-            [ToolCall(id="2", name="read_file", params={"path": "app.py"}),
-             ToolCall(id="3", name="read_file", params={"path": "app.py"}),
-             ToolCall(id="4", name="read_file", params={"path": "app.py"})],
+            _diagnostic_reads(),
             [ToolCall(id="5", name="shell_exec",
                       params={"command": "python -m pytest -q"})],
             [ToolCall(id="6", name="edit",
@@ -498,11 +565,14 @@ class TestFixDrivingStickyEscape:
         backend = _ScriptedBackend(script)
         ctx, action = asyncio.run(_run_agent(project, backend))
 
-        # 1) 关键回归断言：force_edit 激活后，重跑失败 pytest 被拦截（逃逸闭合）。
-        #    agent 收到的工具结果里必须出现针对 shell 的强制修改提示。
-        joined = _messages_text(ctx)
-        assert "禁止再次 read_file/grep/shell_exec/git" in joined, \
-            "force_edit 激活后重跑失败 pytest 必须被拦截，否则可无限逃逸"
+        # 1) 逃逸闭合（RC-3 语义）：force_edit 下失败 pytest 重跑**允许执行**
+        #    （完成守卫要求"修改后重跑验证"，两条指令必须能同时满足），
+        #    但它不能成为逃逸口 —— 重跑既不解除 force_edit，也不重置读取计数，
+        #    因此 FixDriving 不会被反复喂数，agent 仍被确定性地逼入 edit。
+        assert ctx.metadata["swe_stats"]["pytest_calls"] == 3, \
+            "force_edit 激活后重跑 pytest 必须真正执行（用于验证）"
+        assert ctx.metadata["swe_stats"]["fixdriving_activations"] == 1, \
+            "重跑失败 pytest 不得重新触发 FixDriving（否则可无限逃逸）"
 
         # 2) agent 被逼入 edit：app.py 被真实修改，加上了路由
         app_text = (project / "app.py").read_text(encoding="utf-8")

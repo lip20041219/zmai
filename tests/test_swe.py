@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,7 @@ from zmai.swe.tools import (
     ShowToUserTool,
     WriteFileTool,
 )
+from zmai.swe.verifier import verify_test_output
 from zmai.tool import ToolContext
 
 
@@ -109,11 +112,106 @@ class TestShellTool:
         r = t.execute(ctx, {"command": "echo hello"})
         assert r.success
         assert "hello" in r.output
+        # Case 1: 正常成功命令 → SUCCESS
+        assert r.metadata.get("exit_code") == 0
 
     def test_shell_fail(self, ctx):
         t = ShellTool()
         r = t.execute(ctx, {"command": "exit 1"})
         assert not r.success
+        # Case 2: 正常失败命令 → FAIL
+        assert r.metadata.get("exit_code") == 1
+
+    def test_nonzero_exit_beats_success_word_in_output(self, ctx):
+        """Case 3: stdout 含 SUCCESS 但退出码 1 → 仍然 FAIL。"""
+        cmd = "echo SUCCESS & exit 1" if os.name == "nt" else "echo SUCCESS; exit 1"
+        r = ShellTool().execute(ctx, {"command": cmd})
+        assert not r.success
+        assert r.metadata.get("exit_code") == 1
+
+
+class TestShellToolTestVerdict:
+    """shell_exec 的测试结论可靠性（Verification / Test Result）。
+
+    核心不变量：真实 pytest 失败 → ToolResult.success 必须为 False，且与
+    Agent 内部 verify_test_output() 的判定一致。
+    """
+
+    @staticmethod
+    def _write_failing_suite(ws: Path) -> None:
+        """2 passed / 2 failed 的最小测试套件（对应 Case 4 的场景）。"""
+        (ws / "test_verdict_suite.py").write_text(
+            "def test_a():\n"
+            "    assert True\n\n\n"
+            "def test_b():\n"
+            "    assert True\n\n\n"
+            "def test_c():\n"
+            "    assert False\n\n\n"
+            "def test_d():\n"
+            "    assert False\n",
+            encoding="utf-8",
+        )
+
+    def test_pytest_failure_reports_failure(self, ctx, ws: Path):
+        """Case 4: 真实 pytest 2 failed / 2 passed → FAIL。"""
+        self._write_failing_suite(ws)
+        cmd = f'"{sys.executable}" -m pytest -q test_verdict_suite.py'
+        r = ShellTool().execute(ctx, {"command": cmd})
+        assert not r.success
+        assert r.metadata.get("exit_code") != 0
+
+    def test_pytest_failure_behind_pager_pipeline_reports_failure(self, ctx, ws: Path):
+        """Case 4b: `... 2>&1 | more` 的管道退出码掩盖 → 仍必须是 FAIL。
+
+        这是本次修复的根因场景：cmd.exe 返回 `more` 的 0，pytest 的失败被吞掉。
+        """
+        self._write_failing_suite(ws)
+        cmd = f'"{sys.executable}" -m pytest -q test_verdict_suite.py 2>&1 | more'
+        r = ShellTool().execute(ctx, {"command": cmd})
+        assert not r.success
+
+    def test_masked_exit_code_is_corrected_from_parsed_output(self, ctx):
+        """Case 4c: 退出码被掩盖为 0，但汇总行报告失败 → 改判为 FAIL。
+
+        不依赖具体的 pytest 进程，直接构造"退出码 0 + pytest 失败汇总行"。
+        """
+        r = ShellTool().execute(
+            ctx, {"command": "echo pytest 2 failed, 2 passed in 0.16s"}
+        )
+        assert not r.success
+        assert r.metadata.get("exit_code") == 1
+
+    def test_green_pytest_run_still_reports_success(self, ctx, ws: Path):
+        """反向保证：全绿的 pytest 不能被误判为失败。"""
+        (ws / "test_verdict_green.py").write_text(
+            "def test_ok():\n    assert True\n", encoding="utf-8"
+        )
+        cmd = f'"{sys.executable}" -m pytest -q test_verdict_green.py'
+        r = ShellTool().execute(ctx, {"command": cmd})
+        assert r.success
+        assert r.metadata.get("exit_code") == 0
+
+    def test_success_matches_verify_test_output_verdict(self, ctx, ws: Path):
+        """Case 5: ToolResult.success 必须与 verify_test_output() 判定一致。"""
+        self._write_failing_suite(ws)
+        r = ShellTool().execute(
+            ctx,
+            {"command": f'"{sys.executable}" -m pytest -q test_verdict_suite.py'},
+        )
+        verdict = verify_test_output(r.output + (r.error or ""))
+        assert verdict.passed is False
+        assert r.success is False
+
+    def test_failure_summary_survives_context_truncation(self, ctx, ws: Path):
+        """失败摘要不会被下游头部截断（context.tool_truncate 默认 500）切掉。"""
+        self._write_failing_suite(ws)
+        r = ShellTool().execute(
+            ctx,
+            {"command": f'"{sys.executable}" -m pytest -q test_verdict_suite.py'},
+        )
+        model_view = (r.output or "") + (r.error or "")
+        assert "[test summary]" in model_view[:500]
+        assert "2 failed" in model_view[:500]
 
 
 class TestGitTool:

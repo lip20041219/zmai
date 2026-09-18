@@ -12,7 +12,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from zmai.swe.verifier import validate_python_syntax
+from zmai.swe.verifier import (
+    parse_test_totals,
+    validate_python_syntax,
+    verify_test_output,
+)
 from zmai.tool import Tool, ToolContext, ToolResult
 
 logger = logging.getLogger("zmai.swe.tools")
@@ -849,6 +853,56 @@ def _cap_shell_output(output: str, command: str, limit: int = 10000,
     return output[:limit]
 
 
+# 纯分页/透传型管道段（`| more` / `| less` / `| cat`）：无副作用，且会把上游命令
+# 的退出码替换成自己的 0（cmd.exe 与 POSIX sh 都只取管道最后一段的退出码）。
+# 输出本来就是被管道捕获的，去掉后内容不变，退出码恢复为真实命令的。
+_PAGER_STAGE_RE = re.compile(r"(?:\s*\|\s*(?:more(?:\.com)?|less|cat)\s*)+$", re.IGNORECASE)
+
+# 测试命令识别 —— 与 agent.py 的测试运行检测保持完全相同的语义
+# （agent.py 用 "pytest" in cmd.lower() 判断），避免两处判定不一致。
+_TEST_CMD_RE = re.compile(r"pytest|unittest|nosetests", re.IGNORECASE)
+
+
+def _strip_trailing_pager(cmd: str) -> str:
+    """去掉命令末尾的纯分页/透传管道段，避免退出码被末段命令掩盖。"""
+    return _PAGER_STAGE_RE.sub("", cmd).rstrip()
+
+
+def _resolve_test_exit_code(exit_code: int, output: str) -> int:
+    """测试命令退出码校正 —— 退出码被管道掩盖时以输出解析为准。
+
+    `python -m pytest -q 2>&1 | more` 在 cmd.exe 下返回 `more` 的 0，真实 pytest
+    的 1 被掩盖，Runtime 会把失败报成 SUCCESS。这里复用 parse_test_totals() 对
+    pytest 汇总行的解析做**单向**纠正：
+
+    * 退出码非 0 → 保持失败（可能是 collection error 等没有汇总行的失败）。
+    * 退出码为 0 且汇总行明确 failed/errors > 0 → 改判为 1。
+    * 解析不出计数（如 --collect-only、空输出）→ 不改判，绝不把成功误判成失败。
+    """
+    if exit_code != 0:
+        return exit_code
+    totals = parse_test_totals(output)
+    if totals["failed"] > 0 or totals["errors"] > 0:
+        return 1
+    return exit_code
+
+
+def _test_summary_prefix(output: str) -> str:
+    """测试汇总摘要行 —— 前置到输出最前，防止被下游截断切掉。
+
+    pytest 的汇总行（"2 failed, 2 passed in 0.16s"）在输出末尾，而工具结果注入
+    模型上下文时按头部截断（context.tool_truncate，默认 500 字符），汇总行会消失，
+    模型因此看不到通过/失败计数。复用 parse_test_totals() 解析后前置一行。
+    """
+    totals = parse_test_totals(output)
+    if not (totals["passed"] or totals["failed"] or totals["errors"]):
+        return ""
+    return (
+        f"[test summary] {totals['passed']} passed, {totals['failed']} failed, "
+        f"{totals['errors']} errors\n"
+    )
+
+
 class ShellTool(Tool):
     name = "shell_exec"
     description = (
@@ -872,6 +926,9 @@ class ShellTool(Tool):
             _emit_tool_result(self.name, context, params, result, _st)
             return result
         cmd = _translate_cmd(cmd)
+        # 去掉末尾纯分页段：`pytest ... | more` 的退出码会变成 `more` 的 0，
+        # 使失败被报成 SUCCESS。去掉后内容不变、退出码恢复为真实命令的。
+        cmd = _strip_trailing_pager(cmd)
         # 测试文件只读保护：拦截 shell 对测试文件的删除/移动/重命名（绕过写工具）
         if _shell_attempts_test_mutation(cmd):
             result = ToolResult.err(
@@ -897,13 +954,32 @@ class ShellTool(Tool):
             output = r.stdout or ""
             if r.stderr:
                 output += f"\n[stderr]\n{r.stderr}"
-            if r.returncode != 0:
+            exit_code = r.returncode
+            summary = ""
+            verdict_note = ""
+            # ── 测试命令：退出码可能被管道/链接命令掩盖，以输出解析校正 ──
+            # 复用 verifier 的解析，保证 ToolResult.success 与 Agent 内部
+            # verify_test_output() 的判定一致——不能出现"内部 passed=False，
+            # 但模型收到 OK"。仅纠"假成功"，不会把成功误判成失败。
+            if _TEST_CMD_RE.search(cmd):
+                corrected = _resolve_test_exit_code(exit_code, output)
+                if corrected != exit_code:
+                    verdict_note = (
+                        f"[test verdict] 解析出的测试结果是 FAIL，但 shell 退出码为 "
+                        f"{exit_code}（被管道掩盖），已改判为 FAIL。"
+                        f"{verify_test_output(output).error or ''}\n"
+                    )
+                    exit_code = corrected
+                summary = _test_summary_prefix(output)
+            if exit_code != 0:
                 result = ToolResult.err(
-                    error=f"exit {r.returncode}: {_cap_shell_output(output, cmd, 5000)}",
-                    metadata={"exit_code": r.returncode})
+                    error=f"{summary}{verdict_note}exit {exit_code}: "
+                          f"{_cap_shell_output(output, cmd, 5000)}",
+                    metadata={"exit_code": exit_code})
             else:
-                result = ToolResult.ok(output=_cap_shell_output(output, cmd, 10000),
-                                       metadata={"exit_code": r.returncode})
+                result = ToolResult.ok(
+                    output=summary + _cap_shell_output(output, cmd, 10000),
+                    metadata={"exit_code": exit_code})
         except subprocess.TimeoutExpired:
             result = ToolResult.err(f"timeout ({timeout}s)")
         except Exception as e:

@@ -290,6 +290,52 @@ def parse_test_totals(test_output: str) -> dict[str, int]:
     }
 
 
+def classify_test_progress(
+    previous: dict[str, int] | None,
+    current: dict[str, int],
+) -> str:
+    """对比两轮测试的结构化计数，判定测试状态走向（Progress / Regression）。
+
+    返回值：
+        "first"       — 没有上一轮结果（首次运行），不判定
+        "progress"    — 通过数增加，或失败/错误清零
+        "no_progress" — 通过数与失败/错误数都没变（不得据此判定代码错误）
+        "regression"  — 通过数减少 **且** 失败/错误数增加；
+                        或上一轮有真实计数、本轮却一个测试都没跑起来（collection /
+                        import error，见下）
+
+    只比较 ``passed`` 与 ``failed + errors`` 两项结构性计数；skipped /
+    deselected 的变化不参与判定（跳过数变化本身不是退步）。
+
+    collection / import error 单独判定，不并入 failed 数字参与比较：它会让
+    passed/failed 同时归零，若照数字比较会被读成"failed 从 3 降到 0 → progress"。
+    因此当**上一轮有真实测试计数**而本轮 ``passed == failed == collected == 0
+    且 errors > 0`` 时，直接判 regression —— 语义是"测试整个消失（模块已无法
+    import）"，属最严重的退化。首次运行就是 collection error 仍返回 "first"
+    （无基线，无从比较）。
+    """
+    if not previous:
+        return "first"
+    cur_pass = current["passed"]
+    cur_fail = current["failed"] + current["errors"]
+    prev_pass = previous["passed"]
+    prev_fail = previous["failed"] + previous["errors"]
+    # ── 灾难性退化：上一轮有真实测试计数，本轮一个测试都没跑起来 ──
+    # collection/import error 会让 passed/failed 同时归零。若照数字比较，就会得出
+    # "failed 从 3 降到 0 → progress" 的荒谬结论——那不是"失败变少"，而是
+    # "测试整个消失"（模块已无法 import），必须判为 regression。
+    if (prev_pass + previous["failed"] > 0
+            and cur_pass == 0 and current["failed"] == 0
+            and current.get("collected", 0) == 0
+            and current["errors"] > 0):
+        return "regression"
+    if cur_pass < prev_pass and cur_fail > prev_fail:
+        return "regression"
+    if cur_pass > prev_pass or cur_fail < prev_fail:
+        return "progress"
+    return "no_progress"
+
+
 def verify_test_output(test_output: str) -> VerificationCheck:
     """Test output verification.
 
