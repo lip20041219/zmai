@@ -68,6 +68,170 @@ class TestFailureParser:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# P0-1 — Root-Cause Localization：traceback frame → file:line:function → 源码上下文
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestRootCauseLocalization:
+    def test_parses_standard_cpython_frame(self):
+        """Test 1：File "src/app.py", line 42, in parse_config。"""
+        issue = parse_test_failure(
+            'File "src/app.py", line 42, in parse_config\n'
+            "    return json.loads(raw)\n"
+            "TypeError: expected str\n"
+        )
+        assert issue is not None
+        assert issue.file == "src/app.py"
+        assert issue.line == 42
+        assert issue.function == "parse_config"
+
+    def test_prefers_source_frame_over_test_frame(self):
+        """Test 2：测试帧 + 源码帧 → 定位源码帧，而不是测试帧。"""
+        tb = (
+            "_____________ test_parse _____________\n"
+            "tests/test_app.py:10: in test_parse\n"
+            "    parse_config()\n"
+            "src/app.py:42: in parse_config\n"
+            "    return json.loads(raw)\n"
+            "TypeError: expected str\n"
+        )
+        issue = parse_test_failure(tb)
+        assert issue is not None
+        assert (issue.file, issue.line) == ("src/app.py", 42), \
+            f"应定位到被测源码帧: {issue.file}:{issue.line}"
+        assert issue.function == "parse_config"
+        assert "test_app.py" not in issue.file
+
+    def test_prefers_deepest_frame_in_pytest_long_traceback(self):
+        """真实 pytest 长 traceback：测试帧 → 调用帧 → raise 点，应取 raise 点。"""
+        tb = (
+            "test_ledger.py:5: \n"
+            "    l = Ledger()\n"
+            "ledger.py:28: in __init__\n"
+            '    initial_balance = self._validate_amount(initial_balance, "x")\n'
+            "ledger.py:46: ValueError\n"
+        )
+        issue = parse_test_failure(tb)
+        assert issue is not None
+        assert (issue.file, issue.line) == ("ledger.py", 46), \
+            f"应定位到最深的 raise 帧: {issue.file}:{issue.line}"
+
+    def test_skips_pytest_and_stdlib_internal_frames(self):
+        """pytest / site-packages 内部帧不得被当作根因位置。"""
+        tb = (
+            "tests/test_app.py:10: in test_x\n"
+            "    f()\n"
+            'File "/usr/lib/python3.11/site-packages/_pytest/python.py", '
+            "line 1943, in runtest\n"
+            "    self.ihook.pytest_runtest_protocol(item=item)\n"
+            'File "/usr/lib/python3.11/importlib/__init__.py", line 126, in import_module\n'
+            "    return _bootstrap._gcd_import(name[level:])\n"
+            'File "src/app.py", line 42, in parse_config\n'
+            "TypeError: expected str\n"
+        )
+        issue = parse_test_failure(tb)
+        assert issue is not None
+        assert (issue.file, issue.line) == ("src/app.py", 42), \
+            f"应跳过内部帧: {issue.file}:{issue.line}"
+
+    def test_skips_relative_pytest_frame(self):
+        """相对路径的 _pytest 帧同样要跳过（不能被当成项目源码）。"""
+        tb = (
+            "tests/test_app.py:10: in test_x\n"
+            "    f()\n"
+            "_pytest/python.py:1943: in runtest\n"
+            "    self.ihook.pytest_runtest_protocol(item=item)\n"
+            "src/app.py:42: in parse_config\n"
+            "TypeError: expected str\n"
+        )
+        issue = parse_test_failure(tb)
+        assert issue is not None
+        assert (issue.file, issue.line) == ("src/app.py", 42), \
+            f"应跳过相对路径的内部帧: {issue.file}:{issue.line}"
+
+    def test_underscore_project_dir_is_not_internal(self):
+        """项目内的 `_vendor/` 这类下划线目录不是内部帧，必须照常定位。"""
+        issue = parse_test_failure(
+            'File "_vendor/parser.py", line 8, in load\nValueError: bad\n')
+        assert issue is not None
+        assert (issue.file, issue.line) == ("_vendor/parser.py", 8), \
+            f"下划线目录不得被误判为内部帧: {issue.file}:{issue.line}"
+
+    def test_windows_path_with_drive_letter(self):
+        """Test 4：C:\\... 盘符下的路径不能因 ':' 或反斜杠解析错位。"""
+        tb = (
+            'File "C:\\project\\src\\app.py", line 42, in parse_config\n'
+            "    return json.loads(raw)\n"
+            "TypeError: expected str\n"
+        )
+        issue = parse_test_failure(tb)
+        assert issue is not None
+        assert issue.file == "C:\\project\\src\\app.py"
+        assert issue.line == 42
+        assert issue.function == "parse_config"
+
+    def test_windows_pytest_raise_frame(self):
+        """Windows 路径 + pytest raise 形态（file:line: Exception）也要能定位。"""
+        issue = parse_test_failure("C:\\project\\ledger.py:46: ValueError\n")
+        assert issue is not None
+        assert issue.file == "C:\\project\\ledger.py"
+        assert issue.line == 46
+
+    def test_source_snippet_contains_target_line_and_context(self, tmp_path: Path):
+        """Test 3：源码片段包含目标行与上下文，且行号正确。"""
+        src = tmp_path / "src"
+        src.mkdir()
+        body = "".join(f"line_{i} = {i}\n" for i in range(1, 41))
+        (src / "app.py").write_text(body, encoding="utf-8")
+
+        issue = parse_test_failure(
+            'File "src/app.py", line 20, in parse_config\n',
+            project_root=tmp_path,
+        )
+        assert issue is not None
+        assert issue.source_snippet, "应生成源码上下文"
+        assert ">>   20 | line_20 = 20" in issue.source_snippet, \
+            f"目标行应被标记: {issue.source_snippet}"
+        # 上下文 = ±15 行
+        assert "    5 | line_5 = 5" in issue.source_snippet
+        assert "   35 | line_35 = 35" in issue.source_snippet
+        assert "line_4 =" not in issue.source_snippet, "不应包含窗口外的行"
+        assert "line_36 =" not in issue.source_snippet
+
+    def test_source_snippet_clamps_at_file_start(self, tmp_path: Path):
+        """行号靠近文件头/尾时窗口必须被夹紧，不越界。"""
+        (tmp_path / "tiny.py").write_text(
+            "".join(f"v{i} = {i}\n" for i in range(1, 4)), encoding="utf-8")
+        issue = parse_test_failure(
+            'File "tiny.py", line 2, in f\n', project_root=tmp_path)
+        assert issue is not None
+        assert issue.source_snippet.count("\n") == 2, \
+            f"3 行文件应给出 3 行片段: {issue.source_snippet!r}"
+        assert ">>    2 | v2 = 2" in issue.source_snippet
+
+    def test_missing_source_file_is_safe(self):
+        """Test 5：traceback 指向不存在的文件 → 不崩溃，保留定位，片段为空。"""
+        tb = (
+            'File "/no/such/dir/ghost.py", line 7, in gone\n'
+            "NameError: name 'x' is not defined\n"
+        )
+        issue = parse_test_failure(tb, project_root="D:/definitely/not/here")
+        assert issue is not None
+        assert issue.file == "/no/such/dir/ghost.py"
+        assert issue.line == 7
+        assert issue.function == "gone"
+        assert issue.source_snippet == ""
+
+    def test_no_traceback_does_not_crash(self):
+        """Test 6：没有 frame 的普通失败文本不得让 parser 崩溃。"""
+        for text in ("assert 404 == 200", "KeyError: 'username'", "boom\n"):
+            issue = parse_test_failure(text)
+            assert issue is not None
+            assert issue.source_snippet == ""
+            assert issue.function == ""
+
+
+# ═══════════════════════════════════════════════════════════════════
 # P1 — Fix Planner
 # ═══════════════════════════════════════════════════════════════════
 
@@ -196,3 +360,7 @@ class TestRepairPlanEndToEnd:
         # P1 计划：包含 Fix Plan 步骤
         assert "Fix Plan" in joined, f"应含修复计划: {joined}"
         assert "edit" in joined or "write_file" in joined
+        # P0-1 接入：真实 pytest 失败 → 根因位置 + 源码上下文进入 Agent 上下文
+        assert "根因位置" in joined, f"应含根因位置: {joined[-1500:]}"
+        assert "源码上下文" in joined, f"应含源码片段: {joined[-1500:]}"
+        assert ">>" in joined, "源码片段应标出根因行"

@@ -36,10 +36,16 @@ class FailureIssue:
     detail: str
     semantic: str
     hints: list[str] = field(default_factory=list)
-    file: str = ""
     issue_type: str = ""  # NotFound / MissingField / MissingDependency …
-    # ── 精确定位字段：行号、expected/actual、候选业务文件（供短路径修复）──
+    # ── 根因定位字段 ──
+    # file / line / function 三者来自**同一个 traceback frame**（见 _parse_frames），
+    # 且优先选被测源码帧而非测试帧 —— 这是"失败 → 改哪里"的落点。
+    file: str = ""
     line: int = 0
+    function: str = ""
+    # 定位点附近源码（±15 行，>> 标记根因行）；文件不可读时为空串。
+    source_snippet: str = ""
+    # ── 断言值与候选业务文件（供短路径修复）──
     expected: str = ""
     actual: str = ""
     candidate_files: list[str] = field(default_factory=list)
@@ -164,15 +170,177 @@ def _extract_error_type(text: str) -> str:
 
 
 def _extract_file(text: str) -> str:
-    """提取首个非测试文件路径（被测试的源文件，供定位用）。"""
+    """兜底：提取首个 File "..." 路径（仅在完全没有可解析 frame 时使用）。"""
     m = re.search(r'File "([^"]+)"', text)
     return m.group(1) if m else ""
 
 
 def _extract_line(text: str) -> int:
-    """从 pytest 摘要（形如 test_app.py:40: in test_xxx）提取失败行号。"""
+    """兜底：从形如 test_app.py:40 的片段提取行号（仅在无 frame 可用时使用）。"""
     m = re.search(r"(?:test_[A-Za-z0-9_]+\.py|/[^:\n]+\.py):(\d+)", text)
     return int(m.group(1)) if m else 0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Traceback frame —— file / line / function 必须来自同一个 frame
+# ═══════════════════════════════════════════════════════════════════
+
+# pytest 长 traceback 会混排三种形态（实测 pytest 9.x 输出）：
+#   test_ledger.py:5:                      ← 测试帧，无函数名
+#   ledger.py:28: in __init__              ← 源码帧，带函数名
+#   ledger.py:46: ValueError               ← 最深帧（raise 点），只有异常名
+# 加上 CPython 原生形态：
+#   File "src/app.py", line 42, in parse_config
+
+
+# pytest / 插件 / stdlib 的目录名（按路径段匹配）
+_INTERNAL_DIR_SEGMENTS = frozenset({
+    "_pytest", "pytest", "pluggy", "_pluggy",
+    "importlib", "_distutils_hack",
+})
+# 第三方包与 stdlib 的路径特征（子串匹配）
+_INTERNAL_PATH_MARKERS = (
+    "site-packages", "dist-packages", "/lib/python", "/lib64/python",
+)
+
+
+@dataclass
+class TracebackFrame:
+    """一个 traceback frame —— 三者同时解析，不拆分。"""
+
+    file: str
+    line: int
+    function: str = ""
+
+    def is_test(self) -> bool:
+        low = self.file.lower().replace("\\", "/")
+        name = low.rsplit("/", 1)[-1]
+        if "/tests/" in low or "/test/" in low or low.startswith("tests/"):
+            return True
+        if name == "conftest.py":
+            return True
+        return name.startswith("test_") or name.endswith("_test.py")
+
+    def is_internal(self) -> bool:
+        """pytest / pluggy / stdlib / site-packages 内部帧不是根因所在。"""
+        low = self.file.lower().replace("\\", "/")
+        if low.startswith("<"):  # <frozen importlib._bootstrap> / <string>
+            return True
+        # 按目录段判定，相对路径（`_pytest/python.py`）与绝对路径都能命中；
+        # 不能用 startswith("_") —— 那会误伤项目里的 `_vendor/x.py`。
+        segments = [seg for seg in low.split("/") if seg][:-1]
+        if any(seg in _INTERNAL_DIR_SEGMENTS for seg in segments):
+            return True
+        return any(m in low for m in _INTERNAL_PATH_MARKERS)
+
+
+# File "src/app.py", line 42, in parse_config   （引号界定路径，兼容空格/盘符）
+_FRAME_FILE_RE = re.compile(
+    r'^\s*File "(?P<file>[^"]+)", line (?P<line>\d+)(?:, in (?P<func>.*?))?\s*$'
+)
+# tests/test_app.py:40: in test_button_works  （要求顶格，避开源码回显行）
+_FRAME_PYTEST_RE = re.compile(
+    r"^(?P<file>\S.*?\.py):(?P<line>\d+): in (?P<func>\S+)\s*$"
+)
+# ledger.py:46: ValueError  （raise 点：有 file:line，无函数名）
+_FRAME_RAISE_RE = re.compile(
+    r"^(?P<file>\S.*?\.py):(?P<line>\d+): (?P<exc>[A-Za-z_][\w.]*)\s*$"
+)
+
+
+def _parse_frames(text: str) -> list[TracebackFrame]:
+    """按出现顺序解析全部 traceback frame。
+
+    用**整段失败文本**而非 detail[:1000]：最深的帧（raise 点）常在切片之外。
+    """
+    frames: list[TracebackFrame] = []
+    for raw in (text or "").splitlines():
+        m = _FRAME_FILE_RE.match(raw)
+        if m:
+            frames.append(TracebackFrame(
+                m.group("file"), int(m.group("line")), (m.group("func") or "").strip()))
+            continue
+        m = _FRAME_PYTEST_RE.match(raw)
+        if m:
+            frames.append(TracebackFrame(
+                m.group("file"), int(m.group("line")), m.group("func")))
+            continue
+        m = _FRAME_RAISE_RE.match(raw)
+        if m:
+            frames.append(TracebackFrame(m.group("file"), int(m.group("line")), ""))
+    return frames
+
+
+def _select_frame(frames: list[TracebackFrame]) -> TracebackFrame | None:
+    """选出最值得定位的 frame。
+
+    优先级：最后一个「非测试 + 非内部」源码帧（traceback 最深 = raise 点）；
+    没有源码帧时回退到测试帧（比没有定位强）；再没有就用最后一帧。
+    """
+    if not frames:
+        return None
+    source = [f for f in frames if not f.is_test() and not f.is_internal()]
+    if source:
+        return source[-1]
+    conventional = [f for f in frames if not f.is_internal()]
+    if conventional:
+        return conventional[-1]
+    return frames[-1]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 源码上下文
+# ═══════════════════════════════════════════════════════════════════
+
+SNIPPET_CONTEXT_LINES = 15
+_MAX_SNIPPET_FILE_BYTES = 2 * 1024 * 1024
+
+
+def _resolve_source_path(path: str, project_root: str | Path | None) -> Path | None:
+    """把 traceback 里的路径解析成真实文件；解析不到返回 None。"""
+    if not path:
+        return None
+    p = Path(path)
+    candidates = [p] if p.is_absolute() else (
+        ([Path(project_root) / p] if project_root else []) + [p]
+    )
+    for c in candidates:
+        try:
+            if c.is_file():
+                return c
+        except OSError:
+            continue
+    return None
+
+
+def _read_source_snippet(path: str, line: int,
+                         project_root: str | Path | None,
+                         context: int = SNIPPET_CONTEXT_LINES) -> str:
+    """读取定位点前后 context 行的源码。
+
+    行号越界会被夹紧；文件不存在/不可读/过大时返回空串——本函数只读，不写。
+    """
+    if not path or line <= 0:
+        return ""
+    target = _resolve_source_path(path, project_root)
+    if target is None:
+        return ""
+    try:
+        if target.stat().st_size > _MAX_SNIPPET_FILE_BYTES:
+            return ""
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    line = min(line, len(lines))
+    start = max(1, line - context)
+    end = min(len(lines), line + context)
+    return "\n".join(
+        f"{'>>' if n == line else '  '}{n:>5} | {lines[n - 1]}"
+        for n in range(start, end + 1)
+    )
 
 
 def _extract_expected_actual(text: str) -> tuple[str, str]:
@@ -294,10 +462,18 @@ def parse_test_failure(traceback_text: str,
     detail = traceback_text.strip()[:1000]
     error_type = _extract_error_type(detail)
     test_name = _extract_test_name(detail)
-    file = _extract_file(detail)
-    line = _extract_line(detail)
     expected, actual = _extract_expected_actual(detail)
     candidate_files = _collect_candidate_files(detail, project_root, test_name)
+
+    # ── 根因定位：frame 三要素 + 源码上下文 ──
+    # 解析整段文本（最深的 raise 帧常在 detail[:1000] 之外），选中帧后读源码。
+    frame = _select_frame(_parse_frames(traceback_text))
+    if frame is not None:
+        file, line, function = frame.file, frame.line, frame.function
+    else:
+        # 无任何可识别 frame 时退回旧行为，保证不回归。
+        file, line, function = _extract_file(detail), _extract_line(detail), ""
+    source_snippet = _read_source_snippet(file, line, project_root)
 
     def _build(itype: str, semantic: str, hints: list[str]) -> FailureIssue:
         return FailureIssue(
@@ -309,6 +485,8 @@ def parse_test_failure(traceback_text: str,
             file=file,
             issue_type=itype,
             line=line,
+            function=function,
+            source_snippet=source_snippet,
             expected=expected,
             actual=actual,
             candidate_files=candidate_files,
@@ -336,12 +514,17 @@ def format_failure(issue: FailureIssue) -> str:
     lines = [f"- 失败测试: {issue.test_name or '(unknown)'}",
              f"- 错误类型: {issue.error_type}",
              f"- 语义化根因: {issue.semantic}"]
-    if issue.line:
-        lines.append(f"- 失败行号: {issue.line}")
+    if issue.file:
+        loc = f"- 根因位置: {issue.file}:{issue.line}" if issue.line else \
+              f"- 根因位置: {issue.file}"
+        if issue.function:
+            loc += f"  (in {issue.function})"
+        lines.append(loc)
+    if issue.source_snippet:
+        lines.append("- 源码上下文（>> 标记根因行）:")
+        lines.append(issue.source_snippet)
     if issue.expected or issue.actual:
         lines.append(f"- 断言值: expected={issue.expected}, actual={issue.actual}")
-    if issue.file:
-        lines.append(f"- 出错文件: {issue.file}")
     if issue.candidate_files:
         lines.append("- 最可能的被测业务文件（优先读取/修改）:")
         for c in issue.candidate_files[:5]:
