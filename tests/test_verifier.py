@@ -246,30 +246,147 @@ class TestAutoGenerateChecks:
         # 至少有一个 git diff 检查（在 git 仓库中会通过）
 
     def test_auto_test_result(self):
-        """工具结果中测试失败 → 验证失败。"""
-        results = auto_generate_checks(
-            modified_files=["test_main.py"],
-            tool_results=[
-                {"name": "shell_exec", "success": True, "output": "PASSED: 3 tests passed"},
-                {"name": "pytest", "success": False, "output": "FAILED: 1 test failed\nAssertionError"},  # noqa: E501
-            ],
-        )
-        test_checks = [c for c in results.checks if c.strategy == "test_output"]
-        if test_checks:
-            any(not c.passed for c in test_checks)
-            # 只要有 failed 信号，验证就不通过
+        """真实失败的测试命令（success=False，详情在 error）→ 验证失败。
 
-    def test_auto_with_shell_error_signal(self):
-        """shell 输出包含错误信号 → 验证失败。"""
+        旧版本 fixture 用了不存在的工具名 "pytest"（真实注册表只有 shell_exec/git），
+        断言也是被丢弃的裸表达式；这里改成真实形态 + 真断言。
+        """
         results = auto_generate_checks(
             modified_files=[],
             tool_results=[
-                {"name": "shell_exec", "success": True, "output": "error: command not found"},
+                {"name": "shell_exec", "success": True,
+                 "output": "3 passed in 0.10s\n"},
+                {"name": "shell_exec", "success": False, "output": "",
+                 "error": "[test summary] 0 passed, 1 failed, 0 errors\n"
+                          "exit 1: FAILED test_main.py::test_x - AssertionError"},
+            ],
+        )
+        failed = [c for c in results.checks if not c.passed]
+        assert len(failed) == 1
+        assert failed[0].strategy == "exit_code"
+        assert "AssertionError" in failed[0].error
+
+    def test_auto_with_shell_error_signal(self):
+        """shell 命令真实失败（success=False）→ 验证失败，且引用 error 字段证据。"""
+        results = auto_generate_checks(
+            modified_files=[],
+            tool_results=[
+                {"name": "shell_exec", "success": False, "output": "",
+                 "error": "exit 127: error: command not found"},
             ],
         )
         exit_checks = [c for c in results.checks if c.strategy == "exit_code"]
-        # 至少有一个失败检查
-        any(not c.passed for c in exit_checks)
+        assert len(exit_checks) == 1
+        assert exit_checks[0].passed is False
+        assert "command not found" in exit_checks[0].error
+        assert results.passed is False
+
+    # ── 成功输出不得因普通英文单词被误判 ──────────────────────────
+    def test_success_output_with_error_word_passes(self):
+        """"error handling initialized" 是正常输出，不是失败证据。"""
+        results = auto_generate_checks(
+            modified_files=[],
+            tool_results=[
+                {"name": "shell_exec", "success": True,
+                 "output": "error handling initialized\n"},
+            ],
+        )
+        assert results.passed is True
+        assert [c for c in results.checks if c.strategy == "exit_code"] == []
+
+    def test_success_output_with_fail_word_passes(self):
+        """测试名含 failure 的成功运行不得判失败。"""
+        results = auto_generate_checks(
+            modified_files=[],
+            tool_results=[
+                {"name": "shell_exec", "success": True,
+                 "output": "test_failure_handling PASSED\n1 passed in 0.07s\n"},
+            ],
+        )
+        assert results.passed is True
+
+    def test_success_output_with_cannot_word_passes(self):
+        """"cannot connect to cache" 是正常输出，不是失败证据。"""
+        results = auto_generate_checks(
+            modified_files=[],
+            tool_results=[
+                {"name": "shell_exec", "success": True,
+                 "output": "cannot connect to cache\n"},
+            ],
+        )
+        assert results.passed is True
+
+    def test_success_pytest_summary_prefix_passes(self):
+        """ZMAI 自己注入的 "[test summary] … 0 failed, 0 errors" 不得触发失败。
+
+        该前缀由 ShellTool._test_summary_prefix() 前置到**每一条** pytest 输出，
+        必然同时含 "failed" 与 "errors" —— 旧的关键词匹配因此让每次成功 pytest
+        都必然产生失败 check。
+        """
+        results = auto_generate_checks(
+            modified_files=[],
+            tool_results=[
+                {"name": "shell_exec", "success": True,
+                 "output": "[test summary] 1 passed, 0 failed, 0 errors\n"
+                           "1 passed in 0.05s\n"},
+            ],
+        )
+        assert results.passed is True
+
+    # ── 反向：结构化证据里真实存在失败时仍必须判失败 ──────────────
+    def test_failed_shell_success_false_is_detected(self):
+        results = auto_generate_checks(
+            modified_files=[],
+            tool_results=[
+                {"name": "shell_exec", "success": False, "output": "",
+                 "error": "exit 1: \n[stderr]\nboom"},
+            ],
+        )
+        assert results.passed is False
+        failed = [c for c in results.checks if not c.passed]
+        assert len(failed) == 1
+        assert "boom" in failed[0].error
+
+    def test_error_field_evidence_is_not_ignored(self):
+        """失败详情只存在于 error 字段（output 为空）时不得被忽略。"""
+        results = auto_generate_checks(
+            modified_files=[],
+            tool_results=[
+                {"name": "shell_exec", "success": False, "output": "",
+                 "error": "AssertionError: 1 != 2"},
+            ],
+        )
+        assert results.passed is False
+        failed = [c for c in results.checks if not c.passed]
+        assert failed and "AssertionError" in failed[0].error
+
+    def test_success_output_with_structured_failure_counts_fails(self):
+        """成功输出里**解析出的计数**有失败 → 仍判失败（结构化，非关键词）。"""
+        results = auto_generate_checks(
+            modified_files=[],
+            tool_results=[
+                {"name": "shell_exec", "success": True,
+                 "output": "2 passed, 1 failed in 0.16s\n"},
+            ],
+        )
+        assert results.passed is False
+        failed = [c for c in results.checks if not c.passed]
+        assert len(failed) == 1
+        assert failed[0].strategy == "test_output"
+        assert "1 failed" in failed[0].evidence
+
+    def test_write_file_results_are_not_command_checks(self):
+        """非 shell/git 的工具结果不参与命令判定（不回归）。"""
+        results = auto_generate_checks(
+            modified_files=[],
+            tool_results=[
+                {"name": "write_file", "success": True,
+                 "output": "written app.py\n"},
+            ],
+        )
+        assert results.passed is True
+        assert [c for c in results.checks
+                if c.strategy in ("exit_code", "test_output")] == []
 
 
 class TestIntegrationSWEAgent:

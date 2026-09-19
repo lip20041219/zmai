@@ -528,34 +528,51 @@ def auto_generate_checks(
         checks.append(verify_file_exists(f, workspace))
 
     # 2. Check shell/test tool execution results
-    test_outputs: list[str] = []
+    # ── 结构化证据优先，不做裸关键词匹配 ──
+    # 旧实现对成功输出做 error/fail/traceback/cannot 子串匹配，两个方向都不成立：
+    #   * 假失败：成功命令输出里的普通英文（"error handling initialized"、测试名
+    #     test_failure_handling，以及 ZMAI 自己注入的 "[test summary] … 0 failed,
+    #     0 errors" 前缀）都会命中 → 每次成功 pytest 都必然生成失败 check；
+    #   * 漏判：真正失败时 ToolResult.err() 把文本放进 error 字段、output 为空串，
+    #     旧实现只读 output → 真实失败被静默跳过。
     for tr in tool_results:
         name = tr.get("name", "")
-        output = tr.get("output", "")
+        if name not in ("shell_exec", "git"):
+            continue
+        output = tr.get("output") or ""
+        error = tr.get("error") or ""
 
-        if name in ("shell_exec", "git") and output:
-            # Check output for error signals
-            error_signals = ["error", "fail", "traceback", "cannot"]
-            lower = output.lower()
-            has_error = any(s in lower for s in error_signals)
-            if has_error:
-                checks.append(VerificationCheck(
-                    name=f"Command output check: {name}",
-                    strategy="exit_code",
-                    passed=False,
-                    target=output[:100],
-                    evidence="Output contains error signals",
-                    error=f"{name} output appears to contain errors",
-                ))
+        # ① 工具自身报告了失败（shell_exec 非零退出码 / 执行异常）——权威信号。
+        #    失败详情在 error 字段，必须读它。
+        if tr.get("success") is False or error:
+            detail = error or output
+            checks.append(VerificationCheck(
+                name=f"Command failed: {name}",
+                strategy="exit_code",
+                passed=False,
+                target=detail[:100],
+                evidence="tool reported failure (non-zero exit / execution error)",
+                error=detail[:500],
+            ))
+            continue
 
-        if "test" in name.lower() or "pytest" in name.lower():
-            test_outputs.append(output)
+        # ② 结构化测试结果：仅当输出里**能解析出 pytest 计数**时才做测试判定，
+        #    依据是解析出的数字，而不是"文本里出现了 fail/error 字样"。
+        totals = parse_test_totals(output)
+        if totals["failed"] or totals["errors"]:
+            checks.append(VerificationCheck(
+                name="Test result check",
+                strategy="test_output",
+                passed=False,
+                target=output[:100],
+                evidence=(f"{totals['passed']} passed, {totals['failed']} failed, "
+                          f"{totals['errors']} errors"),
+                error="test summary reports failures",
+            ))
 
-    # 3. Verify test results if test output exists
-    for to in test_outputs:
-        checks.append(verify_test_output(to))
+        # ③ 成功且无测试计数 → 不做失败判定（普通输出不构成失败证据）。
 
-    # 4. Attempt Git diff
+    # 3. Attempt Git diff
     try:
         checks.append(verify_git_diff(workspace))
     except Exception:

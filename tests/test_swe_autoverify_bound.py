@@ -8,14 +8,17 @@ LoopGuard 又只挂在 tool_calls 分支 —— 文本路径因此没有任何�
 一路烧到 max_steps，被 Runtime 标成 timeout（`runtime.py`：max_steps 耗尽且最后一步
 不是 complete/fail → `timed_out=True`），而不是一个明确的局部失败。
 
-持续失败是怎么来的（真实成因，不是构造）：
-`verifier.auto_generate_checks` 对**成功**命令的输出做裸关键词匹配
-（error / fail / traceback / cannot），因此一条输出里含 "fail" 字样的**通过**运行
-（例如测试名叫 `test_failure_handling`）就会生成一条永久失败的 check；
-而 `_tool_results` 滑窗只在有新的工具调用时才推进，纯文本循环里它永不推进。
+持续失败从哪来：一条**真实失败**的命令（exit != 0 → `success=False`）会生成
+一条 failed check（`verifier.auto_generate_checks` 的结构化判定），而
+`_tool_results` 滑窗只在有新的工具调用时才推进 —— 纯文本循环里它永不推进，
+于是同一条真实失败被反复重判。
 
 修复后：该分支复用完成守卫已有的 `completion_block_count` 预算
 （语义相同：模型只回文本、Agent 无法推进），超过 MAX_COMPLETION_BLOCKS 即明确失败。
+
+注：本文件早先的夹具曾用"成功 pytest + 测试名含 failure"来制造持续失败 ——
+那依赖的是 verifier 的关键词误判 bug（已修复）。现在改为真实失败命令，
+测试的是"真实 verification failure 能被可靠捕获 + retry 有界"。
 
 全部用例走真实 Runtime + 真实工具执行（真跑 pytest、真写文件）。
 """
@@ -44,20 +47,19 @@ EVAL_CFG = {"eval.require_code_change": "true"}
 
 TEXT = "I have fixed the issue."
 
-# 关键夹具：测试**通过**，但测试名里含 "fail" → 成功输出含 "fail"
-# → auto_generate_checks 生成永久失败的 check。
 PASSING_APP = "def value():\n    return 1\n"
-PASSING_TEST = (
-    "from app import value\n\n\n"
-    "def test_failure_handling():\n"
-    "    assert value() == 1\n"
-)
 
 
 def _write_persistent_fail_project(tmp_path: Path) -> None:
-    """真实跑起来全绿，但输出里含 'fail' 字样 → _auto_verify 永久失败。"""
+    """真实失败的测试 → `pytest` exit 1 → `success=False` → 真实失败的 check。
+
+    这条失败是**结构化证据**（工具自身报告失败），不依赖任何关键词误判。
+    """
     (tmp_path / "app.py").write_text(PASSING_APP, encoding="utf-8")
-    (tmp_path / "test_app.py").write_text(PASSING_TEST, encoding="utf-8")
+    (tmp_path / "test_app.py").write_text(
+        "from app import value\n\n\ndef test_value():\n    assert value() == 2\n",
+        encoding="utf-8",
+    )
 
 
 def _write_clean_project(tmp_path: Path) -> None:
@@ -69,10 +71,10 @@ def _write_clean_project(tmp_path: Path) -> None:
     )
 
 
-def _pytest_v() -> ToolCall:
-    """-v 会打印测试名 → test_failure_handling 出现在成功输出里。"""
-    return ToolCall(id="ptv", name="shell_exec",
-                    params={"command": "python -m pytest -v"})
+def _pytest_failing() -> ToolCall:
+    """真实失败的命令：exit 1 → ToolResult.err(success=False, output="")。"""
+    return ToolCall(id="ptf", name="shell_exec",
+                    params={"command": "python -m pytest -q"})
 
 
 def _pytest_q() -> ToolCall:
@@ -144,7 +146,7 @@ def test_persistent_autoverify_failure_converges_to_fail(tmp_path):
     """真实工具造成的持续验证失败 → 明确 fail，而不是烧到 max_steps。"""
     max_steps = 12
     ctx, actions = _run(
-        tmp_path, [[_pytest_v()]] + [TEXT] * max_steps,
+        tmp_path, [[_pytest_failing()]] + [TEXT] * max_steps,
         max_steps=max_steps, extra_config=EVAL_CFG,
     )
     kinds = [a.type for a in actions]
@@ -154,7 +156,11 @@ def test_persistent_autoverify_failure_converges_to_fail(tmp_path):
     assert vr is not None and vr.passed is False, (
         f"夹具必须造成真实的 _auto_verify 失败: {vr and vr.summary}"
     )
-    assert any(c.passed is False for c in vr.checks), "应存在失败的 check"
+    failed = [c for c in vr.checks if not c.passed]
+    assert len(failed) == 1, f"应恰好一条失败 check: {[c.name for c in vr.checks]}"
+    # 必须是**结构化**失败证据（工具报告失败），不是关键词误判
+    assert failed[0].strategy == "exit_code", failed[0].strategy
+    assert "tool reported failure" in failed[0].evidence, failed[0].evidence
 
     # 2) 明确失败收敛
     assert kinds[-1] == "fail", f"应明确失败: {kinds}"
@@ -174,7 +180,7 @@ def test_persistent_autoverify_failure_converges_to_fail(tmp_path):
 def test_autoverify_failure_shares_completion_block_budget(tmp_path):
     """复用现有预算：不新增平行计数器。"""
     ctx, actions = _run(
-        tmp_path, [[_pytest_v()]] + [TEXT] * 12, max_steps=12, extra_config=EVAL_CFG,
+        tmp_path, [[_pytest_failing()]] + [TEXT] * 12, max_steps=12, extra_config=EVAL_CFG,
     )
     assert ctx.metadata.get("completion_block_count") == MAX_COMPLETION_BLOCKS + 1
     assert "autoverify_block_count" not in ctx.metadata, "不得新增平行计数器"
