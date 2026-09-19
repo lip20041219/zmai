@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from zmai.context.memory import SummaryMemory, _truncate
+from zmai.context.memory import SummaryMemory, _truncate, _truncate_head_tail
 from zmai.context.pruner import (
     DEFAULT_MAX_CHARS,
     DEFAULT_RECENT_WINDOW,
@@ -45,6 +45,8 @@ class ContextManager:
         self.recent_window: int = int(cfg.get("context.recent_window", DEFAULT_RECENT_WINDOW))
         self.tool_result_window: int = int(cfg.get("context.tool_result_window", DEFAULT_TOOL_RESULT_WINDOW))  # noqa: E501
         self.tool_truncate: int = int(cfg.get("context.tool_truncate", 500))
+        # 测试失败证据预算（仅对显式声明为证据的 tool result 生效，见 add_tool_result）
+        self.test_evidence_chars: int = int(cfg.get("context.test_evidence_chars", 4000))
 
         # 组件（使用 _recent_win 而非 _recent 避免与兼容属性冲突）
         self._recent_win = RecentMessages(
@@ -122,8 +124,28 @@ class ContextManager:
         output: str,
         error: str | None = None,
         duration_ms: int = 0,
+        truncate: int | None = None,
     ) -> None:
-        truncated = _truncate(output or "", self.tool_truncate)
+        """记录工具结果并注入一条 user 消息。
+
+        Args:
+            truncate: 本次调用的截断预算（字符）。
+                None（默认）→ ``self.tool_truncate``，**头部截断**，普通工具
+                    （read_file / grep / git / 普通 shell）行为不变。
+                给定值 → **证据保留截断**：头部保留结构化摘要（如 ``[test summary]``），
+                    尾部保留失败详情（traceback / 根因），中间省略。供测试失败证据
+                    使用，避免模型只看到 pytest 的 session/collection 头。
+        """
+        if truncate is None:
+            def _cut(text: str) -> str:
+                return _truncate(text, self.tool_truncate)
+        else:
+            budget = max(0, int(truncate))
+
+            def _cut(text: str) -> str:
+                return _truncate_head_tail(text, budget)
+
+        truncated = _cut(output or "")
         entry = {
             "name": name,
             "success": success,
@@ -140,7 +162,7 @@ class ContextManager:
 
         status = "OK" if success else "FAIL"
         detail = output or error or ""
-        result_msg = f"[工具 {name} 结果]\n{status}: {_truncate(detail, self.tool_truncate)}"
+        result_msg = f"[工具 {name} 结果]\n{status}: {_cut(detail)}"
         slid = self._recent_win.add_message("user", result_msg, metadata={"tool": name})
         if slid:
             self._memory.compress(slid, [])

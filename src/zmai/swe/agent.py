@@ -36,7 +36,7 @@ from zmai.swe.verifier import (
     parse_test_totals,
     verify_test_output,
 )
-from zmai.tool import ToolContext, ToolResult
+from zmai.tool import ToolCall, ToolContext, ToolResult
 
 logger = logging.getLogger("zmai.swe.agent")
 
@@ -64,6 +64,22 @@ def _now_ms() -> int:
     """当前时间戳（毫秒）。"""
     import time
     return int(time.monotonic() * 1000)
+
+
+def _test_evidence_budget(tc: ToolCall, result: ToolResult,
+                          cm: ContextManager) -> int | None:
+    """测试失败结果 → evidence 截断预算；其余工具 → None（默认头部截断）。
+
+    P0-4：测试失败的证据（[test summary] + traceback）在 ContextManager 里若按
+    默认 500 字符头部截断，模型只会看到 pytest 的 session/collection 头，看不到
+    任何失败根因。测试命令的失败结果因此改走证据保留截断（头摘要 + 尾详情）。
+    普通工具（read_file/grep/git/普通 shell）与成功的测试运行保持原行为。
+    """
+    if result.success or tc.name != "shell_exec":
+        return None
+    if not _TEST_CMD_RE.search(str((tc.params or {}).get("command", ""))):
+        return None
+    return cm.test_evidence_chars
 
 
 def _stats(context: AgentContext, **deltas: int) -> dict:
@@ -1018,6 +1034,7 @@ class SWEAgent(Agent):
                     success=result.success,
                     output=result.output or "",
                     error=result.error,
+                    truncate=_test_evidence_budget(tc, result, cm),
                 )
                 # ── Edit syntax validation feedback + limited repair ──
                 # 语法验证失败的编辑：结构化错误已随工具结果进入上下文（含

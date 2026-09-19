@@ -27,6 +27,23 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[:max_chars] + "\n...(截断)"
 
 
+def _truncate_head_tail(text: str, max_chars: int, tail_chars: int = 3000) -> str:
+    """头尾保留截断 —— 保头部摘要 + 尾部详情，中间省略。
+
+    用于测试失败证据：pytest 输出最前面是 session/collection 头（信息密度低），
+    真正的失败原因（FAILURES 段、traceback、short test summary）在最后。只留头部
+    等于把根因丢掉。
+    """
+    if len(text) <= max_chars:
+        return text
+    tail_chars = min(tail_chars, max_chars)
+    if tail_chars <= 0:
+        return _truncate(text, max_chars)
+    head_chars = max_chars - tail_chars
+    omitted = len(text) - head_chars - tail_chars
+    return f"{text[:head_chars]}\n...(中间省略 {omitted} 字符)...\n{text[-tail_chars:]}"
+
+
 class SummaryMemory:
     """摘要记忆 — 将旧消息压缩为摘要并管理。
 
