@@ -364,3 +364,168 @@ class TestRepairPlanEndToEnd:
         assert "根因位置" in joined, f"应含根因位置: {joined[-1500:]}"
         assert "源码上下文" in joined, f"应含源码片段: {joined[-1500:]}"
         assert ">>" in joined, "源码片段应标出根因行"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P0-1 follow-up — 语义解析精度（长输出 / [test summary] 前缀）
+# ═══════════════════════════════════════════════════════════════════
+
+def _noise(lines: int = 240) -> str:
+    """前置噪声：把 FAILURES 段挤出输出头部（真实 Runtime 验证的场景）。"""
+    return "".join(f"[noise] line {i:03d} " + "-" * 60 + "\n" for i in range(lines))
+
+
+# ShellTool 注入失败证据时会前置 [test summary] 与 exit code
+_PREFIX = "[test summary] 1 passed, 1 failed, 0 errors\nexit 1: "
+
+# 真实 pytest 输出的 FAILURES 段（fixture 项目 app.py:7 的 ValueError）
+_FAILURES_VALUEERROR = """\
+================================== FAILURES ===================================
+______________________ test_parse_config_splits_on_comma ______________________
+
+    def test_parse_config_splits_on_comma():
+>       assert parse_config("a=1,b=2") == {"a": "1", "b": "2"}
+               ^^^^^^^^^^^^^^^^^^^^^^^
+
+test_app.py:11:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+text = 'a=1,b=2'
+
+    def parse_config(text):
+        \"\"\"Parse 'k=v,k=v' into a dict.\"\"\"
+        pairs = text.split(";")            # BUG: should be ","
+>       return dict(p.split("=") for p in pairs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       ValueError: dictionary update sequence element #0 has length 3; 2 is required
+
+app.py:7: ValueError
+=========================== short test summary info ===========================
+FAILED test_app.py::test_parse_config_splits_on_comma - ValueError: dictionar...
+1 failed, 1 passed in 0.16s
+"""
+
+# 长噪声在前：FAILURES 段落在 1000 字符之后
+_LONG_VALUEERROR = _PREFIX + "============================= test session starts =============================\ncollected 2 items\n\n" + _noise() + _FAILURES_VALUEERROR  # noqa: E501
+
+# 长噪声 + KeyError（命中 MissingField 语义规则，用于验证不再退化成 Generic）
+_LONG_KEYERROR = _PREFIX + _noise() + """\
+================================== FAILURES ===================================
+_______________________________ test_response_payload _______________________________
+
+    def test_response_payload():
+>       assert payload["user_id"] == 7
+E       KeyError: 'user_id'
+
+app.py:12: KeyError
+=========================== short test summary info ===========================
+FAILED test_app.py::test_response_payload - KeyError: 'user_id'
+1 failed, 1 passed in 0.16s
+"""
+
+
+class TestSemanticParsingWindow:
+    """语义解析必须命中 FAILURES 段，而不是输出头部（detail 窗口修复）。"""
+
+    def test_error_type_found_after_test_summary_prefix(self):
+        """ShellTool 前置的 [test summary] 不再是 ^ 锚点的障碍。"""
+        issue = parse_test_failure(_PREFIX + _FAILURES_VALUEERROR)
+        assert issue is not None
+        assert issue.error_type == "ValueError"
+
+    def test_test_name_found_beyond_head_window(self):
+        """FAILURES 位于前 1000 字符之后，仍能识别失败测试名。"""
+        assert _LONG_VALUEERROR.index("FAILURES") > 1000      # 场景成立
+        issue = parse_test_failure(_LONG_VALUEERROR)
+        assert issue is not None
+        assert issue.test_name == "test_parse_config_splits_on_comma"
+
+    def test_semantic_rule_not_degraded_to_generic(self):
+        """长噪声 + 语义规则可命中的失败 → 具体语义，而不是 Generic。"""
+        issue = parse_test_failure(_LONG_KEYERROR)
+        assert issue is not None
+        assert issue.test_name == "test_response_payload"
+        assert issue.error_type == "KeyError"
+        assert issue.issue_type == "MissingField"
+        assert "user_id" in issue.semantic
+
+    def test_short_failure_unchanged(self):
+        """短输出（≤ 窗口）行为不变：整段参与语义解析。"""
+        text = (
+            "FAILED test_app.py::test_home_returns_200 - AssertionError: "
+            "assert 404 == 200\n"
+            "+  where 404 = <WrapperTestResponse streamed [404 NOT FOUND]>.status_code"
+        )
+        issue = parse_test_failure(text)
+        assert issue is not None
+        assert issue.test_name == "test_home_returns_200"
+        assert issue.issue_type == "NotFound"
+        # 该文本只有 short summary 行，没有 `E   Xxx:` / 顶格 traceback 行，
+        # error_type 与修复前一致（"Error"）——不是本轮引入的回归。
+
+    def test_short_real_failure_full_semantics(self):
+        """真实短输出（含 FAILURES 段）语义解析完整。"""
+        issue = parse_test_failure(_PREFIX + _FAILURES_VALUEERROR)
+        assert issue is not None
+        assert issue.test_name == "test_parse_config_splits_on_comma"
+        assert issue.error_type == "ValueError"
+        assert (issue.file, issue.line) == ("app.py", 7)
+
+
+class TestErrorTypeDetection:
+    """异常类型识别 —— 逐行匹配，但不误伤普通文本。"""
+
+    def test_pytest_e_prefixed_line(self):
+        issue = parse_test_failure("E       TypeError: unsupported operand type(s)\n")
+        assert issue is not None
+        assert issue.error_type == "TypeError"
+
+    def test_leading_exception_name_still_matches(self):
+        """原生 traceback 形态（异常名顶格）不能回归。"""
+        issue = parse_test_failure("ValueError: bad value\napp.py:3: ValueError\n")
+        assert issue is not None
+        assert issue.error_type == "ValueError"
+
+    def test_plain_text_not_misread(self):
+        """源码回显 / 普通叙述不得被当成异常类型（MULTILINE 后仍不误伤）。"""
+        for text in (
+            "some prose mentioning ValueError in the middle of a sentence\n",
+            "raise KeyError('source echo, not the failure')\n",
+            "# ValueError is documented below\n",
+            "assert isinstance(exc, TypeError)\n",
+        ):
+            issue = parse_test_failure(text)
+            assert issue is not None, text
+            assert issue.error_type == "Error", f"{text!r} → {issue.error_type}"
+
+    def test_multiline_source_echo_does_not_override(self):
+        """多行文本里异常名只出现在源码回显中 → 不识别为异常类型。"""
+        text = (
+            "app.py:9: in <module>\n"
+            "    TypeError = object  # a variable named like an exception\n"
+        )
+        issue = parse_test_failure(text)
+        assert issue is not None
+        assert issue.error_type == "Error"
+
+
+class TestRootCauseNoRegression:
+    """P0-1 原有定位能力在长输出下不得回归。"""
+
+    def test_frames_and_snippet_survive_long_output(self, tmp_path: Path):
+        lines = [f"# filler {i}" for i in range(1, 61)]
+        lines[41] = 'pairs = text.split(";")'
+        (tmp_path / "app.py").write_text("\n".join(lines), encoding="utf-8")
+
+        text = _PREFIX + _noise() + (
+            "Traceback (most recent call last):\n"
+            '  File "app.py", line 42, in parse_config\n'
+            "ValueError: bad config\n"
+        )
+        assert text.index('File "app.py"') > 1000      # 根因帧在头部窗口之外
+
+        issue = parse_test_failure(text, tmp_path)
+        assert issue is not None
+        assert (issue.file, issue.line, issue.function) == ("app.py", 42, "parse_config")
+        assert "text.split" in issue.source_snippet
+        assert ">>" in format_failure(issue)

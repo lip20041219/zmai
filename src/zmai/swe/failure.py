@@ -134,16 +134,39 @@ _SEMANTIC_RULES: list[tuple[str, str, str, list[str]]] = [
     ),
 ]
 
+# 逐行匹配异常类型：pytest 的异常行是 `E   ValueError: ...`，原生 traceback 是
+# `ValueError: ...`。用 `^` 单点锚（无 MULTILINE）在 ShellTool 前置了
+# `[test summary]` 之后永远匹配不到位置 0，错误类型会一路回落成 "Error"。
+# 只允许 pytest 的 `E ` 前缀，不放行任意前导空白 —— 避免把源码回显
+# （`    raise TypeError(...)`）或普通文本里缩进出现的词误判成异常类型。
 _ERROR_TYPE_RE = re.compile(
-    r"^(?P<error>AssertionError|KeyError|NameError|TypeError|ImportError|"
+    r"^(?:E\s+)?(?P<error>AssertionError|KeyError|NameError|TypeError|ImportError|"
     r"ModuleNotFoundError|AttributeError|IndexError|ValueError|RuntimeError|"
-    r"SyntaxError|UnicodeDecodeError)\b"
+    r"SyntaxError|UnicodeDecodeError)\b",
+    re.MULTILINE,
 )
 
 
 # ═══════════════════════════════════════════════════════════════════
 # 解析入口
 # ═══════════════════════════════════════════════════════════════════
+
+
+# 语义解析窗口 —— 头部（[test summary] 计数 / collection）+ 尾部（FAILURES 段、
+# traceback、short test summary）。pytest 把失败详情放在输出尾部，长输出（前置噪声、
+# 大量通过用例）会把失败挤出头部：只取 [:1000] 时 test_name / error_type / 语义规则
+# 会一起退化成 unknown / Error / Generic。整段 ≤ 4000 时原样返回，不改变短输出行为。
+# frame 与源码片段解析仍使用完整文本（见 _parse_frames），不受这里影响。
+_SEMANTIC_HEAD_CHARS = 1000
+_SEMANTIC_TAIL_CHARS = 3000
+
+
+def _semantic_text(text: str) -> str:
+    """语义解析用文本：头 + 尾，中间省略。"""
+    text = (text or "").strip()
+    if len(text) <= _SEMANTIC_HEAD_CHARS + _SEMANTIC_TAIL_CHARS:
+        return text
+    return f"{text[:_SEMANTIC_HEAD_CHARS]}\n{text[-_SEMANTIC_TAIL_CHARS:]}"
 
 
 def _extract_test_name(text: str) -> str:
@@ -459,14 +482,16 @@ def parse_test_failure(traceback_text: str,
     if not traceback_text or not traceback_text.strip():
         return None
 
-    detail = traceback_text.strip()[:1000]
+    # 语义解析（测试名/异常类型/规则/期望值）用头+尾窗口：失败详情在输出尾部，
+    # 长输出下头部只有噪声。
+    detail = _semantic_text(traceback_text)
     error_type = _extract_error_type(detail)
     test_name = _extract_test_name(detail)
     expected, actual = _extract_expected_actual(detail)
     candidate_files = _collect_candidate_files(detail, project_root, test_name)
 
     # ── 根因定位：frame 三要素 + 源码上下文 ──
-    # 解析整段文本（最深的 raise 帧常在 detail[:1000] 之外），选中帧后读源码。
+    # 解析整段文本（最深的 raise 帧常在头部窗口之外），选中帧后读源码。
     frame = _select_frame(_parse_frames(traceback_text))
     if frame is not None:
         file, line, function = frame.file, frame.line, frame.function
