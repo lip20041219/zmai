@@ -13,6 +13,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from zmai.swe.verifier import strip_ansi
+
 # ═══════════════════════════════════════════════════════════════════
 # 数据结构
 # ═══════════════════════════════════════════════════════════════════
@@ -481,6 +483,10 @@ def parse_test_failure(traceback_text: str,
     """
     if not traceback_text or not traceback_text.strip():
         return None
+    # 先剥 ANSI：彩色输出（FORCE_COLOR / PY_COLORS / --color=yes）会把转义插进
+    # `app.py:2: KeyError` 这类语义单元中间，使 frame / 异常类型正则全部失配。
+    # 入口统一剥离，下游 frame / 语义 / 源码片段解析无需各自处理。
+    traceback_text = strip_ansi(traceback_text)
 
     # 语义解析（测试名/异常类型/规则/期望值）用头+尾窗口：失败详情在输出尾部，
     # 长输出下头部只有噪声。

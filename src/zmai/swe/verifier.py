@@ -19,12 +19,31 @@ Architecture:
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("zmai.swe.verifier")
+
+
+# ── ANSI 转义序列 ────────────────────────────────────────────────
+# pytest 在 FORCE_COLOR / PY_COLORS / `--color=yes` / CI 强制颜色时会输出彩色文本，
+# 转义序列直接插进被解析的语义单元中间：
+#   \x1b[1m\x1b[31mapp.py\x1b[0m:2: KeyError      ← 路径被包住
+#   \x1b[31mFAILED\x1b[0m test_app.py::test_a    ← "FAILED " 后紧跟转义而非空格
+# 实测后果：failure parser 的 error_type 退化成 Error、file:line 变成 '' :0，
+# verify_test_output 丢掉 FAILED 标记。所有测试输出解析入口因此先剥一层。
+# CSI（\x1b[…m 这类 SGR）与非 CSI 的 ESC 序列（如 \x1b(B 字符集选择）都要覆盖。
+_ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[ -/]*[0-~])")
+
+
+def strip_ansi(text: str) -> str:
+    """剥离 ANSI 转义序列；无转义时原样返回（不做无谓拷贝）。"""
+    if not text or "\x1b" not in text:
+        return text or ""
+    return _ANSI_RE.sub("", text)
 
 
 @dataclass
@@ -264,7 +283,7 @@ def parse_test_totals(test_output: str) -> dict[str, int]:
     造成误匹配（曾把 4 个测试误判成 200 个）。
     """
     import re
-    text = test_output or ""
+    text = strip_ansi(test_output)
     lines = [ln for ln in text.splitlines() if ln.strip()]
     # 汇总行：包含某计数词且带耗时标记 " in "
     summary = text
@@ -343,7 +362,8 @@ def verify_test_output(test_output: str) -> VerificationCheck:
     Supports common test framework output patterns.
     """
     import re
-    lower = test_output.lower()
+    text = strip_ansi(test_output)
+    lower = text.lower()
     failures: list[str] = []
 
     # ── Failure signals ─────────────────────────────────────────
@@ -357,7 +377,7 @@ def verify_test_output(test_output: str) -> VerificationCheck:
         ("FAILURES", "FAILURES"),
         ("Traceback", "Traceback"),
     ]:
-        if signal in test_output:
+        if signal in text:
             failures.append(label)
     for signal, label in [
         ("tests failed", "tests failed"),
