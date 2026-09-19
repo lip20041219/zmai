@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -104,6 +105,54 @@ def _fmt_test_totals(t: dict[str, int]) -> str:
 
 # 测试运行器的子命令（不是测试目标）。`python -m unittest discover` 跑的是全套件。
 _RUNNER_SUBCOMMANDS = {"discover"}
+
+
+# 工作区指纹要跳过的目录：构建产物 / VCS / 缓存 / 依赖。这些目录在每次 pytest
+# 或运行脚本后都会变化（__pycache__ / .pytest_cache），若计入指纹，任何一次测试
+# 运行都会被误判成"代码修改"，green 状态永远站不住（P0-2/P1-2 会整片回归）。
+_WS_IGNORE_DIRS = frozenset({
+    ".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", ".tox", ".venv", "venv", ".eggs", "node_modules",
+    "htmlcov", ".idea", ".vscode",
+})
+_WS_IGNORE_SUFFIXES = (".pyc", ".pyo", ".pyd")
+_WS_IGNORE_NAMES = frozenset({".coverage", ".DS_Store"})
+
+# 只读工具按构造不可能改动工作区，跳过指纹遍历（省一次目录树扫描）。
+# 未列出的工具——包括以后新增的——一律计算：默认"可能写"，宁可多算不可漏判。
+_READ_ONLY_TOOLS = frozenset({"read_file", "grep", "show_to_user", "open_in_browser"})
+
+
+def _workspace_root(context: AgentContext) -> Path:
+    """工作区根目录 —— 与 ShellTool 的 cwd 保持同一套解析顺序，否则指纹会盯错目录。"""
+    return Path(context.config.get("project_path") or context.workspace or ".")
+
+
+def _workspace_fingerprint(root: Path) -> dict[str, tuple[int, int]]:
+    """工作区代码文件的 (mtime_ns, size) 指纹。
+
+    回答的是"这次工具调用**实际**有没有改动工作区"，而不是猜 shell 命令的意图
+    （`python fix.py` 是不是写文件、`sed -i` 是不是改文件都无法从字符串可靠判断）。
+
+    ponytail: 每次工具调用后走一遍工作区目录树。SWE-bench 量级（数千文件、目录
+    剪枝后）是毫秒级；真成为瓶颈再换成 git status 快路径或增量 stat 缓存。
+    """
+    fp: dict[str, tuple[int, int]] = {}
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _WS_IGNORE_DIRS]
+            for fn in filenames:
+                if fn.endswith(_WS_IGNORE_SUFFIXES) or fn in _WS_IGNORE_NAMES:
+                    continue
+                p = Path(dirpath) / fn
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                fp[str(p.relative_to(root))] = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return fp
+    return fp
 
 
 def _is_full_scope_test_command(command: str) -> bool:
@@ -396,6 +445,14 @@ class SWEAgent(Agent):
                 )
             except Exception as e:
                 logger.warning("Repository scan failed: %s", e)
+
+        # ── 工作区指纹基线（P1-3）────────────────────────────────
+        # 必须在任何工具执行**之前**取基线，否则第一次工具调用造成的修改会被
+        # 当成"没有前值可比较"而漏掉（`python fix.py` 只改一次就再没变化）。
+        if "__ws_fingerprint__" not in context.metadata:
+            context.metadata["__ws_fingerprint__"] = _workspace_fingerprint(
+                _workspace_root(context)
+            )
 
         # ── LoopGuard — 循环检测 ────────────────────────────────
         if "loop_guard" not in context.metadata:
@@ -746,13 +803,27 @@ class SWEAgent(Agent):
                     result = context.tools.execute_tool(tc.name, tc.params, tctx)
                     _intercepted = False
                 _dur = _now_ms() - _ts
+                # ── P1-3: 用工作区真实状态判断"是否发生修改" ──
+                # 只认工具名（write_file/edit）会漏掉一切经 shell 的修改：
+                # `python fix.py`、`sed -i`、`echo ... > app.py`、
+                # `git checkout/restore` 都真实改写了工作区，却被当成"未修改"，
+                # 于是 eval 模式 ever_modified 恒为 False（EvalGuard 永久阻塞合法
+                # 完成），且修改前的 green state 不会被失效。
+                # 这里改为比对工作区指纹 —— 判断"实际有没有变"，而不是猜命令意图。
+                _ws_changed = False
+                if not _intercepted and tc.name not in _READ_ONLY_TOOLS:
+                    _fp = _workspace_fingerprint(_workspace_root(context))
+                    _prev_fp = context.metadata.get("__ws_fingerprint__")
+                    _ws_changed = _prev_fp is not None and _fp != _prev_fp
+                    context.metadata["__ws_fingerprint__"] = _fp
                 if result.success:
                     step_tool_ok += 1
-                    # 只有真正改写工作区代码的工具才算"修改证据"。git status/diff/log
+                    # 只有真正改写工作区代码的调用才算"修改证据"。git status/diff/log
                     # 是只读的：曾把它们计入修改，使一条只读 git 命令即可置
                     # ever_modified=True 并解除 force_edit，同时清空 test_failed ——
                     # 既是 no_change 逃逸口，也让 FixDriving 被无声解除。
-                    if tc.name in ("write_file", "edit"):
+                    # 指纹比对天然区分二者：只读 git 不改变工作区 → _ws_changed False。
+                    if tc.name in ("write_file", "edit") or _ws_changed:
                         had_modification = True
                         # 记录真实代码修改：eval 守卫据此放行完成判定
                         context.metadata["ever_modified"] = True
