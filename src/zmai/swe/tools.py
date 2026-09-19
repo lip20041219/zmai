@@ -1024,7 +1024,24 @@ class GitTool(Tool):
             output = r.stdout or ""
             if r.stderr:
                 output += f"\n[stderr]\n{r.stderr}"
-            result = ToolResult.ok(output=output[:5000], metadata={"exit_code": r.returncode})
+            # ── P1: 真实退出码进入统一 success/error 语义 ──
+            # 旧实现在这里无条件 ToolResult.ok(...)，只把 returncode 塞进 metadata。
+            # 而 metadata **不会**进入 ContextManager 的 tool_results entry
+            # （add_tool_result 没有该参数）→ git 的真实失败对 verifier 完全不可见，
+            # auto_generate_checks 可能让一条失败的 git 命令"验证通过"。
+            # 判据：非零退出码 **且 stderr 非空**。git 对真实错误一律写 stderr
+            # （fatal: / error:），而"否定结果"不写 —— `git grep` 无匹配、
+            # `git diff --exit-code` 有差异、`git commit` 无改动可提交都返回 1
+            # 但 stderr 为空，那些是正常结果而不是失败。按输出流区分，不做关键词匹配。
+            if r.returncode != 0 and (r.stderr or "").strip():
+                result = ToolResult.err(
+                    # ToolResult.err 会清空 output，原始输出必须折进 error 才不丢
+                    error=f"exit {r.returncode}: {output[:5000]}",
+                    metadata={"exit_code": r.returncode},
+                )
+            else:
+                result = ToolResult.ok(output=output[:5000],
+                                       metadata={"exit_code": r.returncode})
         except subprocess.TimeoutExpired:
             result = ToolResult.err(f"git timeout ({timeout}s)")
         except Exception as e:
