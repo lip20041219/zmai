@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -123,20 +124,72 @@ _WS_IGNORE_NAMES = frozenset({".coverage", ".DS_Store"})
 _READ_ONLY_TOOLS = frozenset({"read_file", "grep", "show_to_user", "open_in_browser"})
 
 
+def _explicit_workspace_root(context: AgentContext) -> Path | None:
+    """显式配置的工作区根；未配置时返回 None（此时 CWD 只是兜底，不代表项目范围）。"""
+    v = context.config.get("project_path") or context.workspace
+    return Path(v) if v else None
+
+
 def _workspace_root(context: AgentContext) -> Path:
     """工作区根目录 —— 与 ShellTool 的 cwd 保持同一套解析顺序，否则指纹会盯错目录。"""
-    return Path(context.config.get("project_path") or context.workspace or ".")
+    return _explicit_workspace_root(context) or Path(".")
 
 
-def _workspace_fingerprint(root: Path) -> dict[str, tuple[int, int]]:
+def _git_workspace_fingerprint(root: Path) -> dict[str, tuple[int, int]] | None:
+    """用 git 索引状态当工作区指纹（快路径）；非 git 仓库返回 None。
+
+    覆盖修改 / 新增 / 删除 / 重命名 / 回退：任一处变化都会改变 porcelain 输出，
+    因此与目录树指纹一样能回答"工作区实际有没有变"，但只读索引、不遍历目录树。
+    `-uall` 逐个列出未跟踪文件（而非折叠成目录），否则新建目录内的后续改动看不出来；
+    被 .gitignore 忽略的产物（__pycache__ 等）本就不该计入，天然被排除。
+    值统一为 (0, 0)：本指纹只参与相等比较，含义由 key（状态行）承载。
+    """
+    try:
+        r = subprocess.run(["git", "status", "--porcelain", "-uall"],
+                           cwd=str(root), capture_output=True, text=True,
+                           timeout=10, encoding="utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:      # 不是 git 仓库 / git 不可用
+        return None
+    # git 只告诉我们**哪些**文件变了；状态行本身不随内容再变（` M a.py` 改两次
+    # 仍是 ` M a.py`，未跟踪文件同理），因此对变更路径再取一次 (mtime_ns, size)。
+    # 只 stat 变更文件 → 代价与变更数成正比，而不是与仓库大小成正比。
+    fp: dict[str, tuple[int, int]] = {}
+    for ln in (r.stdout or "").splitlines():
+        if len(ln) < 4:
+            continue
+        path = ln[3:]
+        if " -> " in path:                      # rename/copy：取目标路径
+            path = path.split(" -> ", 1)[1]
+        path = path.strip().strip('"')
+        try:
+            st = (root / path).stat()
+            fp[f"git:{ln[:2]}:{path}"] = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            fp[f"git:{ln[:2]}:{path}"] = (-1, -1)   # 删除 / 不可读
+    return fp
+
+
+def _workspace_fingerprint(root: Path, *, prefer_git: bool = False,
+                           ) -> dict[str, tuple[int, int]]:
     """工作区代码文件的 (mtime_ns, size) 指纹。
 
     回答的是"这次工具调用**实际**有没有改动工作区"，而不是猜 shell 命令的意图
     （`python fix.py` 是不是写文件、`sed -i` 是不是改文件都无法从字符串可靠判断）。
 
-    ponytail: 每次工具调用后走一遍工作区目录树。SWE-bench 量级（数千文件、目录
-    剪枝后）是毫秒级；真成为瓶颈再换成 git status 快路径或增量 stat 缓存。
+    prefer_git：**没有显式配置工作区根**时启用。那种情况下 root 是 `Path(".")`
+    —— 它只是一个 cwd 兜底，不代表项目范围：实测 ZMAI 仓库根 30,672 文件、
+    单次遍历 13.7 秒，而每次工具调用都要走一遍。此时改用 git 索引快路径，
+    非 git 目录再退回目录树（正确性优先，不给 `_ws_changed` 造假值）。
+
+    ponytail: 有显式 root 时仍每次工具调用遍历目录树；SWE-bench 量级是毫秒级，
+    真成为瓶颈再对显式 root 也走 git 快路径或增量 stat 缓存。
     """
+    if prefer_git:
+        git_fp = _git_workspace_fingerprint(root)
+        if git_fp is not None:
+            return git_fp
     fp: dict[str, tuple[int, int]] = {}
     try:
         for dirpath, dirnames, filenames in os.walk(root):
@@ -450,8 +503,9 @@ class SWEAgent(Agent):
         # 必须在任何工具执行**之前**取基线，否则第一次工具调用造成的修改会被
         # 当成"没有前值可比较"而漏掉（`python fix.py` 只改一次就再没变化）。
         if "__ws_fingerprint__" not in context.metadata:
+            _explicit_root = _explicit_workspace_root(context)
             context.metadata["__ws_fingerprint__"] = _workspace_fingerprint(
-                _workspace_root(context)
+                _explicit_root or Path("."), prefer_git=_explicit_root is None,
             )
 
         # ── LoopGuard — 循环检测 ────────────────────────────────
@@ -812,7 +866,11 @@ class SWEAgent(Agent):
                 # 这里改为比对工作区指纹 —— 判断"实际有没有变"，而不是猜命令意图。
                 _ws_changed = False
                 if not _intercepted and tc.name not in _READ_ONLY_TOOLS:
-                    _fp = _workspace_fingerprint(_workspace_root(context))
+                    _explicit_root = _explicit_workspace_root(context)
+                    _fp = _workspace_fingerprint(
+                        _explicit_root or Path("."),
+                        prefer_git=_explicit_root is None,
+                    )
                     _prev_fp = context.metadata.get("__ws_fingerprint__")
                     _ws_changed = _prev_fp is not None and _fp != _prev_fp
                     context.metadata["__ws_fingerprint__"] = _fp
