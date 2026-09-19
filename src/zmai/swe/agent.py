@@ -462,26 +462,22 @@ class SWEAgent(Agent):
             completion = CompletionState()
             context.metadata["completion"] = completion
         # ── 硬终止（最高优先级，进入本步即先判）：完成状态已满足 → 立即 return，不再调用 backend ──
-        # eval 守卫优先：SWE-bench 模式下未修改代码不得因"现有测试全绿"完成。
-        if _eval_blocking_completion(context):
+        # eval 守卫：SWE-bench 模式下未修改代码不得因"现有测试全绿"完成。
+        # P0-2A：这里只**抑制完成**，不再直接 return cont —— 在 backend 之前拦截会让
+        # 模型永远拿不到决策机会（ever_modified 永远是 False → 条件自锁 → 空转到
+        # max_steps 后被报成 timeout）。拦截提示由 post-tool EvalGuard 与 completion
+        # guard 注入，那两处都在模型已经被咨询过之后。
+        _eval_blocks_completion = _eval_blocking_completion(context)
+        if _eval_blocks_completion:
             logger.info(
-                "[EvalGuard] Completion blocked: no code modification yet, "
-                "forcing fix before completing (%s, step %d)",
+                "[EvalGuard] Completion suppressed at step entry: no code modification yet "
+                "(%s, step %d) — continuing so the backend can act",
                 context.agent_id, context.step_count,
-            )
-            cm.add_message("user",
-                "[EvalGuard] 当前仓库的现有测试通过，但这不能证明任务已解决——"
-                "SWE-bench 的验证测试（FAIL_TO_PASS）不在当前仓库中，需要通过修改源码实现。\n"
-                "请仔细阅读任务描述定位 bug 根因，然后用 `edit` 或 `write_file` 修改源码。\n"
-                "修改后再运行测试验证。未修改任何源码前不得完成任务。"
-            )
-            context.metadata["messages"] = cm.get_context()
-            return AgentAction.cont(
-                output="EvalGuard: must make a code change before completing"
             )
 
         _green_once = context.metadata.get("test_success_count", 0) >= 1
-        if completion and (completion.should_complete() or _green_once):
+        if (not _eval_blocks_completion and completion
+                and (completion.should_complete() or _green_once)):
             logger.info(
                 "CompletionState satisfied — entering DONE (%s, step %d): %s",
                 context.agent_id, context.step_count, completion.summary(),
@@ -746,6 +742,12 @@ class SWEAgent(Agent):
                         # ── CompletionState: 任何修改使旧测试结果失效 ──
                         if completion:
                             completion.record_modification(step=context.step_count)
+                        # ── P0-2B: green 计数必须与 CompletionState 同步失效 ──
+                        # test_success_count 是 metadata 里的第二个真相源。不清零时，
+                        # `or _green_once` 旁路会让"全绿之后又改了代码"仍然判完成——
+                        # completion.should_complete() 已是 False，metadata["tests_passed"]
+                        # 却仍为 True，两个真相源互相矛盾。
+                        context.metadata["test_success_count"] = 0
                 else:
                     step_tool_fail += 1
                 # ── 测试运行检测（无论成败）──
@@ -864,6 +866,11 @@ class SWEAgent(Agent):
                                 step=context.step_count,
                                 scope_complete=_scope_complete,
                             )
+                        # ── P0-2B: green 计数只在 full_green 时累计，其余结果一律清零 ──
+                        # 失败 / partial_green 同样使"历史 green"失效，否则 `or _green_once`
+                        # 旁路可以在当前 verification 无效时宣布完成。
+                        if not (passed and _scope_complete):
+                            context.metadata["test_success_count"] = 0
                         if passed:
                             # 测试通过 → 退出修复态，清空失败后读取计数，进入"验证"阶段
                             test_failed = False
