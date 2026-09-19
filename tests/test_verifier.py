@@ -482,3 +482,66 @@ class TestVerificationEdgeCases:
         vr = VerificationResult(passed=False, checks=[check_pass, check_fail], summary="")
         assert len(vr.passed_checks) == 1
         assert vr.passed_checks[0].name == "p1"
+
+
+class TestVerifyTestOutputEvidenceOrder:
+    """判定优先级：真实 exit code > 结构化 pytest 计数 > 文本启发式。
+
+    修复前 `verify_test_output` 只接受输出文本，`passed = not failures and
+    has_passed_signal` —— 一次 **exit 0 的通过运行**只要输出里出现 `FAILED ` /
+    `Traceback` / `AssertionError`（测试名含失败词、被测代码自己打印的 traceback、
+    `-rA` 报告等）就会被判失败，属于"成功被判失败"。
+    """
+
+    # 1. exit 0 + 全部通过 → passed=True
+    def test_exit_zero_green_passes(self):
+        r = verify_test_output("2 passed in 0.05s\n", exit_code=0)
+        assert r.passed is True
+        assert r.error is None
+        assert "exit_code=0" in r.evidence
+
+    # 2. exit 1 + 测试失败 → passed=False
+    def test_exit_one_failure_fails(self):
+        r = verify_test_output("1 failed, 1 passed in 0.05s\n", exit_code=1)
+        assert r.passed is False
+        assert "exit code 1" in r.error
+
+    # 3. 输出文本包含 FAIL 但 exit 0 → 不得仅凭关键词判失败
+    def test_keyword_fail_with_exit_zero_is_not_failure(self):
+        out = ("FAILED test_failure_handling PASSED\n"
+               "Traceback (most recent call last):\n"
+               "AssertionError: expected\n"
+               "2 passed in 0.05s\n")
+        assert "FAILED " in out and "Traceback" in out      # 夹具确实含关键词
+        r = verify_test_output(out, exit_code=0)
+        assert r.passed is True, f"exit 0 + 汇总无失败不得被文本推翻: {r.error}"
+
+    # 4. exit code 与文本冲突 → 以结构化证据为准（双向）
+    def test_structured_evidence_wins_over_text(self):
+        # 4a. exit 0 但结构化汇总报失败 → 失败（不因"有 passed 字样"而通过）
+        r = verify_test_output("2 passed, 1 failed in 0.05s\n", exit_code=0)
+        assert r.passed is False
+        assert "summary reports 1 failed" in r.error
+
+        # 4b. exit 1 但文本里有 passed 字样 → 失败
+        r2 = verify_test_output("3 passed in 0.05s\n", exit_code=1)
+        assert r2.passed is False
+        assert "exit code 1" in r2.error
+
+    def test_exit_one_without_summary_still_fails(self):
+        r = verify_test_output("collection error\n", exit_code=1)
+        assert r.passed is False
+
+    def test_exit_zero_without_summary_requires_pass_signal(self):
+        """无结构化计数（如 --collect-only）→ 仍要求出现通过信号。"""
+        assert verify_test_output("3 tests collected in 0.02s\n",
+                                  exit_code=0).passed is False
+        r = verify_test_output("test session starts\n3 tests collected\n",
+                               exit_code=0)
+        assert r.passed is True
+
+    # 向后兼容：无 exit_code 的旧调用点保持原启发式
+    def test_without_exit_code_keeps_legacy_heuristic(self):
+        assert verify_test_output("2 passed in 0.05s\n").passed is True
+        assert verify_test_output("1 failed in 0.05s\n").passed is False
+        assert verify_test_output("").passed is False

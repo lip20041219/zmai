@@ -936,7 +936,10 @@ class SWEAgent(Agent):
                         )
                         # 失败时 output 为空、错误在 error 里；合并供 verify_test_output 判定
                         test_out = (result.output or "") + (result.error or "")
-                        passed = (exit_code == 0) and verify_test_output(test_out).passed
+                        # 真实退出码交给 verify_test_output 作权威判据：
+                        # exit 0 + 结构化汇总无失败 = 通过，输出里的普通文本
+                        # （测试名含失败词、被测代码打印的 traceback）不得推翻它。
+                        passed = verify_test_output(test_out, exit_code=exit_code).passed
                         # ── P0 基线测试数回退防护（防伪造成功）──
                         # 首次运行记录应运行的总测试数；后续"绿色"运行若实际执行
                         # 总数低于基线（测试被反选/删除/忽略，如 pyproject addopts

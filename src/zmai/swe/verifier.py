@@ -355,11 +355,19 @@ def classify_test_progress(
     return "no_progress"
 
 
-def verify_test_output(test_output: str) -> VerificationCheck:
+def verify_test_output(test_output: str, exit_code: int | None = None,
+                       ) -> VerificationCheck:
     """Test output verification.
 
-    Parses the test output string and checks for failure markers.
-    Supports common test framework output patterns.
+    判定优先级（有 exit_code 时）：**真实退出码 > 结构化 pytest 计数 > 文本启发式**。
+    文本关键词只有在拿不到任何结构化证据时才作为判定依据 —— 否则一次 exit 0 的
+    通过运行只要输出里出现 `FAILED ` / `Traceback` / `AssertionError`（测试名、
+    被测代码自己打印的 traceback、-rA 报告等）就会被判失败。
+
+    Args:
+        test_output: 命令输出（stdout+stderr 合并）。
+        exit_code: 测试命令的真实退出码。为 None 时退回纯文本启发式
+            （旧调用点 / 仅需文案场景），保持向后兼容。
     """
     import re
     text = strip_ansi(test_output)
@@ -411,9 +419,37 @@ def verify_test_output(test_output: str) -> VerificationCheck:
     ]
     has_passed_signal = any(s in lower for s in passed_signals)
 
-    passed = not failures and has_passed_signal
+    # ── 结构化证据（优先于文本）──
+    totals = parse_test_totals(text)
+    counted = totals["passed"] + totals["failed"] + totals["errors"]
+    counted_failed = totals["failed"] + totals["errors"]
+
+    if exit_code is None:
+        # 拿不到真实执行结果 → 退回文本启发式（旧调用点，兼容）
+        passed = not failures and has_passed_signal
+        reason = f"failure markers: {', '.join(failures[:3])}"
+    elif exit_code != 0:
+        # 真实退出码是权威
+        passed = False
+        reason = f"exit code {exit_code}"
+    elif counted_failed:
+        # exit 0 但结构化汇总报失败（如退出码被管道掩盖）→ 以计数为准
+        passed = False
+        reason = f"summary reports {totals['failed']} failed, {totals['errors']} errors"
+    elif counted:
+        # exit 0 + 汇总无失败 → 通过；文本关键词不得推翻真实执行结果
+        passed = True
+        reason = ""
+    else:
+        # 无结构化计数（如 --collect-only）→ 仍要求出现通过信号
+        passed = has_passed_signal
+        reason = "no structured test summary and no pass signal"
 
     evidence_parts = []
+    if exit_code is not None:
+        evidence_parts.append(f"exit_code={exit_code}")
+        evidence_parts.append(f"summary: {totals['passed']} passed, "
+                              f"{totals['failed']} failed, {totals['errors']} errors")
     if has_passed_signal:
         evidence_parts.append("Test pass signal detected")
     if failures:
@@ -427,7 +463,7 @@ def verify_test_output(test_output: str) -> VerificationCheck:
         passed=passed,
         target="",
         evidence="; ".join(evidence_parts) if evidence_parts else test_output[:100],
-        error=None if passed else f"Test result contains failures: {', '.join(failures[:3])}",
+        error=None if passed else f"Test result contains failures: {reason}",
     )
 
 
