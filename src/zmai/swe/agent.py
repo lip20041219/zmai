@@ -1494,6 +1494,31 @@ class SWEAgent(Agent):
                     pass
 
             if not vresult.passed:
+                # ── P1: 接入完成守卫的 text-only 预算 ──
+                # 这里原本直接 return cont：既没有局部上界，也不计入任何计数器，
+                # 而完成守卫（下方 _needs_retest/_needs_change 处）与 LoopGuard
+                # （只挂在 tool_calls 分支）都在这条 return 之后 —— 于是
+                #   text-only → 验证失败 → cont → text-only → …
+                # 可以一路烧到 max_steps，最终被 Runtime 标成 timeout。
+                # 之所以能一直失败：auto_generate_checks 对**成功**命令的输出做裸
+                # 关键词匹配（error/fail/traceback/cannot），一条输出里含 "fail"
+                # 字样的成功运行（如测试名 test_failure_handling）就产生永久失败
+                # 的 check，而 _tool_results 滑窗在纯文本循环里不会推进。
+                # 语义与完成守卫一致（模型只回文本、Agent 无法推进），因此共用同一
+                # 条预算，不新增平行计数器。
+                _blocks = context.metadata.get("completion_block_count", 0) + 1
+                context.metadata["completion_block_count"] = _blocks
+                if _blocks > MAX_COMPLETION_BLOCKS:
+                    # 不无限循环：与完成守卫同样的收敛策略 —— 明确失败，
+                    # 而不是耗尽 max_steps 伪装成 timeout。
+                    logger.warning(
+                        "Auto-verify blocked %d times with no progress — failing (%s)",
+                        _blocks - 1, context.agent_id,
+                    )
+                    return AgentAction.fail(
+                        error=(f"Verification blocked {_blocks - 1}x without progress: "
+                               f"{vresult.summary}")
+                    )
                 logger.info("Verification failed: %s", vresult.summary)
                 cm.add_message("user",
                     f"[Verification Results]\n{vresult.summary}\n"
