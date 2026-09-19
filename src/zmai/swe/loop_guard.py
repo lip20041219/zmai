@@ -217,9 +217,14 @@ class LoopGuard:
 
         # ── 检测代码修改 ─────────────────────────────────
         # 写工具（write_file/edit）按工具名认定：它们成功即必然改写了工作区
-        # （空 diff / 截断会被工具本身拒绝），因此不受 ws_changed 影响，语义不变。
-        # 其余工具（shell_exec / git）只能靠工作区证据区分读写两种用法。
-        if success and (name in self._WRITE_TOOLS or ws_changed):
+        # （空 diff / 截断会被工具本身拒绝），因此语义不变。
+        # 其余工具（shell_exec / git）靠工作区证据判定 —— 而 ws_changed 是
+        # **工作区的真实事实**，与"命令是否成功"无关，因此不受 success 约束：
+        # `git stash pop` 冲突、`git checkout` 部分失败、shell 改完文件才返回非零，
+        # 都是"执行失败但确实推进了工作区"。progress 应由 workspace evidence 决定，
+        # 而不是由工具的 success 位决定（否则这些真实修改不被记录，
+        # _steps_without_change 会继续累加，把已经发生的进展当成停滞）。
+        if (success and name in self._WRITE_TOOLS) or ws_changed:
             self._record_modification()
 
     def record_no_modification(self) -> None:

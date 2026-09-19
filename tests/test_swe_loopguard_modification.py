@@ -251,15 +251,59 @@ def test_record_tool_call_ws_changed_semantics():
         "git 已不在 _WRITE_TOOLS 中，旧调用点也不得再重置"
     )
 
-    # 失败调用即使 ws_changed=True 也不算修改（工具没成功）
+    # 失败调用 + 工作区确实变了 → 必须记录 modification（progress 由工作区证据决定，
+    # 不由工具的 success 位决定）：`git stash pop` 冲突、`git checkout` 部分失败、
+    # shell 改完文件才返回非零，都是"执行失败但真实推进了工作区"。
     g5 = LoopGuard(threshold=3)
     g5.record_no_modification()
     g5.record_tool_call(name="shell_exec", params={"command": "x"}, success=False,
                         ws_changed=True)
-    assert g5.get_status()["steps_without_change"] == 1
+    assert g5.get_status()["steps_without_change"] == 0, (
+        "失败但工作区真变了，必须算 modification"
+    )
+    assert g5.get_status()["last_modification_step"] == 1
+
+    # 失败调用 + 工作区没变 → 不记录
+    g6 = LoopGuard(threshold=3)
+    g6.record_no_modification()
+    g6.record_tool_call(name="shell_exec", params={"command": "x"}, success=False,
+                        ws_changed=False)
+    assert g6.get_status()["steps_without_change"] == 1
 
 
 def test_git_removed_from_write_tools():
     """_WRITE_TOOLS 不再包含 git（只读/写无法按名字区分）。"""
     assert "git" not in LoopGuard._WRITE_TOOLS
     assert LoopGuard._WRITE_TOOLS == frozenset({"write_file", "edit"})
+
+
+# ── G：失败但真实修改了工作区 → 进度必须恢复（no-change guard 不误判停滞）──
+def _mutating_fail(tag: str) -> ToolCall:
+    """改文件后 exit 1：典型的"执行失败但产生真实 mutation"。
+
+    错误文本带上不同的 tag，避免命中 identical_failures（那条判定按错误文本聚类）。
+    """
+    return _sh(f"python -c \"import sys; open('app.py','a').write('# {tag}'); "
+               f"sys.stderr.write('boom-{tag}'); sys.exit(1)\"")
+
+
+def test_failed_command_that_mutates_workspace_counts_as_progress(tmp_path):
+    """shell 改了文件后返回非零：真实 Runtime 下不得被当成"无修改"。
+
+    每条命令都不同，避免命中 identical_failures（那是另一条既有判定），
+    从而本用例只考察 no_progress 维度。
+    """
+    ctx, guard, blocks = _run(
+        tmp_path,
+        [[_mutating_fail("a")], [_mutating_fail("b")], [_mutating_fail("c")]],
+        max_steps=3,
+    )
+
+    assert ctx.metadata.get("ever_modified") is True, "工作区真实变化必须被 Agent 检测到"
+    assert guard.get_status()["last_modification_step"] >= 1, (
+        "失败但改了工作区，必须记录为 modification（修复前恒为 -1）"
+    )
+    assert guard.get_status()["steps_without_change"] == 0, (
+        "真实修改后无修改计数必须归零"
+    )
+    assert blocks == 0, f"有真实进展时不得触发 no-change guard: {blocks}"

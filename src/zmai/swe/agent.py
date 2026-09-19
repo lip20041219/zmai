@@ -874,6 +874,20 @@ class SWEAgent(Agent):
                     _prev_fp = context.metadata.get("__ws_fingerprint__")
                     _ws_changed = _prev_fp is not None and _fp != _prev_fp
                     context.metadata["__ws_fingerprint__"] = _fp
+                # ── 修改证据独立于工具 success ──
+                # 判据是"工作区**实际**有没有变"（工作区指纹），而不是"命令是否返回 0"。
+                # `git stash pop` 冲突、`git checkout` 部分失败、shell 改完文件才返回
+                # 非零 —— 都是执行失败但真实推进了工作区。若把修改证据挂在 success 上：
+                #   * 旧 green 不会失效（P0-2 语义被绕过）；
+                #   * 步末仍会 guard.record_no_modification() 累加无修改计数，
+                #     把已经发生的进展当成停滞（LoopGuard 侧记录了也没用）。
+                # 失败的调用不解除 FixDriving 的强制修改要求（force_edit 等仍按成功处理）。
+                if _ws_changed and not result.success:
+                    had_modification = True
+                    context.metadata["ever_modified"] = True
+                    if completion:
+                        completion.record_modification(step=context.step_count)
+                    context.metadata["test_success_count"] = 0
                 if result.success:
                     step_tool_ok += 1
                     # 只有真正改写工作区代码的调用才算"修改证据"。git status/diff/log
