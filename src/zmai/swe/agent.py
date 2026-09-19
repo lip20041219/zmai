@@ -1114,6 +1114,10 @@ class SWEAgent(Agent):
                         success=result.success,
                         output=result.output or "",
                         error=result.error,
+                        # P1: 复用 P1-3 已算出的工作区证据 —— 只看工具名无法区分
+                        # git status（只读）与 git checkout（写），也让 shell 的
+                        # 真实修改能被 LoopGuard 记录。
+                        ws_changed=_ws_changed,
                     )
                 # ── 修复效率统计（供审计，不改变行为）──
                 _stats(context, total_calls=1)

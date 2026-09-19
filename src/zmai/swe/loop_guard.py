@@ -128,9 +128,12 @@ class LoopGuard:
             guard.reset()
     """
 
-    # ── 写操作工具 ──────────────────────────────────────────
-
-    _WRITE_TOOLS = frozenset({"write_file", "edit", "git"})
+    # ── 写操作工具（按工具名即可断定"必然改写工作区"）────────
+    # 这里**不含 git**：git status/diff/log 是只读的，git checkout/restore 才写，
+    # 只看工具名无法区分。曾因把 "git" 计为写操作，任何一条只读 git 命令都会
+    # 重置 _steps_without_change，使 no-change guard 永远无法触发（每步
+    # "git status" 即可无限续命）。git 是否产生修改改由 ws_changed 证据判定。
+    _WRITE_TOOLS = frozenset({"write_file", "edit"})
 
     def __init__(self, threshold: int = LOOP_THRESHOLD) -> None:
         self._threshold = threshold
@@ -163,6 +166,7 @@ class LoopGuard:
         success: bool,
         output: str = "",
         error: str | None = None,
+        ws_changed: bool | None = None,
     ) -> None:
         """记录一次工具调用。
 
@@ -170,7 +174,14 @@ class LoopGuard:
         自动更新：
           - 连续相同调用计数
           - 连续相同失败计数
-          - 无修改计数（写工具成功时重置）
+          - 无修改计数（写工具成功、或工作区确实发生变化时重置）
+
+        Args:
+            ws_changed: Agent 用工作区指纹算出的**真实**修改证据（P1-3）。
+                True  → 成功调用且工作区确实变了（含 shell 改文件、git checkout）
+                False → 成功调用但没有改动工作区（含只读 git status/diff/log）
+                None  → 未提供（旧调用点）→ 退回按工具名判断，保持兼容。
+                工作区证据优先于工具名：只看名字无法区分 git 的读写两种用法。
         """
         sig = _tool_call_signature(name, params)
         entry = {
@@ -205,7 +216,10 @@ class LoopGuard:
             self._last_failure_sig = ""
 
         # ── 检测代码修改 ─────────────────────────────────
-        if success and name in self._WRITE_TOOLS:
+        # 写工具（write_file/edit）按工具名认定：它们成功即必然改写了工作区
+        # （空 diff / 截断会被工具本身拒绝），因此不受 ws_changed 影响，语义不变。
+        # 其余工具（shell_exec / git）只能靠工作区证据区分读写两种用法。
+        if success and (name in self._WRITE_TOOLS or ws_changed):
             self._record_modification()
 
     def record_no_modification(self) -> None:
