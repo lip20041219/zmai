@@ -1054,7 +1054,26 @@ class SWEAgent(Agent):
                             )
                             _stats(context, test_guard_triggered=1)
                             _scope_complete = False
-                        if completion:
+                        # ── P0: 零测试计数 = 无证据，不得作为完成依据 ──
+                        # verifier 的"exit 0 + 通过信号"对**没跑测试**的命令同样成立：
+                        # `pytest --collect-only` 打印 session 头；`pytest --help` /
+                        # `pip install pytest` 的输出含裸子串 "ok"。三者 exit 0、计数为 0。
+                        # 照旧走 green 会让 tests_passed/tests_complete 同时置真 —— 用一条
+                        # 没跑测试的命令换到"完整套件全绿"资格，绕过 P0 门禁。
+                        # 零计数既不是 green（没验证任何东西）也不是 failure（没有失败证据），
+                        # 因此两个分支都不进，只要求补一次能产出计数的完整套件运行。
+                        _no_test_evidence = _total_tests == 0
+                        if _no_test_evidence:
+                            context.metadata["test_scope_incomplete"] = True
+                            context.metadata["required_next_action"] = "run_full_test_suite"
+                            cm.add_message("user",
+                                "[NO_TEST_EVIDENCE] 本次测试运行没有执行任何测试"
+                                "（解析不出 passed/failed/error 计数）。exit 0、输出里出现"
+                                "通过字样，都不构成测试通过的证据。\n"
+                                "下一步必须运行完整测试套件取得结构化计数："
+                                "python -m pytest -q"
+                            )
+                        if completion and not _no_test_evidence:
                             completion.record_test_result(
                                 exit_code=exit_code,
                                 passed=passed,
@@ -1064,9 +1083,9 @@ class SWEAgent(Agent):
                         # ── P0-2B: green 计数只在 full_green 时累计，其余结果一律清零 ──
                         # 失败 / partial_green 同样使"历史 green"失效，否则 `or _green_once`
                         # 旁路可以在当前 verification 无效时宣布完成。
-                        if not (passed and _scope_complete):
+                        if not _no_test_evidence and not (passed and _scope_complete):
                             context.metadata["test_success_count"] = 0
-                        if passed:
+                        if passed and not _no_test_evidence:
                             # 测试通过 → 退出修复态，清空失败后读取计数，进入"验证"阶段
                             test_failed = False
                             reads_after_fail = 0
@@ -1106,7 +1125,7 @@ class SWEAgent(Agent):
                                     "下一步必须运行完整测试套件：python -m pytest -q\n"
                                     "只有完整测试数量达到基线且全部通过后才能完成任务。"
                                 )
-                        else:
+                        elif not _no_test_evidence:
                             # 测试失败 → 进入修复态：强制后续进入修改阶段
                             if not test_failed:
                                 # 首次进入修复态才清零读数。若每次失败 pytest 都清零，

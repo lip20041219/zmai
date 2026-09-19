@@ -213,6 +213,36 @@ def test_zero_evidence_text_only_cannot_complete(tmp_path):
     assert "python -m pytest" in _messages_text(ctx), "应明确要求先跑测试取得证据"
 
 
+# ── G：零测试计数的"成功"命令不得被当作测试通过证据 ─────────────
+def _shell(cmd: str) -> ToolCall:
+    return ToolCall(id=cmd, name="shell_exec", params={"command": cmd})
+
+
+def test_collect_only_cannot_complete(tmp_path):
+    """`pytest --collect-only` 打印 "test session starts" 头 → verifier 判"通过"，
+    但一个测试都没跑（计数为 0）。照旧记 green 会让 tests_complete 置真 ——
+    用一条没跑测试的命令换到完成资格，绕过"正向证据才能完成"的门禁。
+    """
+    ctx, actions = _run(tmp_path, [[_shell("python -m pytest --collect-only")], TEXT],
+                        max_steps=8)
+
+    assert actions[-1] != "complete", f"零测试计数不得完成: {actions}"
+    comp = ctx.metadata["completion"]
+    assert comp.tests_complete is False and comp.tests_passed is False
+    assert ctx.metadata.get("test_success_count", 0) == 0
+    assert "python -m pytest -q" in _messages_text(ctx), "应要求跑完整套件取得计数"
+
+
+def test_pytest_help_cannot_complete(tmp_path):
+    """`pytest --help` 输出含裸子串 "ok" → verifier 同样判"通过"，计数仍为 0。"""
+    ctx, actions = _run(tmp_path, [[_shell("python -m pytest --help")], TEXT],
+                        max_steps=8)
+
+    assert actions[-1] != "complete", f"零测试计数不得完成: {actions}"
+    assert ctx.metadata["completion"].tests_complete is False
+    assert ctx.metadata.get("test_success_count", 0) == 0
+
+
 def test_green_evidence_still_completes(tmp_path):
     """反向护栏：真的跑出完整套件全绿后，纯文本仍应正常完成。"""
     ctx, actions = _run(tmp_path, [[_pytest()], TEXT], max_steps=6)
