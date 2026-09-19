@@ -1537,8 +1537,22 @@ class SWEAgent(Agent):
         #   a) 从未全绿（tests_passed=False）
         #   b) partial_green：子集通过但未达基线（tests_passed=True, tests_complete=False）
         _tests_failed_ever = context.metadata.get("tests_ever_failed", False)
-        _needs_retest = bool(_tests_failed_ever and completion
-                             and not completion.tests_complete)
+        # ── P1-4: 改过代码就必须有一次"修改之后的有效全绿验证" ──
+        # 原判据只认"测试曾经失败"，于是"改过代码但测试从未失败"没有任何门禁：
+        # 改完直接回纯文本即可 complete —— 无论是从未跑过测试，还是只跑了子集
+        # （partial_green），都不是有效验证。
+        # completion.tests_complete 已经准确表达"存在一次未被后续修改作废的完整
+        # 套件全绿"（record_modification / 失败 / partial_green 都会把它置 False），
+        # 直接复用，不新增第二套 completion 真相源。
+        # 作用域限定在**项目本身有测试**的任务（测试即验收标准）；无测试的项目
+        # 保持既有行为，不会被这条新门禁永久卡住。
+        _repo_info = context.metadata.get("repo_info")
+        _has_tests = bool(getattr(_repo_info, "test_files", None))
+        _needs_retest = bool(
+            completion and not completion.tests_complete
+            and (_tests_failed_ever
+                 or (_has_tests and context.metadata.get("ever_modified")))
+        )
         # ── SWE eval 守卫：纯文本响应同样不得在零修改时完成 ──
         # 该守卫原先只在 `if response.tool_calls:` 分支内生效，模型只要只回文本就能
         # 绕过 FixDriving / force_edit / LoopGuard 全部机制直接 complete
