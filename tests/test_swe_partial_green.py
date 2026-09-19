@@ -53,6 +53,12 @@ def _pytest(file: str) -> ToolCall:
                     params={"command": f"python -m pytest {file} -q"})
 
 
+def _bare() -> ToolCall:
+    """未指定测试目标 → 唯一能"证明"覆盖完整套件的运行方式。"""
+    return ToolCall(id="pt_bare", name="shell_exec",
+                    params={"command": "python -m pytest -q"})
+
+
 def _fix() -> ToolCall:
     return ToolCall(id="fix", name="edit",
                     params={"path": "bug.py", "mode": "regex_replace",
@@ -85,8 +91,8 @@ class _ScriptedBackend(Backend):
         return {BackendCapability.TOOL_USE}
 
 
-async def _run(tmp_path: Path, script, max_steps: int = 8):
-    _write_project(tmp_path)
+async def _run(tmp_path: Path, script, max_steps: int = 8, project=_write_project):
+    project(tmp_path)
     backend = _ScriptedBackend(script)
     agent = SWEAgent("pg")
     ctx = AgentContext(
@@ -335,3 +341,99 @@ def test_loopguard_blocks_repeated_subset(tmp_path):
     assert recovery, "重复子集测试应触发 scope-aware LoopRecovery"
     assert ctx.metadata.get("required_next_action") == "run_full_test_suite"
     assert action.type != "complete", "子集未达基线不得 complete"
+
+
+# ══════════════════════════════════════════════════════════════════
+# P1-2：首次子集测试锁定过小 baseline → 子集全绿即判定完成
+# ══════════════════════════════════════════════════════════════════
+# 复现：模型改完代码，**第一次**测试运行就是子集（`pytest -q test_a.py`，1/1 通过）。
+# 修复前 baseline 被直接锁成 1，_scope_complete 保持 True → full_green → complete，
+# 而项目里另外 2 个测试从未运行（且实际失败）。
+# 目标语义：baseline 是"完整套件有多少测试"的断言，只有失败的诊断运行、或未指定
+# 测试目标的裸运行才有资格建立它。
+
+
+def _write_scope_project(tmp_path: Path) -> None:
+    """完整套件 3 个测试全绿；test_sub.py 是其中 1 个测试的子集。"""
+    (tmp_path / "bug.py").write_text("FIXED = True\n", encoding="utf-8")
+    (tmp_path / "test_g.py").write_text(
+        "def test_g1():\n    assert True\n\n\ndef test_g2():\n    assert True\n",
+        encoding="utf-8")
+    (tmp_path / "test_sub.py").write_text(
+        "def test_sub():\n    assert True\n", encoding="utf-8")
+
+
+def test_full_scope_command_detection():
+    """裸运行（无测试目标）才是可证明的完整套件。"""
+    from zmai.swe.agent import _is_full_scope_test_command as full
+
+    assert full("python -m pytest -q")
+    assert full("pytest")
+    assert full("python -m pytest")
+    # discover 是子命令，跑的就是全套件
+    assert full("python -m unittest discover")
+    # 显式指定目标 = 子集
+    assert not full("python -m pytest -q test_a.py")
+    assert not full("python -m pytest test_all.py -q")
+    assert not full("pytest tests/")
+    # -k/-m 选择器无法证明覆盖完整套件 → 同样按子集处理（会提示跑完整套件）
+    assert not full("python -m pytest -k foo")
+
+
+def test_first_green_subset_does_not_lock_baseline(tmp_path):
+    """首次运行就是子集全绿（7/7 passed）→ 不得锁定 baseline，更不得 complete。"""
+    script = [
+        [_fix()],                  # 先产生修改（解除 eval 守卫）
+        [_pytest("test_app.py")],  # **首次**测试运行：子集 7 全绿
+        [_pytest("test_app.py")],  # 再跑一次子集，仍不得 complete
+        None,
+    ]
+    ctx, actions = asyncio.run(_run(tmp_path, script))
+
+    assert "complete" not in actions, f"子集全绿不得 complete: {actions}"
+    assert ctx.metadata.get("baseline_test_count") is None, (
+        "首次即子集全绿，不得用 7 锁定完整 baseline"
+    )
+    assert ctx.metadata.get("test_scope_incomplete") is True
+    assert ctx.metadata.get("test_success_count", 0) == 0
+    # completion state 本身必须是 False —— 不只是 baseline 为 None
+    comp: CompletionState = ctx.metadata["completion"]
+    assert comp.tests_complete is False
+    assert comp.should_complete() is False
+    assert "[TEST_SCOPE_INCOMPLETE]" in _messages_text(ctx)
+
+
+def test_first_green_full_suite_establishes_baseline(tmp_path):
+    """首次运行的是完整套件且全绿 → 正常建立 baseline 并 complete（既有行为不变）。"""
+    script = [
+        [_fix()],
+        [_bare()],   # 首次测试运行 = 完整套件（3 passed）
+        None,
+    ]
+    ctx, actions = asyncio.run(_run(tmp_path, script, project=_write_scope_project))
+
+    assert actions[-1] == "complete", f"完整套件全绿应 complete: {actions}"
+    assert ctx.metadata["baseline_test_count"] == 3
+    assert ctx.metadata["test_success_count"] == 1
+    assert ctx.metadata.get("test_scope_incomplete") is False
+
+
+def test_subset_green_then_full_suite_green_completes(tmp_path):
+    """子集全绿不 complete；随后完整套件全绿才拿到 completion 资格。"""
+    script = [
+        [_fix()],
+        [_pytest("test_sub.py")],  # 子集 1/1 passed → partial，不建立 baseline
+        [_bare()],                 # 完整套件 3 passed → 建立 baseline=3 → full_green
+        None,
+    ]
+    ctx, actions = asyncio.run(_run(tmp_path, script, project=_write_scope_project))
+
+    # 子集全绿那一步不得 complete
+    assert actions[1] != "complete", f"子集全绿不应 complete: {actions}"
+    # 完整套件全绿才 complete
+    assert actions[-1] == "complete", f"完整全绿应 complete: {actions}"
+    assert ctx.metadata["baseline_test_count"] == 3
+    assert ctx.metadata["test_success_count"] == 1
+    comp: CompletionState = ctx.metadata["completion"]
+    assert comp.should_complete() is True
+    assert comp.tests_complete is True

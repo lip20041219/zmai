@@ -42,7 +42,10 @@ class EverLoopsBackend(Backend):
             content="re-running tests",
             tool_calls=[ToolCall(
                 id=f"c{self.calls}", name="shell_exec",
-                params={"command": "python -m pytest test_pass.py -q"},
+                # P1-2：带测试目标的运行无法证明覆盖完整套件，不再作为完成依据。
+                # 本测试验证的是"已绿后短路、不再调用 backend"，与跑哪套测试无关，
+                # 因此改用仓库自身的完整套件命令。
+                params={"command": "python -m pytest -q"},
             )],
             usage=TokenUsage(input_tokens=10, output_tokens=5),
             stop_reason="tool_use",

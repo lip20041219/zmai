@@ -102,6 +102,28 @@ def _fmt_test_totals(t: dict[str, int]) -> str:
     return s
 
 
+# 测试运行器的子命令（不是测试目标）。`python -m unittest discover` 跑的是全套件。
+_RUNNER_SUBCOMMANDS = {"discover"}
+
+
+def _is_full_scope_test_command(command: str) -> bool:
+    """测试命令是否**可证明**覆盖整个套件（未显式指定测试目标）。
+
+    `python -m pytest -q`            → True（跑项目配置的全部测试）
+    `python -m pytest -q test_a.py`  → False（只跑指定目标，是子集）
+
+    只认"完全没有非选项参数"这一种证明方式。`-k` / `-m` 这类带参数的选择器因此
+    也会被判为子集——它们确实无法证明覆盖完整套件，被提示去跑完整套件是正确方向，
+    不是误判。找不到运行器时返回 True（保守：保持既有行为）。
+    """
+    tokens = command.split()
+    for i, tok in enumerate(tokens):
+        if "pytest" in tok or "unittest" in tok or "nosetests" in tok:
+            return not [t for t in tokens[i + 1:]
+                        if not t.startswith("-") and t not in _RUNNER_SUBCOMMANDS]
+    return True
+
+
 def _log_stop() -> None:
     """打印任务完成/停止循环的显式日志（自主停止的可审计信号）。"""
     logger.info("[ZMAI] Task completed.")
@@ -862,10 +884,22 @@ class SWEAgent(Agent):
                         _baseline = context.metadata.get("baseline_test_count")
                         # partial_green：子集全绿但未覆盖完整基线。
                         # 它不是 failed，但也不能算 full_green / complete。
+                        # ── P1-2: 首次"全绿"运行不得自证 baseline ──
+                        # baseline 是"完整套件有多少测试"的断言，只有两种运行有资格
+                        # 建立它：失败的运行（诊断运行，暴露了套件真实规模），或未指定
+                        # 测试目标的运行（裸 `pytest -q`，跑的就是全套件）。
+                        # 首次就"子集 + 全绿"两者都不满足：它既没暴露别的测试、也没
+                        # 覆盖它们。照旧锁成 baseline，等于用"我只跑了这 1 个且它通过
+                        # 了"自证整个套件只有 1 个测试 → 直接拿到 completion 资格。
+                        _full_scope_cmd = _is_full_scope_test_command(_cmd_l)
                         _scope_complete = True
                         if _baseline is None:
-                            if _total_tests > 0:
+                            if _total_tests > 0 and (not passed or _full_scope_cmd):
                                 context.metadata["baseline_test_count"] = _total_tests
+                            elif _total_tests > 0:
+                                # 首次即子集全绿：不锁定 baseline，本次也不算 full_green。
+                                # 下一轮由 partial_green 分支提示跑完整套件，届时再建立基线。
+                                _scope_complete = False
                         elif passed and _baseline > 0 and _total_tests < _baseline:
                             logger.warning(
                                 "TestGuard: test count %d < baseline %d — "
@@ -912,9 +946,16 @@ class SWEAgent(Agent):
                                 context.metadata["tests_passed"] = False
                                 context.metadata["required_next_action"] = "run_full_test_suite"
                                 cm.add_message("user",
-                                    "[TEST_SCOPE_INCOMPLETE] 当前测试运行通过，但只执行了 "
-                                    f"{_total_tests}/{_baseline} 个测试（未覆盖完整基线套件）。\n"
-                                    "本次结果不能作为最终完成验证。\n"
+                                    "[TEST_SCOPE_INCOMPLETE] 当前测试运行通过，但"
+                                    + (
+                                        f"只执行了 {_total_tests}/{_baseline} 个测试"
+                                        "（未覆盖完整基线套件）。\n"
+                                        if _baseline else
+                                        f"只执行了 {_total_tests} 个测试，且尚未建立完整"
+                                        "基线——首次运行就是子集，无法证明已覆盖整个测试"
+                                        "套件。\n"
+                                    )
+                                    + "本次结果不能作为最终完成验证。\n"
                                     "不要继续随机读取、修改文件或重复运行同一个子集。\n"
                                     "下一步必须运行完整测试套件：python -m pytest -q\n"
                                     "只有完整测试数量达到基线且全部通过后才能完成任务。"
