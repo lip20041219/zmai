@@ -1650,12 +1650,19 @@ class SWEAgent(Agent):
         # 直接复用，不新增第二套 completion 真相源。
         # 作用域限定在**项目本身有测试**的任务（测试即验收标准）；无测试的项目
         # 保持既有行为，不会被这条新门禁永久卡住。
+        # ── P0: 有测试的项目必须以"正向证据"为准，而不是"三个门禁都没触发" ──
+        # 此前判据是 `_tests_failed_ever or (有测试 and 改过代码)`：只要模型零修改、
+        # 零测试，`_needs_retest`/`_needs_change` 全为假、`_auto_verify` 又因无工具
+        # 结果返回 None —— 于是"没改、没测、没失败"的纯文本响应直接 complete，
+        # Runtime 手上没有任何独立证据（模型说完成即完成）。
+        # 项目本身有测试时，唯一的正向证据就是 completion.tests_complete
+        # ——"存在一次未被后续修改作废的完整套件全绿"。直接复用它，不新增状态。
+        # 无测试的项目不受约束（测试不是它的验收标准）。
         _repo_info = context.metadata.get("repo_info")
         _has_tests = bool(getattr(_repo_info, "test_files", None))
         _needs_retest = bool(
             completion and not completion.tests_complete
-            and (_tests_failed_ever
-                 or (_has_tests and context.metadata.get("ever_modified")))
+            and (_has_tests or _tests_failed_ever)
         )
         # ── SWE eval 守卫：纯文本响应同样不得在零修改时完成 ──
         # 该守卫原先只在 `if response.tool_calls:` 分支内生效，模型只要只回文本就能

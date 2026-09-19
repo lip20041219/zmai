@@ -197,12 +197,28 @@ def test_green_then_edit_same_step_then_text_only_cannot_complete(tmp_path):
 
 
 # ── F：零修改 + 非 eval 的既有语义不回归 ────────────────────────
-def test_zero_modification_text_only_preserves_behavior(tmp_path):
-    """零修改、测试从未失败：保持既有行为（本 P1 不改变这条路径）。"""
-    ctx, actions = _run(tmp_path, [TEXT])
+def test_zero_evidence_text_only_cannot_complete(tmp_path):
+    """项目**有测试**，模型零修改、零测试、零失败却声称完成 → 不得 complete。
 
-    assert actions[-1] == "complete", f"零修改的既有语义不得改变: {actions}"
-    assert ctx.metadata.get("ever_modified") is not True
+    这条路径此前是零证据完成：`_needs_retest` 需要"改过代码或失败过"才为真，
+    `_needs_change` 只在 eval 模式生效，`_auto_verify` 因无工具结果返回 None ——
+    三个门禁全不触发，`AgentAction.complete` 直接放行，Runtime 没有任何独立证据。
+    有测试的项目必须以"存在有效的完整套件全绿"这一正向证据为准。
+    """
+    ctx, actions = _run(tmp_path, [TEXT], max_steps=8)
+
+    assert actions[-1] != "complete", f"零证据不得完成: {actions}"
+    assert ctx.metadata.get("ever_modified") is not True, "本用例前提：零修改"
+    assert ctx.metadata["completion"].tests_complete is False, "没有任何有效全绿"
+    assert "python -m pytest" in _messages_text(ctx), "应明确要求先跑测试取得证据"
+
+
+def test_green_evidence_still_completes(tmp_path):
+    """反向护栏：真的跑出完整套件全绿后，纯文本仍应正常完成。"""
+    ctx, actions = _run(tmp_path, [[_pytest()], TEXT], max_steps=6)
+
+    assert actions[-1] == "complete", f"有全绿证据应可完成: {actions}"
+    assert ctx.metadata["completion"].tests_complete is True
 
 
 # ── 作用域护栏：无测试的项目不得被新门禁卡死 ────────────────────
