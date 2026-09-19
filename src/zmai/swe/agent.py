@@ -787,10 +787,25 @@ class SWEAgent(Agent):
                         # 无计数的运行（collection/import error）同样参与比较，只是
                         # 不刷新基线 —— "上一轮还能跑出 1 passed/3 failed，本轮一个测试
                         # 都没跑起来"是最严重的退化，漏掉它等于对灾难性回退保持沉默。
-                        _prev_totals = context.metadata.get("last_test_totals")
+                        # ── P1-1: totals 只在同一测试命令（同一测试范围）内可比 ──
+                        # 计数下降只有在"跑的还是同一套测试"时才等于退化。换了一套
+                        # 测试再比总数，比较的是两个不同的测试集合。反例：模型未做
+                        # 任何修改，`pytest test_fail.py`（0 passed, 1 failed）之后跑
+                        # `pytest broken/` 撞上 collection error，被读成"测试整个消失"
+                        # → 假 regression + [Recovery] + needs_revert/force_edit。
+                        # ponytail: 用命令的 token 集合做 scope 身份，免解析、够用；
+                        # 若要容忍 -q 增删或 pytest vs python -m pytest 的改写，
+                        # 再提取 pytest 的目标参数作为 key。
+                        _scope = " ".join(sorted(_cmd_l.split()))
+                        _prev_totals = (
+                            context.metadata.get("last_test_totals")
+                            if context.metadata.get("last_test_scope") == _scope
+                            else None
+                        )
                         _verdict = classify_test_progress(_prev_totals, _totals)
                         if _totals["passed"] + _totals["failed"] > 0:
                             context.metadata["last_test_totals"] = dict(_totals)
+                            context.metadata["last_test_scope"] = _scope
                             # 测试重新被收集起来 → 已从"改坏"状态恢复
                             context.metadata.pop("needs_revert", None)
                         # 计数正常的运行照旧记录（含首次 "first"）；无计数的运行只在

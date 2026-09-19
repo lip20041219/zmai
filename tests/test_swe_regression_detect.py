@@ -176,8 +176,9 @@ def _messages_text(ctx: AgentContext) -> str:
     )
 
 
-def _run(tmp_path: Path, script, max_steps: int = 6, extra_config: dict | None = None):
-    _write_project(tmp_path)
+def _run(tmp_path: Path, script, max_steps: int = 6, extra_config: dict | None = None,
+         project=_write_project):
+    project(tmp_path)
     backend = _ScriptedBackend(script)
     agent = SWEAgent("reg")
     ctx = AgentContext(
@@ -507,3 +508,112 @@ def test_revert_after_breaking_edit_restores_diagnosable_state(tmp_path):
     assert ctx.metadata["test_progress"] != "regression"
     assert ctx.metadata["last_test_totals"]["passed"] == 1
     assert ctx.metadata["last_test_totals"]["failed"] == 1
+
+
+# ══════════════════════════════════════════════════════════════════
+# P1-1：不同测试命令共用 last_test_totals → 假 Regression
+# ══════════════════════════════════════════════════════════════════
+# 复现：`pytest test_fail.py` 记下 0 passed/1 failed，随后**模型未做任何修改**，
+# 跑 `pytest broken/` 撞上 collection error。两套测试范围互不相干，却因为共用一份
+# last_test_totals 被读成"测试整个消失"→ 假 [Regression] + [Recovery] +
+# needs_revert + force_edit。totals 只在同一测试范围内可比。
+
+
+def _write_cross_project(tmp_path: Path) -> None:
+    """两个互不相干的测试范围：test_fail.py（1 failed）与 broken/（无法 import）。"""
+    (tmp_path / "test_fail.py").write_text(
+        "def test_never():\n    assert False\n", encoding="utf-8")
+    (tmp_path / "broken").mkdir()
+    (tmp_path / "broken" / "test_broken.py").write_text(
+        "import module_that_does_not_exist\n", encoding="utf-8")
+
+
+def _write_recovery_project(tmp_path: Path) -> None:
+    """初始 0 passed / 1 failed；一次正确修改即可转绿。"""
+    (tmp_path / "bug.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "test_one.py").write_text(
+        "import bug\n\n\ndef test_v():\n    assert bug.VALUE == 2\n",
+        encoding="utf-8")
+
+
+def _good_edit() -> ToolCall:
+    """把 VALUE 从 1 改成 2：test_one 由失败转通过 → progress。"""
+    return ToolCall(id="good", name="edit",
+                    params={"path": "bug.py", "mode": "regex_replace",
+                            "old_text": "VALUE = 1", "new_text": "VALUE = 2"})
+
+
+def _cmd(command: str) -> ToolCall:
+    return ToolCall(id=command, name="shell_exec", params={"command": command})
+
+
+# ── P1-1 Test 1（= Test 4 真实 Runtime 复现）：跨命令不得凭计数判 Regression ──
+def test_cross_command_run_is_not_regression(tmp_path):
+    """不同测试命令之间不得比较 totals，更不得进入回退/强制修改态。
+
+    真实工具执行、模型未做任何修改：needs_revert / force_edit 必须保持未设置，
+    [Regression] / [Recovery] 不得注入。
+    """
+    script = [
+        [_cmd("python -m pytest -q test_fail.py")],   # 0 passed, 1 failed
+        [_cmd("python -m pytest -q broken/")],        # collection error（另一套范围）
+        None,
+    ]
+    ctx, _ = _run(tmp_path, script, max_steps=4, project=_write_cross_project)
+
+    assert ctx.metadata.get("test_progress") != "regression"
+    text = _messages_text(ctx)
+    assert "[Regression]" not in text, f"跨命令不得注入假 regression: {text[-500:]}"
+    assert "[Recovery]" not in text, f"跨命令不得注入假 recovery: {text[-500:]}"
+    assert not ctx.metadata.get("needs_revert")
+    assert not ctx.metadata.get("force_edit")
+    assert not ctx.metadata.get("ever_modified")
+    assert ctx.metadata["swe_stats"].get("regression_detected", 0) == 0
+    assert ctx.metadata["swe_stats"].get("module_broken_regressions", 0) == 0
+
+
+# ── P1-1 Test 2：相同测试命令仍然能够检测 Regression ────────────────
+def test_same_command_regression_still_detected(tmp_path):
+    """同一测试命令（scope 相同）→ 仍必须判定 regression，修复不得扼杀检测。"""
+    script = [
+        [_pytest()],      # 1 passed, 1 failed → 建立基线
+        [_bad_edit()],    # 改坏
+        [_pytest()],      # 0 passed, 2 failed → 必须仍是 regression
+        None,
+    ]
+    ctx, _ = _run(tmp_path, script)
+
+    assert ctx.metadata["test_progress"] == "regression"
+    assert "[Regression]" in _messages_text(ctx)
+    assert ctx.metadata["swe_stats"]["regression_detected"] == 1
+
+
+def test_same_command_collection_error_still_regression(tmp_path):
+    """同一命令下"测试整个消失"仍是最严重退化（P0-C 语义不得被 scope 门控削弱）。"""
+    script = [
+        [_pytest()],          # 建立基线
+        [_breaking_edit()],   # 破坏 import
+        [_pytest()],          # 同一命令 → collection error → regression
+        None,
+    ]
+    ctx, _ = _run(tmp_path, script, max_steps=4)
+
+    assert ctx.metadata["test_progress"] == "regression"
+    assert ctx.metadata["swe_stats"]["module_broken_regressions"] == 1
+    assert ctx.metadata["needs_revert"] is True
+
+
+# ── P1-1 Test 3：同一命令下的改善/恢复不得误判 ─────────────────────
+def test_same_command_recovery_is_not_regression(tmp_path):
+    """同一命令 failed → green 是 progress，不得判 regression。"""
+    script = [
+        [_pytest()],       # 0 passed, 1 failed → 基线
+        [_good_edit()],    # 修好
+        [_pytest()],       # 1 passed → progress
+        None,
+    ]
+    ctx, _ = _run(tmp_path, script, project=_write_recovery_project)
+
+    assert ctx.metadata["test_progress"] == "progress"
+    assert "[Regression]" not in _messages_text(ctx)
+    assert ctx.metadata["swe_stats"].get("regression_detected", 0) == 0
