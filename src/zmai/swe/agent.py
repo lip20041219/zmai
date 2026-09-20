@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from zmai.agent import Agent, AgentAction, AgentContext, AgentResult, AgentState
+from zmai.context.memory import _truncate_head_tail
 from zmai.errors import BackendError
 from zmai.gateway import Backend
 from zmai.gateway.base import BackendRequest, BackendResponse
@@ -1137,15 +1138,23 @@ class SWEAgent(Agent):
                                 # （读数永远攒不满 fix.read_limit，force_edit 永不激活），
                                 # 直到耗尽 max_steps 提前终止。
                                 reads_after_fail = 0
+                                # ── P0-1: 新失败解除计划闩锁 ──
+                                # 首次失败 / 修复后再次失败都算"新失败"，必须重新进入
+                                # 诊断→规划。否则首个失败会把后续所有失败的根因分析
+                                # 永久锁死：多 bug 任务只能拿到第一条失败的 file:line
+                                # 与源码上下文，其余失败退化成裸 traceback。
+                                # 同一失败连续重跑不计（test_failed 已为 True，不进本分支）。
+                                repair_plan_injected = False
                             test_failed = True
                             # 一旦测试曾失败，则只有"全绿重测"才能判定完成（粘性标记）
                             context.metadata["tests_ever_failed"] = True
                             if repair_phase != "edit":
                                 repair_phase = "diagnose"
-                            # ── 首次失败注入具体修复计划（让 Agent 制定修改方案而非只分析）──
+                            # ── 失败注入具体修复计划（让 Agent 制定修改方案而非只分析）──
+                            # P0-1: 闩锁只在**诊断成功**后置位（见下方 _issue is not None）。
+                            # 在解析前置位会让一次解析异常永久烧掉闩锁——既不重试，也
+                            # 伪造出"诊断已完成"的状态，把 Agent 直接推入修改阶段。
                             if not repair_plan_injected:
-                                repair_plan_injected = True
-                                repair_phase = "plan"
                                 _fail_text = (result.output or "") + (result.error or "")
                                 # ── P2: 语义化失败解析 ──
                                 # ── P1: 基于语义失败生成有序修复计划 ──
@@ -1171,7 +1180,15 @@ class SWEAgent(Agent):
                                         context.metadata["last_failure_issue"] = _issue
                                         _plan_msg = "\n" + format_failure(_issue) \
                                                     + "\n" + format_plan(_plan)
+                                        # 诊断真正产出结果，才宣告"计划已就绪"
+                                        repair_plan_injected = True
+                                        repair_phase = "plan"
                                 except Exception:
+                                    logger.warning(
+                                        "Failure analysis failed for %s — 保持诊断态并"
+                                        "允许下次失败重试解析", context.agent_id,
+                                        exc_info=True,
+                                    )
                                     _plan_msg = ""
                                 cm.add_message("user",
                                     "[Repair Plan] 测试失败。请按以下闭环立即修复（不要只读不修）：\n"  # noqa: E501
@@ -1179,7 +1196,12 @@ class SWEAgent(Agent):
                                     "2. 计划：明确要修改哪个文件、添加或改动什么代码\n"
                                     "3. 修改：用 `edit` 或 `write_file` 工具实施修改\n"
                                     "4. 验证：重新运行 `python -m pytest`，直到通过\n"
-                                    f"\n失败分析：\n{_fail_text[:800]}\n{_plan_msg}"
+                                    # P0-1: 头+尾截断。pytest 把 traceback 放在输出尾部，
+                                    # 取头部 800 字符只剩 rootdir/collected 噪声，"失败分析"
+                                    # 段不含任何根因信息。
+                                    f"\n失败分析：\n"
+                                    f"{_truncate_head_tail(_fail_text, cm.test_evidence_chars)}"
+                                    f"\n{_plan_msg}"
                                 )
                                 _l = context.metadata.get("__log__")
                                 if _l:
@@ -1424,7 +1446,11 @@ class SWEAgent(Agent):
 
             # ── Fix-driving enforcement ────────────────────────
             # 测试失败后只读不修达到阈值 → 强制进入修改阶段（读取永远无法让测试通过）。
-            if test_failed and reads_after_fail >= fix_read_limit:
+            # P0-1: 前置条件加上"诊断已产出结果"。解析异常/解析不出失败时
+            # repair_plan_injected 保持 False，此时不得强制修改——否则就是对一条
+            # 运行时自己都没能定位的失败强行要求改代码（fail-open）。定位未就绪时
+            # 继续允许读取，由 LoopGuard（no_progress）与 max_steps 兜底。
+            if test_failed and repair_plan_injected and reads_after_fail >= fix_read_limit:
                 logger.warning(
                     "FixDriving: test failed, %d reads after failure without modification — forcing fix phase",  # noqa: E501
                     reads_after_fail,

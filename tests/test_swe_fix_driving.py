@@ -588,3 +588,188 @@ class TestFixDrivingStickyEscape:
                            cwd=str(project), capture_output=True, text=True,
                            timeout=60, encoding="utf-8", errors="replace")
         assert r.returncode == 0, f"修复后 pytest 应通过: {r.stdout}{r.stderr}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 测试 7: P0-1 根因定位链 —— 闩锁生命周期 / 不伪造诊断态 / 失败分析截断
+# ═══════════════════════════════════════════════════════════════════
+
+
+APP_TWO_BUGS = '''\
+from flask import Flask
+
+app = Flask(__name__)
+
+
+def index():
+    return "Hello"
+
+
+def greet():
+    return "Hi"
+'''
+
+TEST_TWO_BUGS = '''\
+import pytest
+from app import app
+
+
+@pytest.fixture
+def client():
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        yield c
+
+
+def test_home_returns_200(client):
+    assert client.get("/").status_code == 200
+
+
+def test_greeting_returns_200(client):
+    assert client.get("/greet").status_code == 200
+'''
+
+_PYTEST = ToolCall(id="p", name="shell_exec",
+                   params={"command": "python -m pytest -q"})
+
+# 只给 index 补路由（greet 仍然 404）→ 第二次重测必然产生**新的**失败
+_FIX_INDEX_ROUTE = ToolCall(
+    id="e1", name="edit",
+    params={"path": "app.py", "mode": "regex_replace",
+            "old_text": "def index", "new_text": """@app.route('/')
+def index"""})
+
+def _capture_repair_plans(monkeypatch) -> list[str]:
+    """在注入点截获 [Repair Plan] 消息原文。
+
+    不能事后从 ctx.metadata["messages"] 取：上下文预算会把该消息压缩成摘要 /
+    挤出 recent window，观察到的已不是模型当时收到的内容。
+    """
+    from zmai.context.manager import ContextManager
+
+    captured: list[str] = []
+    original = ContextManager.add_message
+
+    def _spy(self, role, content, metadata=None):
+        if role == "user" and content and "[Repair Plan]" in content:
+            captured.append(content)
+        return original(self, role, content, metadata)
+
+    monkeypatch.setattr(ContextManager, "add_message", _spy)
+    return captured
+
+
+class TestRootCauseLatchLifecycle:
+    def test_parse_exception_does_not_arm_fix_driving(self, tmp_path: Path, monkeypatch):
+        """P0-1 A: 解析异常不得伪造"诊断已完成"，也不得因此进入强制修改阶段。"""
+        project = tmp_path / "flask_parse_boom"
+        _write_flask_project(project)
+
+        import zmai.swe.failure as failure_mod
+        real = failure_mod.parse_test_failure
+        seen = {"n": 0}
+
+        def _flaky(text, project_root=None):
+            seen["n"] += 1
+            if seen["n"] == 1:
+                raise RuntimeError("parser exploded")
+            return real(text, project_root=project_root)
+
+        monkeypatch.setattr(failure_mod, "parse_test_failure", _flaky)
+
+        script: list[list[ToolCall] | None] = [
+            [_PYTEST],            # 失败 → 解析抛异常
+            _diagnostic_reads(),  # 攒满 fix.read_limit
+            None,
+        ]
+        backend = _ScriptedBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend))
+
+        assert ctx.metadata["swe_stats"].get("fixdriving_activations", 0) == 0, \
+            "诊断未就绪时不得触发 FixDriving 强制修改"
+        assert "[FixDriving]" not in _messages_text(ctx), "不得注入强制修改提示"
+        assert ctx.metadata.get("repair_plan_injected") is False, \
+            "解析异常不得伪造『计划已就绪』状态"
+
+    def test_parse_exception_does_not_burn_latch(self, tmp_path: Path, monkeypatch):
+        """P0-1 A: 解析异常后，下一次失败必须能重试解析（闩锁未被烧掉）。"""
+        project = tmp_path / "flask_parse_retry"
+        _write_flask_project(project)
+
+        import zmai.swe.failure as failure_mod
+        real = failure_mod.parse_test_failure
+        seen = {"n": 0}
+
+        def _flaky(text, project_root=None):
+            seen["n"] += 1
+            if seen["n"] == 1:
+                raise RuntimeError("parser exploded")
+            return real(text, project_root=project_root)
+
+        monkeypatch.setattr(failure_mod, "parse_test_failure", _flaky)
+
+        script: list[list[ToolCall] | None] = [[_PYTEST], [_PYTEST], None]
+        backend = _ScriptedBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend))
+
+        assert seen["n"] >= 2, "下一次失败必须重试解析，不得永久锁死"
+        assert ctx.metadata["swe_stats"].get("failure_parser_used", 0) == 1, \
+            "只有第二次（成功的）解析应计入失败分析"
+        # 闩锁置位即证明 _issue 非空且 _plan_msg（含 file:line/源码上下文）已生成；
+        # 消息本身可能被上下文预算压缩，故不断言消息文本（见
+        # test_failure_injects_semantic_analysis_and_plan 对文本的覆盖）。
+        assert ctx.metadata.get("repair_plan_injected") is True, \
+            "重试成功后应真正产出计划"
+
+    def test_second_real_failure_reenters_analysis(self, tmp_path: Path):
+        """P0-1 B: 第一次失败修复后的第二次真实失败必须能重新进入失败分析。"""
+        project = tmp_path / "flask_two_bugs"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "app.py").write_text(APP_TWO_BUGS, encoding="utf-8")
+        (project / "test_app.py").write_text(TEST_TWO_BUGS, encoding="utf-8")
+
+        script: list[list[ToolCall] | None] = [
+            [_PYTEST],            # 失败 #1（两个测试都失败）
+            [_FIX_INDEX_ROUTE],   # 只修 index
+            [_PYTEST],            # 失败 #2（greet 仍 404）→ 必须重新分析
+            None,
+        ]
+        backend = _ScriptedBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend))
+
+        app_text = (project / "app.py").read_text(encoding="utf-8")
+        assert "@app.route('/')" in app_text, "第一次修改应已生效"
+        # failure_parser_used 只在 _issue 非空时 +1：计数为 2 即证明第二次真实失败
+        # 重新走完了 parse → plan 全链路，未被首次失败的闩锁阻断。
+        assert ctx.metadata["swe_stats"].get("failure_parser_used", 0) == 2, \
+            "第二次真实失败必须重新进入 failure analysis，不得被首次闩锁永久阻断"
+
+
+class TestFailureAnalysisTruncation:
+    def test_failure_analysis_keeps_traceback_tail(self, tmp_path: Path, monkeypatch):
+        """P0-1 C: 失败分析段必须携带 traceback 尾部/file:line，而非只有 pytest 头部。"""
+        project = tmp_path / "flask_noisy"
+        _write_flask_project(project)
+        # collection 阶段打印大量噪声（-s 使其进入 stdout），把 FAILURES 段挤出输出头部
+        (project / "conftest.py").write_text(
+            'def pytest_configure(config):\n'
+            '    for _ in range(140):\n'
+            '        print("[noise] " + "-" * 60)\n',
+            encoding="utf-8",
+        )
+        captured = _capture_repair_plans(monkeypatch)
+
+        script: list[list[ToolCall] | None] = [
+            [ToolCall(id="p", name="shell_exec",
+                      params={"command": "python -m pytest -q -s"})],
+            None,
+        ]
+        backend = _ScriptedBackend(script)
+        asyncio.run(_run_agent(project, backend))
+
+        assert captured, "应注入 [Repair Plan]"
+        section = captured[0].split("失败分析：", 1)[1]
+        assert len(section) > 1200, \
+            f"失败分析应保留尾部（旧实现只留头部 800 字符）: {len(section)}"
+        assert "FAILURES" in section, "应含 traceback 尾部（FAILURES 段）"
+        assert "test_app.py:" in section, "应含 file:line"
