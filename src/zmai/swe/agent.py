@@ -332,7 +332,7 @@ _BASE_SYSTEM_PROMPT = """You are a Software Engineering Agent (SWE Agent). Your 
 - grep: Search text or regex in files (do NOT use shell grep — use this tool)
 
 ### Execute
-- shell_exec: Execute shell commands in workspace directory
+- shell_exec: Execute shell commands in the project source directory (cwd = project root)
 - git: Execute git commands
 
 ### Deliver
@@ -1832,8 +1832,16 @@ class SWEAgent(Agent):
                 _last_mod = _i
         tool_results = tool_results[_last_mod + 1:]
 
-        ws_path = context.workspace
-        result = auto_generate_checks(modified_files, tool_results, ws_path)
+        # ── P1-A1: 检查根目录必须是**项目源码目录**，不是 Agent 工作区 ──
+        # context.workspace 是 ZMAI 的临时工作区（只有 input/output/temp），源码在
+        # project_path。verifier 的 workspace 参数是"相对路径的解析根"，传工作区会让
+        # modified_files 里的每个相对路径都解析到不存在的路径，`文件存在: <file>`
+        # 必然 FAIL —— 已修好的改动被判成验证失败，烧 completion_block_count 后
+        # 把整个 run 判成 FAILED（SWE-bench smoke: psf__requests-3362 实测）。
+        # git 检查同理：工作区不是 git 仓库，diff 必须去项目里跑。
+        ws_path = context.config.get("project_path") or context.workspace
+        result = auto_generate_checks(
+            modified_files, tool_results, Path(ws_path) if ws_path else None)
         logger.info("Verification complete: %s (%d/%d)", result.summary,
                      sum(1 for c in result.checks if c.passed), len(result.checks))
         return result

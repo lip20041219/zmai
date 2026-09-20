@@ -309,6 +309,41 @@ def parse_test_totals(test_output: str) -> dict[str, int]:
     }
 
 
+# pytest 自己发出的"这次调用根本没跑测试"信号。
+# 只认 pytest 的**报文文本**，不认裸退出码：exit 4/5 是 pytest 的用法错误 / 零收集
+# 专用码，但别的命令（make、自写脚本）也会用 4，按退出码放行会让非测试命令的失败
+# 被静默吞掉（fail-open）。报文文本没有这个歧义。
+_TEST_INVOCATION_ERROR_SIGNALS = (
+    "error: file or directory not found",   # pytest <不存在的路径>
+    "error: usage:",                        # pytest CLI 用法错误（argparse）
+    "unrecognized arguments",               # 同上
+    "no tests ran",                         # 收集到 0 个测试
+    "no tests collected",                   # 同上
+    "collected 0 items",                    # 收集头（非 -q）
+)
+
+
+def is_test_invocation_error(text: str) -> bool:
+    """这次命令失败是否属于**测试调用错误**（根本没跑到被测代码）。
+
+    与"测试失败"互斥，判据是 pytest 的报文文本：
+      * 调用错误 —— `ERROR: file or directory not found` / `no tests ran` /
+        `collected 0 items` / `ERROR: usage:`。一个测试都没执行。
+      * 测试失败 —— 有 `N failed` / `N errors` 结构化计数或 FAILED 段。
+
+    只被 ``auto_generate_checks`` 用在"工具报告失败"分支上，把调用错误从失败证据里
+    剔除；真正的 assertion failure 带计数，不受影响。
+    """
+    if not text:
+        return False
+    low = text.lower()
+    if not any(sig in low for sig in _TEST_INVOCATION_ERROR_SIGNALS):
+        return False
+    # 有真实测试计数 → 确实跑到了测试，不是调用错误。
+    totals = parse_test_totals(text)
+    return not (totals["passed"] or totals["failed"] or totals["errors"])
+
+
 def classify_test_progress(
     previous: dict[str, int] | None,
     current: dict[str, int],
@@ -582,6 +617,14 @@ def auto_generate_checks(
         #    失败详情在 error 字段，必须读它。
         if tr.get("success") is False or error:
             detail = error or output
+            # ── P1-A2: 测试**调用**错误 ≠ 测试失败 ──
+            # 复用"无测试收集证据"语义（同 agent.py 的 _no_test_evidence）：一次连
+            # 被测代码都没跑到的 pytest 调用，既不构成失败证据也不构成通过证据。
+            # 实测误判：`exit 4: ERROR: file or directory not found: tests/test_requests.py`
+            # 被记成 Command failed → auto-verify 判失败 → "blocked 3x without progress"
+            # → 整个 run 被 FAILED，而 agent 从未拿到真实的测试反馈。
+            if is_test_invocation_error(detail):
+                continue
             checks.append(VerificationCheck(
                 name=f"Command failed: {name}",
                 strategy="exit_code",

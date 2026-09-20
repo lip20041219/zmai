@@ -962,7 +962,8 @@ def _test_summary_prefix(output: str) -> str:
 class ShellTool(Tool):
     name = "shell_exec"
     description = (
-        "Execute shell command in workspace directory. "
+        "Execute shell command in the project source directory (the working "
+        "directory is the project root; use paths relative to it, no cd needed). "
         "On Windows: use dir instead of ls, type instead of cat, cd instead of pwd."
     )
     parameters = {
