@@ -858,9 +858,65 @@ def _cap_shell_output(output: str, command: str, limit: int = 10000,
 # 输出本来就是被管道捕获的，去掉后内容不变，退出码恢复为真实命令的。
 _PAGER_STAGE_RE = re.compile(r"(?:\s*\|\s*(?:more(?:\.com)?|less|cat)\s*)+$", re.IGNORECASE)
 
-# 测试命令识别 —— 与 agent.py 的测试运行检测保持完全相同的语义
-# （agent.py 用 "pytest" in cmd.lower() 判断），避免两处判定不一致。
+# 宽松的 runner 子串匹配 —— 与 agent.py 的读取计数检测（`"pytest" in cmd`）同义。
+# 仅用于**失败方向**的退出码校正（_resolve_test_exit_code，只会 0→1，fail-closed），
+# 因此刻意保持宽松：误判只多改判一次失败，不会放行未验证的完成。
+# 需要"是否为真实测试证据"的判断请用 is_test_command()。
 _TEST_CMD_RE = re.compile(r"pytest|unittest|nosetests", re.IGNORECASE)
+
+# ── 真实测试运行器识别（证据方向，必须严格）──────────────────────
+# 裸子串匹配会把 `type pytest.log` / `cat pytest.ini` / `pip install pytest` /
+# `echo pytest` / `python -c "...pytest..."` / `# pytest` 注释都当成"测试运行"。
+# 其中 `type pytest.log` 会把**旧的全绿日志**重放成"完整套件全绿"证据 ——
+# 实现上只需 `pytest > pytest.log` 再 `type pytest.log`，即可在代码已改坏的情况下
+# 拿到 tests_complete。因此这里按 shell 段拆开，只认"段首可执行的就是 runner"。
+_SHELL_SEGMENT_RE = re.compile(r"&&|\|\||[;|&\n]")
+_ENV_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=\S*")
+# 段首即 runner 的命令
+_BARE_RUNNERS = frozenset({"pytest", "py.test", "nosetests"})
+# `python -m <module>` 形式的测试模块
+_RUNNER_MODULES = frozenset({"pytest", "unittest", "nose", "nose2"})
+# `poetry run pytest` / `uv run pytest` 之类的包装前缀（漏判会让合法运行拿不到证据）
+_RUN_PREFIXES = frozenset({"poetry", "uv", "pipenv", "pdm", "hatch", "rye"})
+
+
+def _exe_name(token: str) -> str:
+    """取段首 token 的可执行名：去引号、取路径末段、去 .exe、转小写。"""
+    t = token.strip().strip("\"'").replace("/", "\\").rsplit("\\", 1)[-1].lower()
+    return t[:-4] if t.endswith(".exe") else t
+
+
+def is_test_command(command: str) -> bool:
+    """命令是否**确实调用了**测试运行器（而不只是文本里含 "pytest"）。
+
+    只认段首为可执行 runner 的形态：
+      pytest / py.test / nosetests
+      python[-X.Y] -m pytest|unittest|nose|nose2   （`py -3 -m pytest` 亦可）
+      poetry|uv|pipenv|pdm|hatch|rye run <上述任一>
+
+    反例（一律 False）：`type pytest.log`、`cat pytest.ini`、`pip install pytest`、
+    `echo pytest`、`python -c "...pytest..."`、`# pytest`。
+    """
+    for segment in _SHELL_SEGMENT_RE.split(command or ""):
+        tokens = segment.split()
+        while tokens and _ENV_ASSIGN_RE.fullmatch(tokens[0]):
+            tokens.pop(0)
+        if len(tokens) >= 2 and _exe_name(tokens[0]) in _RUN_PREFIXES \
+                and tokens[1] == "run":
+            tokens = tokens[2:]
+        if not tokens:
+            continue
+        exe = _exe_name(tokens[0])
+        if exe in _BARE_RUNNERS:
+            return True
+        if exe != "py" and not exe.startswith("python"):
+            continue
+        rest = tokens[1:]
+        if "-m" in rest:
+            i = rest.index("-m")
+            if i + 1 < len(rest) and _exe_name(rest[i + 1]) in _RUNNER_MODULES:
+                return True
+    return False
 
 
 def _strip_trailing_pager(cmd: str) -> str:

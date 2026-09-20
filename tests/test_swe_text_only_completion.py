@@ -25,6 +25,8 @@ import asyncio
 from collections.abc import Iterator
 from pathlib import Path
 
+import pytest
+
 from zmai.agent import AgentContext
 from zmai.gateway.base import (
     Backend,
@@ -35,6 +37,7 @@ from zmai.gateway.base import (
     TokenUsage,
 )
 from zmai.swe.agent import SWEAgent
+from zmai.swe.tools import is_test_command
 from zmai.tool import ToolCall, ToolRegistry
 
 GREEN_BUG = "VALUE = 1\n"
@@ -241,6 +244,79 @@ def test_pytest_help_cannot_complete(tmp_path):
     assert actions[-1] != "complete", f"零测试计数不得完成: {actions}"
     assert ctx.metadata["completion"].tests_complete is False
     assert ctx.metadata.get("test_success_count", 0) == 0
+
+
+# ── H：P1 —— 只有真正的 runner 调用才算测试证据 ─────────────────
+def test_replayed_test_log_cannot_complete(tmp_path):
+    """重放旧的全绿日志不得作为完成证据。
+
+    `pytest > pytest.log` 之后改坏代码，再重读该日志：命令文本里含 "pytest"
+    （文件名），输出是旧的全绿汇总行。旧实现按裸子串 `"pytest" in cmd` 匹配，
+    于是这条**没跑任何测试**的命令给出 tests_complete=True —— 代码已坏却判完成。
+    """
+    script = [
+        [_shell("python -m pytest -q > pytest.log 2>&1")],
+        [_break_edit()],
+        [_shell("""python -c "print(open('pytest.log').read())" """.strip())],
+        TEXT,
+    ]
+    ctx, actions = _run(tmp_path, script, max_steps=8)
+
+    assert actions[-1] != "complete", f"重放旧日志不得完成: {actions}"
+    assert ctx.metadata["completion"].tests_complete is False
+    assert ctx.metadata.get("test_success_count", 0) == 0
+
+
+def test_redirected_test_run_still_forms_evidence(tmp_path):
+    """反向护栏：真实 runner 调用（含重定向形态）仍被识别为测试命令。"""
+    script = [
+        [_shell("python -m pytest -q > pytest.log 2>&1")],
+        [_shell("python -m pytest -q")],
+        TEXT,
+    ]
+    ctx, actions = _run(tmp_path, script, max_steps=6)
+
+    assert actions[-1] == "complete", f"真实全绿应可完成: {actions}"
+    assert ctx.metadata["completion"].tests_complete is True
+
+
+@pytest.mark.parametrize("cmd", [
+    "pytest",
+    "pytest -q",
+    "py.test",
+    "nosetests",
+    "python -m pytest",
+    "python3 -m pytest -q",
+    "py -m pytest",
+    "py -3 -m pytest",
+    "python -m unittest discover",
+    "cd src && python -m pytest -q",
+    "python -m pytest -q > pytest.log 2>&1",
+    "python -m pytest -q | more",
+    "poetry run pytest",
+    "uv run python -m pytest",
+    "FOO=1 python -m pytest -q",
+    "C:\\Python311\\python.exe -m pytest",
+    '"C:\\Python311\\python.exe" -m pytest',
+])
+def test_real_runner_invocations_are_recognized(cmd):
+    assert is_test_command(cmd) is True, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "type pytest.log",
+    "cat pytest.ini",
+    "pip install pytest",
+    "echo pytest",
+    "echo pytest --version",
+    'python -c "import pytest"',
+    "# pytest",
+    "git log --grep pytest",
+    "python -m pip install pytest",
+    "python -c \"print(open('pytest.log').read())\"",
+])
+def test_non_runner_commands_are_rejected(cmd):
+    assert is_test_command(cmd) is False, cmd
 
 
 def test_green_evidence_still_completes(tmp_path):

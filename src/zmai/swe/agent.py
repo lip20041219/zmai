@@ -21,7 +21,6 @@ from zmai.swe.models import MAX_REPLANS, Plan, format_plan_summary
 from zmai.swe.planner import generate_plan
 from zmai.swe.scanner import RepositoryInfo, RepositoryScanner
 from zmai.swe.tools import (
-    _TEST_CMD_RE,
     EditTool,
     GitTool,
     GrepTool,
@@ -30,6 +29,7 @@ from zmai.swe.tools import (
     ShellTool,
     ShowToUserTool,
     WriteFileTool,
+    is_test_command,
 )
 from zmai.swe.verifier import (
     VerificationResult,
@@ -79,7 +79,7 @@ def _test_evidence_budget(tc: ToolCall, result: ToolResult,
     """
     if result.success or tc.name != "shell_exec":
         return None
-    if not _TEST_CMD_RE.search(str((tc.params or {}).get("command", ""))):
+    if not is_test_command(str((tc.params or {}).get("command", ""))):
         return None
     return cm.test_evidence_chars
 
@@ -825,7 +825,7 @@ class SWEAgent(Agent):
                 # 工作区，不构成对修改阶段的绕过；其余 shell/git/read 仍一律拦截。
                 _test_cmd_exempt = (
                     tc.name == "shell_exec"
-                    and bool(_TEST_CMD_RE.search(str(tc.params.get("command", ""))))
+                    and is_test_command(str(tc.params.get("command", "")))
                 )
                 if (_force_edit and not _test_cmd_exempt
                         and tc.name not in ("edit", "write_file", "show_to_user")):
@@ -929,8 +929,12 @@ class SWEAgent(Agent):
                 # 当成"测试通过"，反而给 test_success_count 记一次全绿。
                 if tc.name in ("shell_exec", "git") and not _intercepted:
                     _cmd_l = str(tc.params.get("command", "")).lower()
-                    if ("pytest" in _cmd_l or "unittest" in _cmd_l
-                            or "nosetests" in _cmd_l):
+                    # ── P1: 只认真正的 runner 调用，不认含 "pytest" 字样的命令 ──
+                    # 裸子串匹配会把 `type pytest.log`（重放旧的全绿日志）/
+                    # `cat pytest.ini` / `pip install pytest` / `echo pytest` /
+                    # `python -c "...pytest..."` / `# pytest` 都当成测试运行，
+                    # 从而用一条没跑测试的命令取得 tests_complete。
+                    if is_test_command(str(tc.params.get("command", ""))):
                         exit_code = int(
                             (result.metadata or {}).get("exit_code", 0)
                         )
