@@ -529,3 +529,302 @@ class TestRootCauseNoRegression:
         assert (issue.file, issue.line, issue.function) == ("app.py", 42, "parse_config")
         assert "text.split" in issue.source_snippet
         assert ">>" in format_failure(issue)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P1 — 多 failure 归因一致性（test_name / file:line / snippet 必须同源）
+# ═══════════════════════════════════════════════════════════════════
+
+# 两个不同文件、不同异常的 failure（真实 pytest -q 输出形态）
+_MULTI_TWO_FILES = """\
+=================================== FAILURES ===================================
+_________________________________ test_alpha __________________________________
+
+    def test_alpha():
+>       check_alpha()
+
+test_x.py:6:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def check_alpha():
+>       raise ValueError("alpha boom")
+E       ValueError: alpha boom
+
+alpha.py:2: ValueError
+__________________________________ test_beta __________________________________
+
+    def test_beta():
+>       check_beta()
+
+test_x.py:10:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def check_beta():
+        data = {}
+>       return data["k"]
+E       KeyError: 'k'
+
+beta.py:3: KeyError
+=========================== short test summary info ============================
+FAILED test_x.py::test_alpha - ValueError: alpha boom
+FAILED test_x.py::test_beta - KeyError: 'k'
+2 failed in 0.15s
+"""
+
+# 同一文件两个 assert failure（无源码 frame，帧全在测试文件内）
+_MULTI_SAME_FILE = """\
+=================================== FAILURES ===================================
+_________________________________ test_first __________________________________
+
+    def test_first():
+>       assert 1 == 2
+E       assert 1 == 2
+
+test_y.py:2: AssertionError
+_________________________________ test_second _________________________________
+
+    def test_second():
+>       assert 3 == 4
+E       assert 3 == 4
+
+test_y.py:6: AssertionError
+=========================== short test summary info ============================
+FAILED test_y.py::test_first - assert 1 == 2
+FAILED test_y.py::test_second - assert 3 == 4
+2 failed in 0.08s
+"""
+
+# collection/import error（无 FAILURES 段，只有 ERRORS 段与 import traceback）
+_COLLECTION_ERROR = """\
+==================================== ERRORS ====================================
+_________________________ ERROR collecting test_z.py __________________________
+ImportError while importing test module 'test_z.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+test_z.py:1: in <module>
+    import nonexistent_mod_xyz
+E   ModuleNotFoundError: No module named 'nonexistent_mod_xyz'
+=========================== short test summary info ============================
+ERROR test_z.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 0.41s
+"""
+
+
+# 类内测试的多 failure（真实 pytest -q 输出原样捕获）：
+# 头名形态为 `TestAlpha.test_alpha`，与模块级 `test_alpha` 不同。
+_MULTI_CLASS_STYLE = """\
+FF                                                                       [100%]
+================================== FAILURES ===================================
+____________________________ TestAlpha.test_alpha _____________________________
+
+self = <test_c.TestAlpha object at 0x000001E0BC603590>
+
+    def test_alpha(self):
+>       check_alpha()
+
+test_c.py:7:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def check_alpha():
+>       raise ValueError("alpha boom")
+E       ValueError: alpha boom
+
+alpha.py:2: ValueError
+_____________________________ TestBeta.test_beta ______________________________
+
+self = <test_c.TestBeta object at 0x000001E0BDCC1150>
+
+    def test_beta(self):
+>       check_beta()
+
+test_c.py:12:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def check_beta():
+        data = {}
+>       return data["k"]
+               ^^^^^^^^^
+E       KeyError: 'k'
+
+beta.py:3: KeyError
+=========================== short test summary info ============================
+FAILED test_c.py::TestAlpha::test_alpha - ValueError: alpha boom
+FAILED test_c.py::TestBeta::test_beta - KeyError: 'k'
+2 failed in 0.22s
+"""
+
+_CLASS_MODULES = {
+    "alpha.py": 'def check_alpha():\n    raise ValueError("alpha boom")\n',
+    "beta.py": 'def check_beta():\n    data = {}\n    return data["k"]\n',
+}
+
+
+def _write_modules(root: Path, **files: str) -> None:
+    for name, body in files.items():
+        (root / name).write_text(body, encoding="utf-8")
+
+
+class TestMultiFailureAttribution:
+    def test_two_files_name_and_location_same_failure(self, tmp_path: Path):
+        """2 个不同文件的 failure：test_name 与 file:line/snippet 必须来自同一个。"""
+        _write_modules(tmp_path, **_CLASS_MODULES)
+        issue = parse_test_failure(_MULTI_TWO_FILES, tmp_path)
+        assert issue is not None
+        # 选择语义：稳定取第一个 failure（test_alpha）
+        assert issue.test_name == "test_alpha"
+        assert issue.error_type == "ValueError"
+        # 定位必须同源 —— 修复前这里是 beta.py:3（最后一个 failure）
+        assert (issue.file, issue.line) == ("alpha.py", 2)
+        assert "raise ValueError" in issue.source_snippet
+        assert 'data["k"]' not in issue.source_snippet, "不得混入第二个 failure 的源码"
+        assert 'KeyError' not in issue.source_snippet
+
+    def test_class_style_name_and_location_same_failure(self, tmp_path: Path):
+        """类内测试（`TestAlpha.test_alpha`）：归属必须与模块级同样同源。
+
+        pytest 对类内 failure 打印的头是 `TestAlpha.test_alpha`，与模块级
+        `test_alpha` 形态不同 —— 修复前该形态切不出 block，退回全文扫描，
+        于是 test_name 取自第一个 failure、file:line 取自最后一个。
+        """
+        _write_modules(tmp_path, **_CLASS_MODULES)
+        issue = parse_test_failure(_MULTI_CLASS_STYLE, tmp_path)
+        assert issue is not None
+        assert issue.test_name == "test_alpha", "类内失败应取方法名（与修复前取值一致）"
+        assert issue.error_type == "ValueError"
+        assert (issue.file, issue.line) == ("alpha.py", 2), \
+            "类内 failure 也必须定位到第一个 failure（修复前为 beta.py:3）"
+        assert "raise ValueError" in issue.source_snippet
+        assert 'data["k"]' not in issue.source_snippet, "不得混入第二个 failure 的源码"
+
+    def test_class_style_parametrize_header_is_a_boundary(self, tmp_path: Path):
+        """类内 + parametrize 头（`TestCalc.test_calc[1-2]`）同样可切分。"""
+        _write_modules(tmp_path, **{
+            "calc.py": "def total():\n    raise ValueError('calc boom')\n",
+            "other.py": "def other():\n    return {}\n",
+        })
+        text = (
+            "________________________ TestCalc.test_calc[1-2] _____________________________\n"
+            "    def test_calc(self):\n>       total()\n\n"
+            "test_c.py:5: \n"
+            "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n"
+            "    def total():\n>       raise ValueError('calc boom')\n"
+            "E       ValueError: calc boom\n\n"
+            "calc.py:2: ValueError\n"
+            "__________________________ TestOther.test_other[3-4] __________________________\n"
+            "    def test_other(self):\n>       return {}\n"
+            "E       KeyError: 'nope'\n\n"
+            "other.py:2: KeyError\n"
+        )
+        issue = parse_test_failure(text, tmp_path)
+        assert issue is not None
+        assert issue.test_name == "test_calc"
+        assert issue.error_type == "ValueError"
+        assert (issue.file, issue.line) == ("calc.py", 2)
+
+    def test_same_file_expected_actual_matches_location(self, tmp_path: Path):
+        """同文件 2 个 assert failure：expected/actual 与 file:line 不得错配。"""
+        _write_modules(
+            tmp_path,
+            **{"test_y.py": "def test_first():\n    assert 1 == 2\n\n\n"
+                             "def test_second():\n    assert 3 == 4\n"},
+        )
+        issue = parse_test_failure(_MULTI_SAME_FILE, tmp_path)
+        assert issue is not None
+        assert issue.test_name == "test_first"
+        assert (issue.file, issue.line) == ("test_y.py", 2), "应定位第一个 failure"
+        # expected/actual 取自 assert 1 == 2（第一个 failure），与 file:line 同源
+        assert (issue.expected, issue.actual) == ("2", "1")
+        marked = [ln for ln in issue.source_snippet.splitlines() if ln.startswith(">>")]
+        assert marked and "assert 1 == 2" in marked[0], f"根因行应同源: {marked}"
+
+    def test_first_failure_selection_is_stable(self, tmp_path: Path):
+        """三个 failure：选择语义明确且可重复（稳定取第一个块）。"""
+        text = (
+            "_________________________________ test_one ___________________________________\n"
+            "    def test_one():\n>       assert 1 == 2\nE       assert 1 == 2\n\n"
+            "a.py:2: AssertionError\n"
+            "_________________________________ test_two ___________________________________\n"
+            "    def test_two():\n>       assert 3 == 4\nE       assert 3 == 4\n\n"
+            "b.py:5: AssertionError\n"
+            "________________________________ test_three __________________________________\n"
+            "    def test_three():\n>       assert 5 == 6\nE       assert 5 == 6\n\n"
+            "c.py:9: AssertionError\n"
+        )
+        _write_modules(tmp_path, **{"a.py": "x = 1\n", "b.py": "y = 2\n", "c.py": "z = 3\n"})
+        first = parse_test_failure(text, tmp_path)
+        again = parse_test_failure(text, tmp_path)
+        assert first is not None and again is not None
+        assert first.test_name == "test_one"
+        assert (first.file, first.line) == ("a.py", 2)
+        assert (again.test_name, again.file, again.line) == ("test_one", "a.py", 2)
+
+    def test_single_failure_behavior_unchanged(self, tmp_path: Path):
+        """单 failure：现有行为保持不变（多帧 traceback 不得被切成两块）。
+
+        fixture 用真实 pytest 形态：failure 头是整行下划线夹名字，**帧之间**
+        的分隔是带空格的 `_ _ _ _`（无名字）。
+        """
+        _write_modules(tmp_path, **{"app.py": "def parse_config():\n    raise ValueError('bad')\n"})
+        text = (
+            "============================= test session starts =============================\n"
+            "collected 1 item\n\n"
+            "=================================== FAILURES ===================================\n"
+            "_________________________________ test_config _________________________________\n\n"
+            "    def test_config():\n>       parse_config()\n\n"
+            "test_app.py:5: \n"
+            "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\n"
+            "    def parse_config():\n>       raise ValueError('bad')\n"
+            "E       ValueError: bad\n\n"
+            "app.py:2: ValueError\n"
+            "=========================== short test summary info ============================\n"
+            "FAILED test_app.py::test_config - ValueError: bad\n"
+            "1 failed in 0.05s\n"
+        )
+        issue = parse_test_failure(text, tmp_path)
+        assert issue is not None
+        assert issue.test_name == "test_config"
+        assert issue.error_type == "ValueError"
+        assert (issue.file, issue.line) == ("app.py", 2)
+        assert "raise ValueError" in issue.source_snippet
+        assert ">>" in format_failure(issue)
+
+    def test_non_test_header_is_not_a_boundary(self):
+        """非测试名的整行下划线头不得被当成 failure 边界（纯单元级守卫）。
+
+        仅断言分块判据本身；不主张真实 pytest 会打印这种头。
+        """
+        from zmai.swe.failure import _split_failure_blocks
+
+        text = (
+            "______ test_one ______\n"
+            "    def test_one():\n>       helper()\n\n"
+            "test_a.py:2: \n"
+            "______ helper ______\n"
+            "    def helper():\n>       raise ValueError('x')\n\n"
+            "lib.py:9: ValueError\n"
+        )
+        assert [n for n, _ in _split_failure_blocks(text)] == ["test_one"]
+
+    def test_collection_error_behavior_unchanged(self, tmp_path: Path):
+        """collection/import error：现有行为保持（test_name 空，定位到出错测试文件）。"""
+        _write_modules(tmp_path, **{"test_z.py": "import nonexistent_mod_xyz\n"})
+        issue = parse_test_failure(_COLLECTION_ERROR, tmp_path)
+        assert issue is not None
+        assert issue.test_name == "", "collection error 无失败测试名，不得凭空造名"
+        assert issue.error_type == "ImportError"
+        assert (issue.file, issue.line) == ("test_z.py", 1)
+
+    def test_no_header_falls_back_to_whole_text(self, tmp_path: Path):
+        """无可切分头（非 pytest 格式）时保持原单块行为。"""
+        _write_modules(tmp_path, **{"app.py": "def f():\n    raise ValueError('x')\n"})
+        text = (
+            'Traceback (most recent call last):\n'
+            '  File "app.py", line 2, in f\n'
+            "    raise ValueError('x')\n"
+            "ValueError: x\n"
+        )
+        issue = parse_test_failure(text, tmp_path)
+        assert issue is not None
+        assert (issue.file, issue.line, issue.function) == ("app.py", 2, "f")
+        assert "raise ValueError" in issue.source_snippet

@@ -469,6 +469,54 @@ def _collect_candidate_files(text: str, project_root: str | Path | None,
     return result
 
 
+# pytest 的 failure 分块锚点：`________ test_name ________`（名字夹在下划线中间）。
+# 要求 ≥5 个**连续**下划线，因此不会误吃 `_ _ _ _` 帧分隔行与 `==== FAILURES ====`。
+_FAILURE_HEADER_RE = re.compile(r"^_{5,}\s*(?P<name>\S.*?)\s*_{5,}$")
+# setup/teardown 错误头是 `ERROR at setup of test_x` —— 测试名在尾部，剥掉前缀。
+_BLOCK_NAME_PREFIX_RE = re.compile(r"^ERROR at (?:setup|teardown) of\s+")
+# ── 分块边界判据：头名看起来像测试 ──
+# 覆盖 pytest 的两种 failure 头：模块级 `test_alpha` 与类内 `TestAlpha.test_alpha`
+# （parametrize 后缀 `test_calc[1-2]` 一并覆盖）。用 search 而非 match：类内头名
+# 的 `test_` 不在行首。`ERROR collecting test_z.py` 这类头（`test_` 前是空格，
+# 既非行首也不在 `.` 之后）据此排除 —— collection error 因此不走分块，保持原有行为。
+_BLOCK_HEAD_RE = re.compile(r"(?:^|\.)test_\w+")
+# 头名可直接用作 test_name 的形态：只有模块级 `test_*`。类内 `TestAlpha.test_alpha`
+# 仍由 _extract_test_name() 兜底（取其方法名 `test_alpha`），取值与修复前一致。
+_BLOCK_NAME_RE = re.compile(r"test_\w+")
+# 段落终止：`===== short test summary info =====` / `===== ERRORS =====` 等节标题
+_SECTION_RE = re.compile(r"^=+\s+\S.*\s+=+$")
+
+
+def _split_failure_blocks(text: str) -> list[tuple[str, str]]:
+    """把 pytest 多 failure 输出切成 ``(test_name, block_text)`` 列表。
+
+    多 failure 输出里，``::test_`` / ``E `` 异常行 / assert 值出现在**第一个**
+    failure，而最深 traceback frame 在**最后一个** —— 全文扫描会把两者拼成一条
+    自相矛盾的 FailureIssue。先切块，再把所有提取限定在同一块内即可消除错配。
+
+    切分失败（非 pytest 格式 / 输出被截断 / 无测试名形态的 failure 头）时返回
+    空列表，调用方据此保持原有单块行为。按出现顺序返回，首个即"第一个 failure"。
+    """
+    lines = (text or "").splitlines()
+    heads: list[tuple[int, str]] = []
+    for i, raw in enumerate(lines):
+        m = _FAILURE_HEADER_RE.match(raw)
+        if not m:
+            continue
+        name = _BLOCK_NAME_PREFIX_RE.sub("", m.group("name").strip())
+        if _BLOCK_HEAD_RE.search(name):
+            heads.append((i, name))
+    blocks: list[tuple[str, str]] = []
+    for idx, (start, name) in enumerate(heads):
+        end = heads[idx + 1][0] if idx + 1 < len(heads) else len(lines)
+        for j in range(start + 1, end):
+            if _SECTION_RE.match(lines[j]):
+                end = j
+                break
+        blocks.append((name, "\n".join(lines[start:end])))
+    return blocks
+
+
 def parse_test_failure(traceback_text: str,
                        project_root: str | Path | None = None) -> FailureIssue | None:
     """把 pytest 输出 / traceback 解析成语义化 FailureIssue。
@@ -488,17 +536,28 @@ def parse_test_failure(traceback_text: str,
     # 入口统一剥离，下游 frame / 语义 / 源码片段解析无需各自处理。
     traceback_text = strip_ansi(traceback_text)
 
+    # ── P1: 多 failure 归因一致性 ──
+    # 全部提取限定在**同一个** failure 块内：否则 test_name/error_type/expected
+    # 取自第一个 failure，file/line/snippet 取自最后一个，拼出自相矛盾的诊断。
+    # 单 failure（或无法切分）时 scope 即全文，行为与原先完全一致。
+    # 选择语义：稳定取**第一个** failure 块。
+    _blocks = _split_failure_blocks(traceback_text)
+    _block_name, scope = _blocks[0] if _blocks else ("", traceback_text)
+
     # 语义解析（测试名/异常类型/规则/期望值）用头+尾窗口：失败详情在输出尾部，
     # 长输出下头部只有噪声。
-    detail = _semantic_text(traceback_text)
+    detail = _semantic_text(scope)
     error_type = _extract_error_type(detail)
-    test_name = _extract_test_name(detail)
+    # 模块级头名（pytest 权威）优先；类内头名（`TestAlpha.test_alpha`）与无块时
+    # 由 _extract_test_name 兜底 —— 两者取值与修复前一致。
+    test_name = _block_name if _BLOCK_NAME_RE.match(_block_name) \
+        else _extract_test_name(detail)
     expected, actual = _extract_expected_actual(detail)
     candidate_files = _collect_candidate_files(detail, project_root, test_name)
 
     # ── 根因定位：frame 三要素 + 源码上下文 ──
-    # 解析整段文本（最深的 raise 帧常在头部窗口之外），选中帧后读源码。
-    frame = _select_frame(_parse_frames(traceback_text))
+    # 解析整个块（最深的 raise 帧常在头部窗口之外），选中帧后读源码。
+    frame = _select_frame(_parse_frames(scope))
     if frame is not None:
         file, line, function = frame.file, frame.line, frame.function
     else:
