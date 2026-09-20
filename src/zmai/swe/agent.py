@@ -1505,7 +1505,19 @@ class SWEAgent(Agent):
                     recoveries = context.metadata.get("loop_recovery_count", 0) + 1
                     context.metadata["loop_recovery_count"] = recoveries
                     recover_limit = int(context.config.get("loop_guard.recover_limit", 2))
-                    if recoveries >= recover_limit:
+                    # ── P1: 强制修改必须有"靶子" ──
+                    # 升级的设计意图是"用当前失败证据**定向**修改"，前提是确实存在一个
+                    # 可定向的目标，或模型自己已经在改代码：
+                    #   repair_plan_injected → 运行时已定位根因，定向修改有靶子；
+                    #   ever_modified        → 模型已展示过修改路径，此时停滞意味着
+                    #                          "改法不奏效"，要求换一个改法是合理的。
+                    # 两者皆无（既未定位、也从未修改过）时强制 edit 等于让人凭空改代码
+                    # ——与 P0-1 同源的 fail-open。此时保持 diagnose，只注入恢复提示，
+                    # 由 workflow.read_limit / max_steps 兜底（不删除 LoopGuard 恢复本身）。
+                    _escalate = recoveries >= recover_limit and (
+                        repair_plan_injected
+                        or bool(context.metadata.get("ever_modified")))
+                    if _escalate:
                         context.metadata["force_edit"] = True
                         context.metadata["repair_phase"] = "plan"
                     recovery_msg = (
@@ -1524,7 +1536,7 @@ class SWEAgent(Agent):
                            if context.metadata.get("force_edit") else
                            "- 若证据不足，只允许一次新的定向读取（或重跑一次 pytest）。")
                     )
-                    if recoveries >= recover_limit:
+                    if _escalate:
                         recovery_msg += (
                             f"\n\n已连续 {recoveries} 次循环恢复仍未推进——进入修复升级："
                             f"你现在必须直接修改代码，禁止再读取无关文件。"

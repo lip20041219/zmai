@@ -639,11 +639,11 @@ _FIX_INDEX_ROUTE = ToolCall(
             "old_text": "def index", "new_text": """@app.route('/')
 def index"""})
 
-def _capture_repair_plans(monkeypatch) -> list[str]:
-    """在注入点截获 [Repair Plan] 消息原文。
+def _capture_messages(monkeypatch, marker: str) -> list[str]:
+    """在注入点截获含 marker 的 user 消息原文。
 
-    不能事后从 ctx.metadata["messages"] 取：上下文预算会把该消息压缩成摘要 /
-    挤出 recent window，观察到的已不是模型当时收到的内容。
+    不能事后从 ctx.metadata["messages"] 取：上下文预算会把消息压缩成摘要 / 挤出
+    recent window，观察到的已不是模型当时收到的内容。
     """
     from zmai.context.manager import ContextManager
 
@@ -651,12 +651,17 @@ def _capture_repair_plans(monkeypatch) -> list[str]:
     original = ContextManager.add_message
 
     def _spy(self, role, content, metadata=None):
-        if role == "user" and content and "[Repair Plan]" in content:
+        if role == "user" and content and marker in content:
             captured.append(content)
         return original(self, role, content, metadata)
 
     monkeypatch.setattr(ContextManager, "add_message", _spy)
     return captured
+
+
+def _capture_repair_plans(monkeypatch) -> list[str]:
+    """在注入点截获 [Repair Plan] 消息原文。"""
+    return _capture_messages(monkeypatch, "[Repair Plan]")
 
 
 class TestRootCauseLatchLifecycle:
@@ -773,3 +778,116 @@ class TestFailureAnalysisTruncation:
             f"失败分析应保留尾部（旧实现只留头部 800 字符）: {len(section)}"
         assert "FAILURES" in section, "应含 traceback 尾部（FAILURES 段）"
         assert "test_app.py:" in section, "应含 file:line"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 测试 8: LoopGuard 升级门控 —— "诊断未成功不得强制进入普通 edit 路径"
+# ═══════════════════════════════════════════════════════════════════
+
+# 不存在的文件：read 必然失败且失败签名稳定 → 用于廉价地攒满 LoopGuard 阈值
+_MISSING = "no_such_file_xyz.py"
+
+
+def _missing_reads(n: int, prefix: str) -> list[ToolCall]:
+    return [ToolCall(id=f"{prefix}{i}", name="read_file",
+                     params={"path": _MISSING}) for i in range(n)]
+
+
+class TestLoopGuardEscalationGate:
+    def test_no_diagnosis_no_edit_cannot_force_edit(self, tmp_path: Path, monkeypatch):
+        """A: 解析持续失败且从未修改过代码 → LoopGuard 达标也不得强制 edit。
+
+        必须同时证明"阈值确实达到了"（loop_recovery_count >= recover_limit），
+        否则本用例会退化成"路径没走到"的假通过。
+        """
+        project = tmp_path / "flask_lg_no_target"
+        _write_flask_project(project)
+
+        import zmai.swe.failure as failure_mod
+
+        def _boom(*a, **k):
+            raise RuntimeError("parser exploded")
+
+        monkeypatch.setattr(failure_mod, "parse_test_failure", _boom)
+        loopguard_msgs = _capture_messages(monkeypatch, "[LoopGuard]")
+
+        script: list[list[ToolCall] | None] = [
+            [_PYTEST],                    # 失败 → 解析抛异常（诊断不成功）
+            _missing_reads(5, "a"),       # 5 次相同失败 → LoopGuard 阻断（恢复 1）
+            _missing_reads(5, "b"),       # 再 5 次 → 恢复 2 = 达到 recover_limit
+            None,
+        ]
+        backend = _ScriptedBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend))
+
+        # 前提：升级阈值确实被触达（否则断言无意义）
+        assert ctx.metadata.get("loop_recovery_count", 0) >= 2, \
+            "本用例必须真的走到 LoopGuard 升级阈值"
+        # 门控生效：不进入强制修改 / 不伪装成 plan 态
+        assert ctx.metadata.get("repair_plan_injected") is False
+        assert ctx.metadata.get("force_edit") is not True, \
+            "诊断未成功且从未修改过代码时不得强制进入普通 edit 路径"
+        assert ctx.metadata.get("repair_phase") == "diagnose", \
+            f"应保持诊断态, 实际 {ctx.metadata.get('repair_phase')}"
+        assert ctx.metadata["swe_stats"].get("fixdriving_activations", 0) == 0
+        joined = _messages_text(ctx)
+        assert "[FixDriving]" not in joined, "不得注入 FixDriving 强制修改提示"
+        # 恢复提示本身仍应注入（LoopGuard 未被删除），但不得宣告"升级/必须改代码"
+        assert loopguard_msgs, "LoopGuard 恢复提示应照常注入"
+        assert not any("进入修复升级" in m for m in loopguard_msgs), \
+            "未升级时不得声称进入修复升级"
+
+    def test_with_diagnosis_and_edit_still_escalates(self, tmp_path: Path, monkeypatch):
+        """B: 已有成功诊断 + 已有真实 edit → LoopGuard 升级行为保持原样。"""
+        project = tmp_path / "flask_lg_with_target"
+        _write_flask_project(project)
+        loopguard_msgs = _capture_messages(monkeypatch, "[LoopGuard]")
+
+        script: list[list[ToolCall] | None] = [
+            [_PYTEST],                                  # 失败 → 诊断成功（闩锁置位）
+            [ToolCall(id="e1", name="edit",             # 真实修改 → ever_modified
+                      params={"path": "app.py", "mode": "regex_replace",
+                              "old_text": "def index",
+                              "new_text": "@app.route('/')\ndef index"})],
+            _missing_reads(5, "a"),                     # 恢复 1
+            _missing_reads(5, "b"),                     # 恢复 2 → 应升级
+            None,
+        ]
+        backend = _ScriptedBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend))
+
+        assert ctx.metadata.get("repair_plan_injected") is True, "前提：诊断成功"
+        assert ctx.metadata.get("ever_modified") is True, "前提：已发生过真实修改"
+        assert ctx.metadata.get("loop_recovery_count", 0) >= 2
+        assert ctx.metadata.get("force_edit") is True, \
+            "有诊断/有修改时 LoopGuard 升级不得被错误封堵"
+        assert ctx.metadata.get("repair_phase") == "plan"
+        assert any("进入修复升级" in m for m in loopguard_msgs), \
+            "升级时应注入升级提示"
+
+    def test_force_edit_budget_still_bounds_escalation(self, tmp_path: Path):
+        """C: 升级置位后 MAX_FORCE_EDIT_STEPS 仍然生效，不产生无限强制修改。"""
+        project = tmp_path / "flask_lg_budget"
+        _write_flask_project(project)
+
+        script: list[list[ToolCall] | None] = [
+            [_PYTEST],
+            [ToolCall(id="e1", name="edit",
+                      params={"path": "app.py", "mode": "regex_replace",
+                              "old_text": "def index",
+                              "new_text": "@app.route('/')\ndef index"})],
+            _missing_reads(5, "a"),
+            _missing_reads(5, "b"),     # 此处升级 force_edit
+        ]
+        # 升级后只发被拒绝的调用：force_edit 预算应把强制期截断为有界失败
+        script += [_missing_reads(1, f"s{i}") for i in range(12)]
+        script.append(None)
+
+        backend = _ScriptedBackend(script)
+        ctx, action = asyncio.run(_run_agent(project, backend, max_steps=30))
+
+        assert ctx.metadata.get("force_edit") is True, "前提：确实进入强制修改期"
+        assert action.type == "fail", \
+            f"强制期内无修改应有界失败, 实际 {action.type}: {action.output}"
+        assert "force_edit armed" in (action.error or ""), \
+            f"应由 force_edit 预算终止: {action.error}"
