@@ -278,3 +278,55 @@ class TestPruneAction:
         assert a.should_prune is False
         assert a.should_compact is False
         assert a.reason == ""
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P1-B — edit/write_file 结果的文件名提取
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _tool_msg(tool: str, detail: str) -> dict:
+    """构造一条工具结果消息（形态与 ContextManager.add_tool_result 一致）。"""
+    return {"role": "user", "content": f"[工具 {tool} 结果]\nOK: {detail}",
+            "metadata": {"tool": tool}}
+
+
+class TestEditResultPathExtraction:
+    def test_regex_replace_counts_are_not_filenames(self):
+        """A/C: `replaced 1 matches in app.py` 必须得到 app.py，不能是 "1"。"""
+        mem = SummaryMemory()
+        mem.compress([_tool_msg("edit", "replaced 1 matches in app.py")], [])
+        assert mem.modified_files == ["app.py"], \
+            f"匹配数被当成了文件名: {mem.modified_files}"
+
+    def test_regex_replace_nested_path(self):
+        """B: 带目录的文件名。"""
+        mem = SummaryMemory()
+        mem.compress([_tool_msg("edit", "replaced 3 matches in src/foo.py")], [])
+        assert mem.modified_files == ["src/foo.py"]
+
+    def test_count_tokens_never_tracked(self):
+        """C: 纯数字 / count / 普通单词不得被当成路径。"""
+        mem = SummaryMemory()
+        mem.compress([_tool_msg("edit", "replaced 2 matches in 7")], [])
+        assert mem.modified_files == [], f"不应 track 出 count: {mem.modified_files}"
+
+    def test_existing_real_output_formats_still_work(self):
+        """D: tools.py 的其余真实输出形态保持兼容。"""
+        for detail, want in [
+            ("written app.py (1234 chars)", "app.py"),
+            ("written (open) app.py (10 chars)", "app.py"),
+            ("appended notes.txt", "notes.txt"),
+            ("replaced app.py:12-15", "app.py"),
+            ("inserted at src/util.py:42", "src/util.py"),
+        ]:
+            mem = SummaryMemory()
+            mem.compress([_tool_msg("edit", detail)], [])
+            assert mem.modified_files == [want], f"{detail!r} → {mem.modified_files}"
+
+    def test_edit_failure_does_not_track_path(self):
+        """失败结果不携带文件名（不误 track 错误文本里的单词）。"""
+        mem = SummaryMemory()
+        mem.compress([{"role": "user", "content": "[工具 edit 结果]\nFAIL: path required",
+                       "metadata": {"tool": "edit"}}], [])
+        assert mem.modified_files == []

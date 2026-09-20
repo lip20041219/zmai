@@ -891,3 +891,83 @@ class TestLoopGuardEscalationGate:
             f"强制期内无修改应有界失败, 实际 {action.type}: {action.output}"
         assert "force_edit armed" in (action.error or ""), \
             f"应由 force_edit 预算终止: {action.error}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 测试 9: P1-A — auto-verify 只能使用与当前 workspace 相关的证据
+# ═══════════════════════════════════════════════════════════════════
+
+_FIX_INDEX = ToolCall(
+    id="e1", name="edit",
+    params={"path": "app.py", "mode": "regex_replace",
+            "old_text": "def index", "new_text": """@app.route('/')
+def index"""})
+
+
+class TestAutoVerifyEvidenceScope:
+    def test_stale_failure_does_not_block_after_edit(self, tmp_path: Path, monkeypatch):
+        """A/B/C/D: 旧 failure → edit → 未重测 → auto-verify 不得再拿旧 failure 判失败。
+
+        观测：auto-verify 通过（无 [Verification Results]），从而走到 completion
+        守卫并注入"必须全绿重测"指令 —— 完成仍然被阻断（fail-closed 不变）。
+        """
+        project = tmp_path / "flask_av_stale"
+        _write_flask_project(project)
+        verify_msgs = _capture_messages(monkeypatch, "[Verification Results]")
+        workflow_msgs = _capture_messages(monkeypatch, "[Workflow]")
+
+        script: list[list[ToolCall] | None] = [
+            [_PYTEST],        # 失败（edit 之前 = 旧证据）
+            [_FIX_INDEX],     # 真实修改工作区
+            None,             # 未重测直接 end_turn
+        ]
+        backend = _ScriptedBackend(script)
+        ctx, action = asyncio.run(_run_agent(project, backend, max_steps=8))
+
+        assert not verify_msgs, \
+            f"edit 前的旧 failure 不得再被当成当前 workspace 的失败: {verify_msgs[:1]}"
+        assert any("全绿运行" in m for m in workflow_msgs), \
+            "应走到 completion 守卫并要求全绿重测"
+        assert action.type != "complete", "未重测不得完成"
+        assert ctx.metadata.get("ever_modified") is True
+
+    def test_retest_still_failing_keeps_blocking(self, tmp_path: Path, monkeypatch):
+        """E: edit 后重测仍失败 → 必须继续阻断（新失败证据仍参与判定）。"""
+        project = tmp_path / "flask_av_retest_fail"
+        _write_flask_project(project)
+        verify_msgs = _capture_messages(monkeypatch, "[Verification Results]")
+        workflow_msgs = _capture_messages(monkeypatch, "[Workflow]")
+
+        script: list[list[ToolCall] | None] = [
+            [_PYTEST],        # 失败
+            [ToolCall(id="e1", name="edit",   # 真实修改了工作区，但没有修好 bug
+                      params={"path": "app.py", "mode": "append",
+                              "new_text": "# no-op change"})],
+            [_PYTEST],        # 改后重测：仍然失败（这就是"当前 workspace 的失败证据"）
+            None,
+        ]
+        backend = _ScriptedBackend(script)
+        ctx, action = asyncio.run(_run_agent(project, backend, max_steps=8))
+
+        assert action.type != "complete", "重测仍失败时不得完成"
+        assert verify_msgs, "改后产生的失败证据必须继续参与 auto-verify 判定"
+        assert not any("全绿运行" in m for m in workflow_msgs), \
+            "重测仍失败时不应注入『去重测』指令（已经在重测）"
+
+    def test_green_retest_still_completes(self, tmp_path: Path):
+        """F: edit 后测试通过 → 不得被旧 failure 阻断。"""
+        project = tmp_path / "flask_av_green"
+        _write_flask_project(project)
+
+        script: list[list[ToolCall] | None] = [
+            [_PYTEST],
+            [_FIX_INDEX],
+            [ToolCall(id="p2", name="shell_exec",
+                      params={"command": "python -m pytest -q"})],
+            None,
+        ]
+        backend = _ScriptedBackend(script)
+        ctx, action = asyncio.run(_run_agent(project, backend, max_steps=8))
+
+        assert action.type == "complete", \
+            f"改后全绿应可完成, 实际 {action.type}: {action.error or action.output}"

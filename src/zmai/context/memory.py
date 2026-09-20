@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger("zmai.context.memory")
@@ -42,6 +43,44 @@ def _truncate_head_tail(text: str, max_chars: int, tail_chars: int = 3000) -> st
     head_chars = max_chars - tail_chars
     omitted = len(text) - head_chars - tail_chars
     return f"{text[:head_chars]}\n...(中间省略 {omitted} 字符)...\n{text[-tail_chars:]}"
+
+
+# ── edit / write_file 结果里的文件名提取 ──
+# tools.py 的真实输出形态：
+#   written <path> (<n> chars)               written (open) <path> (<n> chars)
+#   appended <path>
+#   replaced <n> matches in <path>           （regex_replace）
+#   replaced <path>:<start>-<end>            （replace_lines）
+#   inserted at <path>:<ln>
+# 旧实现取关键词后的**第一个 token**，于是 `replaced 1 matches in app.py` 把匹配数
+# 当成了文件名（_modified_files == ["1"]），auto_generate_checks 随即生成
+# verify_file_exists("1") 这种必然失败的 check，把已修好的运行错误判成验证失败。
+_EDIT_RESULT_KEYWORDS = ("written ", "replaced ", "appended ", "inserted at ")
+_TRAILING_RANGE_RE = re.compile(r"^(?P<path>.+?):\d+(?:-\d+)?$")
+
+
+def _looks_like_path(token: str) -> bool:
+    """token 是否像文件路径：含扩展名或路径分隔符，且不是纯数字（count）。"""
+    t = token.strip().strip("'\",;()")
+    if not t or t.replace(".", "").isdigit():
+        return False
+    return "." in t or "/" in t or "\\" in t
+
+
+def _extract_path_from_result(text: str) -> str:
+    """从 edit / write_file 的结果行里取文件名；取不到返回空串。
+
+    取**第一个像路径**的 token：`replaced 1 matches in app.py` 的 `1` / `matches`
+    会被 `_looks_like_path` 挡掉，落到 `app.py`。去尾部的 `:<start>-<end>` 范围后缀。
+    """
+    for tok in text.split():
+        t = tok.strip().strip("'\",;()")
+        m = _TRAILING_RANGE_RE.match(t)
+        if m:
+            t = m.group("path")
+        if _looks_like_path(t):
+            return t
+    return ""
 
 
 class SummaryMemory:
@@ -184,15 +223,11 @@ class SummaryMemory:
             if meta and meta.get("tool"):
                 tool_name = meta["tool"]
                 if "write_file" in tool_name or "edit" in tool_name:
-                    for find_kw in ("written ", "replaced ", "appended "):
-                        if find_kw in content:
-                            for line in content.split("\n"):
-                                if find_kw in line:
-                                    parts = line.split(find_kw, 1)
-                                    if len(parts) > 1:
-                                        fname = parts[1].split()[0] if parts[1].split() else ""
-                                        if fname and fname not in files:
-                                            files.append(fname)
+                    for line in content.split("\n"):
+                        if any(kw in line for kw in _EDIT_RESULT_KEYWORDS):
+                            fname = _extract_path_from_result(line)
+                            if fname and fname not in files:
+                                files.append(fname)
 
             # 失败信息
             if role == "user" and "FAIL:" in content:

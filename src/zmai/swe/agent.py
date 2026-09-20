@@ -1818,6 +1818,20 @@ class SWEAgent(Agent):
         if not modified_files and not tool_results:
             return None  # Nothing to check
 
+        # ── P1-A: 只用与**当前 workspace**相关的执行证据 ──
+        # 修改前产生的失败结果描述的是旧代码：工作区已经变了，那条失败可能早已不存在。
+        # 继续拿它生成 passed=False 的 check，会把"已修改、只是还没重测"的正常推进误判
+        # 成验证失败，烧掉 completion_block_count 并最终错误 FAILED。
+        # 修改**之后**产生的失败/成功结果照常参与判定，因此"改完重测仍失败 → 继续阻断"
+        # 与"改完重测通过 → 放行"都不受影响（completion 闸门另有一套证据约束）。
+        # ponytail: 只把成功的 edit/write_file 当作修改边界；shell 改文件（sed -i、
+        # python fix.py）识别不到 → 边界偏保守（旧失败仍被计入），不会漏放。
+        _last_mod = -1
+        for _i, _tr in enumerate(tool_results):
+            if _tr.get("name") in ("write_file", "edit") and _tr.get("success"):
+                _last_mod = _i
+        tool_results = tool_results[_last_mod + 1:]
+
         ws_path = context.workspace
         result = auto_generate_checks(modified_files, tool_results, ws_path)
         logger.info("Verification complete: %s (%d/%d)", result.summary,
