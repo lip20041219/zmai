@@ -125,6 +125,7 @@ class ContextManager:
         error: str | None = None,
         duration_ms: int = 0,
         truncate: int | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> None:
         """记录工具结果并注入一条 user 消息。
 
@@ -135,6 +136,10 @@ class ContextManager:
                 给定值 → **证据保留截断**：头部保留结构化摘要（如 ``[test summary]``），
                     尾部保留失败详情（traceback / 根因），中间省略。供测试失败证据
                     使用，避免模型只看到 pytest 的 session/collection 头。
+            meta: 随结果一起携带的归属信息（可选，默认 None，行为与改造前一致）。
+                同时写入 tool-result entry 与**注入模型的那条消息**的 metadata，
+                使 ``is_read_visible()`` 能按 key 判断该结果是否仍在可见窗口。
+                结构性字段（name/success/output/duration_ms/tool）优先，meta 不覆盖它们。
         """
         if truncate is None:
             def _cut(text: str) -> str:
@@ -147,6 +152,7 @@ class ContextManager:
 
         truncated = _cut(output or "")
         entry = {
+            **(meta or {}),
             "name": name,
             "success": success,
             "output": truncated,
@@ -163,10 +169,27 @@ class ContextManager:
         status = "OK" if success else "FAIL"
         detail = output or error or ""
         result_msg = f"[工具 {name} 结果]\n{status}: {_cut(detail)}"
-        slid = self._recent_win.add_message("user", result_msg, metadata={"tool": name})
+        slid = self._recent_win.add_message(
+            "user", result_msg, metadata={**(meta or {}), "tool": name})
         if slid:
             self._memory.compress(slid, [])
         self._ensure_budget()
+
+    def is_read_visible(self, read_key: Any) -> bool:
+        """该 key 对应的结果是否仍逐字位于**模型可见的活跃窗口**（P1-1）。
+
+        只查最近消息窗口 —— 那才是模型实际读到的那份内容；不查 ``_memory`` 里的
+        历史摘要，摘要不是原文，模型无法据它拿到源码。
+
+        找不到一律返回 False（fail-closed）：判"不可见"的代价只是多注入一次正文，
+        判"可见"的代价是模型被告知复用一份它已经看不到的内容 —— 后者正是 P1-1。
+        """
+        if not read_key:
+            return False
+        for msg in self._recent_win.messages:
+            if (msg.get("metadata") or {}).get("read_key") == read_key:
+                return True
+        return False
 
     # ═══════════════════════════════════════════════════════════════
     # 追踪

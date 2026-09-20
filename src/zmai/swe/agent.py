@@ -978,6 +978,9 @@ class SWEAgent(Agent):
                     project_path=context.config.get("project_path"),
                     config=context.config,
                     timeout=context.config.get("timeout", 30),
+                    # P1-1: 把"这份内容是否仍在模型可见窗口"的判据交给 ContextManager。
+                    # 工具只拿探针，不持有 cm 引用。
+                    read_visible=cm.is_read_visible,
                 )
                 _ts = _now_ms()
                 # 用 execute_tool 容错分发：LLM 幻觉出不存在的工具名时返回
@@ -1475,6 +1478,9 @@ class SWEAgent(Agent):
                     output=result.output or "",
                     error=result.error,
                     truncate=_test_evidence_budget(tc, result, cm),
+                    # P1-1: 把工具自带的 read_key 一路带进注入模型的那条消息，
+                    # 供 is_read_visible() 后续判断该结果是否还在可见窗口。
+                    meta=result.metadata,
                 )
                 # ── Edit syntax validation feedback + limited repair ──
                 # 语法验证失败的编辑：结构化错误已随工具结果进入上下文（含

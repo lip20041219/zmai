@@ -299,6 +299,22 @@ class OpenInBrowserTool(Tool):
         return result
 
 
+def _read_visible(context: ToolContext, read_key: object) -> bool:
+    """上下文可见性探针（P1-1）。
+
+    询问"这份 read 结果是否仍逐字位于模型可见窗口"。**fail-closed**：探针缺失、
+    不可调用、key 为空、或探针本身抛错，一律返回 False —— 判"不可见"只是多注入
+    一次正文；判"可见"会让模型被要求复用一份它已经看不到的内容（就是 P1-1）。
+    """
+    probe = getattr(context, "read_visible", None)
+    if not callable(probe) or not read_key:
+        return False
+    try:
+        return bool(probe(read_key))
+    except Exception:
+        return False
+
+
 class ReadFileTool(Tool):
     name = "read_file"
     description = "Read file content. Supports start_line and end_line. Max 10MB for text."
@@ -338,6 +354,8 @@ class ReadFileTool(Tool):
             return result
 
         # ── 读取缓存命中判定（文件自上次读取以来未变化）──
+        _cache_hit = False          # 文件维度：磁盘内容与缓存一致
+        _read_key: str | None = None
         agent = getattr(context, "agent_id", "?")
         try:
             st = full.stat()
@@ -353,17 +371,28 @@ class ReadFileTool(Tool):
                 cur_hash = hashlib.sha256(full.read_bytes()).hexdigest()
             except OSError:
                 cur_hash = ""
-            if cur_hash == _cached_hash:
+            _cache_hit = cur_hash == _cached_hash
+            if _cache_hit:
+                _read_key = _cached_hash
+            # ── P1-1: 轻量命中需要**两个**维度同时成立 ──
+            #   ① 文件没变（sha256 一致）—— 已有判据，不动；
+            #   ② 这份内容仍在模型可见窗口 —— 新增判据。
+            # 二者混为一谈就是 P1-1：compact 会把早先的 read 结果滚出 recent
+            # window 压成摘要，此时只回一句"请复用之前的读取结果"，模型手上已经
+            # 没有原文。判据缺失/抛错一律按不可见处理（见 _read_visible），走下面
+            # 的正常渲染路径，把带行号的正文重新交回。
+            if _cache_hit and _read_visible(context, _read_key):
                 result = ToolResult.ok(
                     output=(
                         f"[ReadCache] {path} 已在当前修复上下文读取过，内容未变化。\n"
                         f"请复用之前的读取结果，不要重复读取 —— 直接基于已读内容分析并修改代码。"
                     ),
-                    metadata={"cached": True, "line_count": _line_count, "size": _size},
+                    metadata={"cached": True, "line_count": _line_count,
+                              "size": _size, "read_key": _read_key},
                 )
                 _emit_tool_result(self.name, context, params, result, _st)
                 return result
-            # 内容已变化 → 缓存失效，走正常读取路径
+            # 内容已变化 → 缓存失效；或内容未变但已不可见 → 都走正常读取路径
 
         fsize = full.stat().st_size
         if fsize > self._MAX_TEXT_SIZE:
@@ -407,8 +436,9 @@ class ReadFileTool(Tool):
         selected = lines[max(0, start - 1):end]
         total = len(lines)
         numbered = "".join(f"{i+1:>4}|{line}" for i, line in enumerate(selected))
-        # 记录读取缓存（供后续重复读命中）
-        if cache_key is not None:
+        # 记录读取缓存（供后续重复读命中）。命中（内容未变）时跳过：条目已存在，
+        # 重复 append 只会让 order 列表堆积同一个 key，把其它条目提前挤掉。
+        if cache_key is not None and not _cache_hit:
             try:
                 content_hash = hashlib.sha256(full.read_bytes()).hexdigest()
             except OSError:
@@ -418,9 +448,11 @@ class ReadFileTool(Tool):
             if len(self._read_cache_order) > 400:  # 简单 LRU 上限，防无限增长
                 oldest = self._read_cache_order.pop(0)
                 self._read_cache.pop(oldest, None)
+            _read_key = content_hash or None
         result = ToolResult.ok(
             output=f"{path} ({total} lines, {start}-{min(end, total)})\n{numbered}",
-            metadata={"line_count": total, "size": fsize},
+            metadata={"line_count": total, "size": fsize,
+                      "cached": _cache_hit, "read_key": _read_key},
         )
         _emit_tool_result(self.name, context, params, result, _st)
         return result

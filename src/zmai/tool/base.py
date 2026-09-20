@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,9 @@ class ToolContext:
         timeout: 执行超时（秒），默认 120。
         env: 环境变量字典。
         logger: 日志记录器。
+        read_visible: 上下文可见性探针（可选）。工具用它询问"我上次产出的那份内容
+            是否仍逐字位于模型可见的窗口"。未注入（None）时调用方必须按**不可见**
+            处理（fail-closed），不得据此认为内容仍然可见。
     """
 
     agent_id: str
@@ -33,6 +37,8 @@ class ToolContext:
     timeout: int = 120
     env: dict[str, str] = field(default_factory=dict)
     logger: logging.Logger | None = None
+    # P1-1: 上下文可见性探针。默认 None —— 不注入时行为与改造前一致且 fail-closed。
+    read_visible: Callable[[Any], bool] | None = None
 
 
 @dataclass

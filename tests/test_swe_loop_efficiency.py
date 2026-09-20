@@ -76,11 +76,25 @@ class TestReadCache:
                            project_path=root, timeout=10)
 
     def test_repeated_read_hits_cache(self, tmp_path: Path):
+        """内容仍在模型可见窗口 → 轻量命中。
+
+        P1-1 起"轻量命中"需要两个条件同时成立：文件未变（sha256）**且**这份内容
+        仍在模型可见窗口（由 ToolContext.read_visible 探针给出）。因此本用例按
+        agent 侧的真实形态注册一次结果，而不是给一个没有任何可见性证据的裸
+        ToolContext —— 裸上下文下探针缺失，工具会按 fail-closed 直接回正文。
+        """
+        from zmai.context.manager import ContextManager
+        from zmai.tool import ToolContext
+
         (tmp_path / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        cm = ContextManager()
         tool = ReadFileTool()  # 同一实例 = 同一修复上下文
-        ctx = self._ctx(tmp_path)
+        ctx = ToolContext(agent_id="a", workspace_path=tmp_path,
+                          project_path=tmp_path, timeout=10,
+                          read_visible=cm.is_read_visible)
         r1 = tool.execute(ctx, {"path": "app.py"})
         assert r1.success
+        cm.add_tool_result("read_file", True, r1.output, meta=r1.metadata)
         r2 = tool.execute(ctx, {"path": "app.py"})
         assert r2.success
         assert "[ReadCache]" in r2.output, f"第二次读取应命中缓存: {r2.output}"

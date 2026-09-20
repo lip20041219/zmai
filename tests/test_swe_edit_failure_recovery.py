@@ -206,10 +206,12 @@ def _capture_tool_results(monkeypatch) -> list[dict[str, Any]]:
     seen: list[dict[str, Any]] = []
     original = ContextManager.add_tool_result
 
-    def _spy(self, name, success, output, error=None, duration_ms=0, truncate=None):
+    def _spy(self, name, success, output, error=None, duration_ms=0, truncate=None,
+             meta=None):
         seen.append({"name": name, "success": success,
                      "text": (output or "") + (error or "")})
-        return original(self, name, success, output, error, duration_ms, truncate)
+        return original(self, name, success, output, error, duration_ms, truncate,
+                        meta)
 
     monkeypatch.setattr(ContextManager, "add_tool_result", _spy)
     return seen
