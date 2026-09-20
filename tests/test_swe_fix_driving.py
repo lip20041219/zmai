@@ -116,8 +116,10 @@ class _ScriptedBackend(Backend):
         if calls:
             for c in calls:
                 self.calls_seen.append(c.name)
+        # 脚本耗尽 = 模拟模型结束回合。真实模型收尾时会**说话**；`content=""` +
+        # 无 tool_calls 是退化响应（P1-B 起 runtime 会重试它），不再用作收尾信号。
         return BackendResponse(
-            content="",
+            content="" if calls else "(no further tool calls)",
             tool_calls=calls,
             usage=TokenUsage(input_tokens=10, output_tokens=5),
             stop_reason="tool_use" if calls else "end_turn",

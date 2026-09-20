@@ -62,6 +62,15 @@ MAX_FORCE_EDIT_STEPS = 8
 # 引导其收敛 —— 必须在预算内明确失败，而不是无限重复"改坏 → 要求恢复 → 再改坏"。
 MAX_REGRESSION_RECOVERIES = 2
 
+# edit/write_file 执行失败后的**定向恢复**注入上限（P1: edit failure recovery）。
+# 观测（pylint-6506 / 5859 / 7228）：diagnosis → repair plan → force_edit →
+# edit failed → 无任何恢复消费者 → 模型漂移去跑 pytest / 写草稿脚本 → 0-byte diff。
+# force_edit 只是工具白名单状态，不是"edit 失败"的恢复状态。
+# 每次失败注入一条带 target 的恢复提示（强制修改期内额外放行一次对 target 的
+# 定向 read）；超过上限后不再注入，交由 MAX_FORCE_EDIT_STEPS / completion
+# fail-closed / LoopGuard 收尾 —— 不新增无界循环，也不放宽任何完成门禁。
+MAX_EDIT_FAILURE_RECOVERIES = 3
+
 
 def _now_ms() -> int:
     """当前时间戳（毫秒）。"""
@@ -225,6 +234,145 @@ def _is_full_scope_test_command(command: str) -> bool:
             return not [t for t in tokens[i + 1:]
                         if not t.startswith("-") and t not in _RUNNER_SUBCOMMANDS]
     return True
+
+
+def _norm_target_path(p: object) -> str:
+    """路径归一化 —— 只用于"是不是同一个目标文件"的比较，不做安全判定。"""
+    return os.path.normpath(str(p or "")).replace("\\", "/")
+
+
+def _reset_edit_failure_recovery(context: AgentContext) -> None:
+    """真实修改已落地 → 清零 edit-failure 恢复状态。
+
+    清零对象是**计数 + 定向 read 额度**：历史 edit 失败不得污染后续 repair cycle，
+    也不得在下一次进入强制修改期时留下一个可用的读取额度。
+    判据由调用方按工作区证据（had_modification / ever_modified）给出，而不是
+    "工具返回 success"。
+    """
+    context.metadata["edit_failure_recovery_attempts"] = 0
+    context.metadata["edit_recovery_read_allowance"] = 0
+
+
+def _take_edit_recovery_read(context: AgentContext, tc: ToolCall) -> bool:
+    """edit 失败恢复期内，放行**一次**对上一次失败目标文件的定向 read。
+
+    只放行 read_file、只放行目标文件本身、只放行一次、消耗即失效。不解除整段
+    force_edit（其余 read/grep/git/非测试 shell 仍被拒绝），也不给别的文件开口子。
+    """
+    left = int(context.metadata.get("edit_recovery_read_allowance", 0) or 0)
+    if left <= 0 or tc.name != "read_file":
+        return False
+    target = str(context.metadata.get("edit_failure_target") or "")
+    if not target:
+        return False
+    if _norm_target_path((tc.params or {}).get("path", "")) != _norm_target_path(target):
+        return False
+    context.metadata["edit_recovery_read_allowance"] = left - 1
+    return True
+
+
+def _handle_edit_failure(context: AgentContext, cm: ContextManager,
+                         tc: ToolCall, result: ToolResult) -> None:
+    """目标源码文件的 edit/write_file 执行失败 → 有界、定向的恢复注入。
+
+    只处理"调用真的执行了、但对目标文件的修改没有落地"这一种失败
+    （空 diff / 正则错误 / 截断 / 写入失败 / TestGuard 拒绝）。
+
+    不处理 EDIT_VALIDATION_FAILED —— 那条已有专用路径（[EDIT_REPAIR]），
+    这里若也消费会让同一失败被两套机制重复计数。
+
+    TestGuard 拒绝是个特例：那次尝试的目标本身非法（测试/验收文件只读），
+    绝不能把它当成"恢复目标"写进提示，否则等于持续把模型推向测试文件。
+    """
+    error = result.error or ""
+    if "EDIT_VALIDATION_FAILED" in error:       # 语法错误：专用路径，不重复消费
+        return
+    attempted = str((tc.params or {}).get("path", "") or "")
+    _test_rejection = "TestGuard" in error
+    if _test_rejection:
+        # 保持上一次的**源码**目标（若有），而不是这次被拒的测试文件
+        target = str(context.metadata.get("edit_failure_target") or "")
+        if not target:                          # 还没记录过源码目标 → 用诊断落点兜底
+            target = str(getattr(
+                context.metadata.get("last_failure_issue"), "file", "") or "")
+    else:
+        target = attempted
+        if attempted:
+            context.metadata["edit_failure_target"] = attempted
+
+    attempts = int(context.metadata.get("edit_failure_recovery_attempts", 0) or 0) + 1
+    context.metadata["edit_failure_recovery_attempts"] = attempts
+    _stats(context, edit_failures=1)
+    first_line = (error.strip().splitlines() or ["(no error message)"])[0]
+    logger.warning("[EDIT_FAILURE] file=%s attempt=%d/%d error=%s",
+                   attempted or "(unknown)", attempts,
+                   MAX_EDIT_FAILURE_RECOVERIES, first_line)
+
+    if attempts > MAX_EDIT_FAILURE_RECOVERIES:
+        # 有界：不再注入。强制期预算 / completion fail-closed / LoopGuard 照旧收尾。
+        logger.warning(
+            "Edit-failure recovery budget exhausted (%d) — no further recovery (%s)",
+            attempts, context.agent_id,
+        )
+        return
+    _stats(context, edit_failure_recoveries=1)
+
+    # 定向 read：只在"读取本来就被结构性禁用"的强制修改期内才需要放行一次。
+    # 判据落在 **target**，而不是"这次被拒的文件"：TestGuard 拒绝时 target 保留的
+    # 是上一次的源码目标（见上方分支），沿用 `not _test_rejection` 会把源码 target
+    # 的读取额度一并关掉，让下面那句 "read target first" 变成空头支票。
+    # 额度只放行 `read_file`（见 _take_edit_recovery_read），不触及 edit/write_file，
+    # TestGuard 对测试文件的写保护语义不受影响。
+    _arm_read = bool(target) and bool(context.metadata.get("force_edit"))
+    if _arm_read:
+        context.metadata["edit_recovery_read_allowance"] = 1
+
+    lines = [
+        "[EDIT_FAILURE_RECOVERY] 上一次 edit/write_file 执行失败——修改没有落地。",
+        f"target: {target or '(未知——请先用 grep 定位需要修改的业务源码文件)'}",
+        f"error: {first_line}",
+    ]
+    if _test_rejection:
+        lines.append(
+            "注意：失败原因是目标文件属于测试/验收文件（TestGuard 只读保护）。"
+            "测试文件永远不得修改——target 必须是业务源码文件。"
+        )
+    lines += [
+        "required:",
+        "- read target file first: 先 `read_file` 读 target 的**真实**内容与行号"
+        + ("（读取工具当前被禁用，仅本文件放行一次）" if _arm_read else ""),
+        "- re-plan the edit: 按读到的真实内容重新确定改法（old_text / 行号 / 新内容）",
+        "- retry modification: 下一次必须用 `edit` 或 `write_file` 让 target 真实发生修改",
+        "- do not modify tests or unrelated files: 不得改测试文件、草稿文件或无关路径",
+        "不要用重跑 pytest、写草稿脚本或探索无关路径来替代这次修改——"
+        "先把这次失败的修改在 target 上做成。",
+    ]
+    cm.add_message("user", "\n".join(lines))
+
+
+def _degenerate_response_reason(response: BackendResponse) -> str | None:
+    """退化响应判定：退化时返回原因字符串，正常响应返回 None（P1-B）。
+
+    观测（pylint-5859 / 7228）：连续 4 次 `content="" tool_calls=[]` 被当成正常回合
+    消费 —— 完成门禁累计 3 次后 fail，全程没有任何机制重试或标注它。Runtime 无法
+    区分"模型什么都没说"与"模型主动收尾"。
+
+    两类退化：
+      1. 截断且**无** tool_calls：stop_reason=length/max_tokens —— 文本不完整，
+         不能当作结束（deepseek 透传 OpenAI 的 "length"；claude/gemini 归一化为
+         "max_tokens"）。带 tool_calls 的截断回合不在此列：重试复用的是同一个请求
+         （max_tokens 不变），截断是确定性的，重试只会烧完预算再 fail-closed，
+         反而把一次可继续的回合变成硬失败。
+      2. 空响应：content 与 tool_calls 同时为空。
+
+    判据刻意保守：**content 非空即视为正常**。因此 `content="done" + tool_calls=[]`
+    这类合法纯文本收尾不受影响，也不影响任何带 tool_calls 的回合。
+    """
+    if response.stop_reason in ("length", "max_tokens") and not response.tool_calls:
+        return f"truncated response (stop_reason={response.stop_reason})"
+    if not response.content and not response.tool_calls:
+        return "empty response (no content, no tool calls)"
+    return None
 
 
 def _log_stop() -> None:
@@ -432,6 +580,17 @@ def _build_fix_state_directive(context: AgentContext) -> str:
             "`show_to_user`, and `shell_exec` running pytest."
         )
         lines.append("- Your next tool call MUST be `edit` or `write_file`.")
+        # edit 失败恢复放行了**一次**对目标文件的定向 read。状态块若继续宣称读取
+        # 全禁用，模型会当成矛盾指令而不敢重读，恢复提示里的 "read target first"
+        # 就成了空头支票（与 LoopRecovery 处同一条教训）。
+        _allow = int(context.metadata.get("edit_recovery_read_allowance", 0) or 0)
+        _rt = str(context.metadata.get("edit_failure_target") or "")
+        if _allow > 0 and _rt:
+            lines.append(
+                f"- EXCEPTION (上一次 edit 失败): ONE `read_file` of `{_rt}` is allowed "
+                "now so you can re-read its real content before retrying the edit. "
+                "After that single read, reads are rejected again."
+            )
     elif test_failed:
         lines.append(
             f"- tests are FAILING → you MUST emit `edit` or `write_file` to fix "
@@ -731,23 +890,37 @@ class SWEAgent(Agent):
             try:
                 response = await run_sync(context.backend.invoke, request)
                 last_error = None
-                break
             except BackendError:
                 raise  # BackendError propagates immediately, no retry
             except Exception as e:
                 last_error = e
-                if attempt < max_retries - 1:
-                    wait = 2 ** attempt
-                    logger.info(
-                        "Backend call failed (attempt %d/%d), waiting %.1fs: %s",
-                        attempt + 1, max_retries, wait, e,
-                    )
-                    await asyncio.sleep(wait)
-                else:
-                    logger.error(
-                        "Backend call permanently failed (attempt %d/%d): %s",
-                        attempt + 1, max_retries, e,
-                    )
+                response = None
+            # ── P1-B: 退化响应不进入正常回合 ──────────────────
+            # HTTP 200 + 空/截断响应走同一条 retry budget 与退避：它与网络抖动
+            # 一样属于"这一次调用没拿到可用输出"，不该被当成一次模型决策消费。
+            # 复用既有预算，不新增状态机；耗尽后由下方 fail-closed 分支收尾。
+            if last_error is None and response is not None:
+                _degenerate = _degenerate_response_reason(response)
+                if _degenerate is not None:
+                    _stats(context, degenerate_responses=1)
+                    logger.warning("[DegenerateResponse] attempt %d/%d: %s (%s)",
+                                   attempt + 1, max_retries, _degenerate, context.agent_id)
+                    last_error = RuntimeError(f"[DEGENERATE_RESPONSE] {_degenerate}")
+                    response = None
+            if last_error is None:
+                break
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                logger.info(
+                    "Backend call failed (attempt %d/%d), waiting %.1fs: %s",
+                    attempt + 1, max_retries, wait, last_error,
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.error(
+                    "Backend call permanently failed (attempt %d/%d): %s",
+                    attempt + 1, max_retries, last_error,
+                )
 
         if last_error or response is None:
             _l = context.metadata.get("__log__")
@@ -828,7 +1001,11 @@ class SWEAgent(Agent):
                     tc.name == "shell_exec"
                     and is_test_command(str(tc.params.get("command", "")))
                 )
-                if (_force_edit and not _test_cmd_exempt
+                # 例外：edit 失败恢复期内，对**上一次失败的目标文件**放行一次定向
+                # read（消耗式）。不解除 force_edit —— 其余 read/grep/git/非测试
+                # shell 照旧被拒绝，其它文件也拿不到这个额度。
+                _recovery_read = _force_edit and _take_edit_recovery_read(context, tc)
+                if (_force_edit and not _test_cmd_exempt and not _recovery_read
                         and tc.name not in ("edit", "write_file", "show_to_user")):
                     # 恢复态优先：上一次修改已让项目无法 import 时，正确的下一步是
                     # "撤回那次修改"，而不是继续叠加新修改（P1-D）。
@@ -889,6 +1066,8 @@ class SWEAgent(Agent):
                     if completion:
                         completion.record_modification(step=context.step_count)
                     context.metadata["test_success_count"] = 0
+                    # 工作区真的变了 → 这次 edit-failure cycle 结束，状态清零
+                    _reset_edit_failure_recovery(context)
                 if result.success:
                     step_tool_ok += 1
                     # 只有真正改写工作区代码的调用才算"修改证据"。git status/diff/log
@@ -914,6 +1093,9 @@ class SWEAgent(Agent):
                         # completion.should_complete() 已是 False，metadata["tests_passed"]
                         # 却仍为 True，两个真相源互相矛盾。
                         context.metadata["test_success_count"] = 0
+                        # 目标源码真实发生修改 → edit-failure 恢复计数清零，
+                        # 不让历史失败污染后续 repair cycle（P1: edit failure recovery）。
+                        _reset_edit_failure_recovery(context)
                 else:
                     step_tool_fail += 1
                 # ── 测试运行检测（无论成败）──
@@ -1327,6 +1509,17 @@ class SWEAgent(Agent):
                             "一次性重写该文件的正确版本。\n"
                             f"最近一次语法错误 ({_err_type}) 详见上一条工具结果。"
                         )
+                # ── Edit failure recovery（P1）──────────────────────────
+                # 目标源码的 edit/write_file **执行失败**（空 diff / 正则错误 / 截断 /
+                # 写入失败 / TestGuard 拒绝）时，此前只累加 step_tool_fail，没有任何
+                # 恢复消费者：模型在 force_edit 下拿不到靶子，于是漂移去跑 pytest、
+                # 写草稿文件、探索无关路径，最终 0-byte diff（pylint-6506/5859/7228）。
+                # 这里把模型拉回**同一个目标文件**，并（强制修改期内）放行一次定向
+                # read，让"重读真实内容 → 重新规划 → 重试修改"这条路径可执行。
+                # 有界、不改测试、不放宽完成门禁。
+                elif (tc.name in ("edit", "write_file") and not result.success
+                        and result.error and not _intercepted):
+                    _handle_edit_failure(context, cm, tc, result)
             # ── LoopGuard: track no-modification steps ──
             if guard and not had_modification:
                 guard.record_no_modification()
@@ -1933,6 +2126,8 @@ class SWEAgent(Agent):
                 "ever_modified": context.metadata.get("ever_modified", False),
                 "test_success_count": context.metadata.get("test_success_count", 0),
                 "edit_repair_attempts": context.metadata.get("edit_repair_attempts", 0),
+                "edit_failure_recovery_attempts": context.metadata.get(
+                    "edit_failure_recovery_attempts", 0),
                 "edit_validation_failures": context.metadata.get(
                     "swe_stats", {}
                 ).get("edit_validation_failures", 0),

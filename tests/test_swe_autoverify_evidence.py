@@ -82,8 +82,10 @@ class _ScriptedBackend(Backend):
     def invoke(self, request: BackendRequest) -> BackendResponse:
         calls = self._script[self._idx] if self._idx < len(self._script) else None
         self._idx += 1
+        # 脚本耗尽 = 模拟模型结束回合，必须带非空 content：`content=""` + 无
+        # tool_calls 是退化响应（P1-B 起 runtime 会重试它），不再是合法收尾信号。
         return BackendResponse(
-            content="",
+            content="" if calls else "(no further tool calls)",
             tool_calls=calls,
             usage=TokenUsage(input_tokens=10, output_tokens=5),
             stop_reason="tool_use" if calls else "end_turn",
