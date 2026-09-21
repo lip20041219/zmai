@@ -30,6 +30,7 @@ from zmai.swe.tools import (
     ShellTool,
     ShowToUserTool,
     WriteFileTool,
+    _is_test_file,
     is_test_command,
 )
 from zmai.swe.verifier import (
@@ -244,13 +245,14 @@ def _norm_target_path(p: object) -> str:
 def _reset_edit_failure_recovery(context: AgentContext) -> None:
     """真实修改已落地 → 清零 edit-failure 恢复状态。
 
-    清零对象是**计数 + 定向 read 额度**：历史 edit 失败不得污染后续 repair cycle，
-    也不得在下一次进入强制修改期时留下一个可用的读取额度。
+    清零对象是**计数 + 两种一次性额度**（定向 read / 目标发现 grep）：历史 edit
+    失败不得污染后续 repair cycle，也不得在下一次进入强制修改期时留下可用的额度。
     判据由调用方按工作区证据（had_modification / ever_modified）给出，而不是
     "工具返回 success"。
     """
     context.metadata["edit_failure_recovery_attempts"] = 0
     context.metadata["edit_recovery_read_allowance"] = 0
+    context.metadata["edit_recovery_grep_allowance"] = 0
 
 
 def _take_edit_recovery_read(context: AgentContext, tc: ToolCall) -> bool:
@@ -268,6 +270,31 @@ def _take_edit_recovery_read(context: AgentContext, tc: ToolCall) -> bool:
     if _norm_target_path((tc.params or {}).get("path", "")) != _norm_target_path(target):
         return False
     context.metadata["edit_recovery_read_allowance"] = left - 1
+    return True
+
+
+def _take_edit_recovery_grep(context: AgentContext, tc: ToolCall) -> bool:
+    """目标未知的 edit 失败恢复期内，放行**一次** grep 用于发现源码目标。
+
+    与 `_take_edit_recovery_read` 分工互补，二者互斥：
+      * 目标已知 → 定向 read（重读真实内容后再改）；
+      * 目标未知 → 本函数，一次 grep 找到"该改哪个文件"。
+
+    TestGuard 拒绝时若从未记录过源码目标，`edit_failure_target` 与
+    `last_failure_issue` 皆空，恢复提示会要求模型"先用 grep 定位"——但在
+    force_edit 下 grep 与 read_file 一并被结构性拦截，这条指令不可执行，
+    模型只能在预算内反复盲试 edit/write_file（pylint-6506/5859/7228 的
+    0-byte diff 形态）。额度只认 grep、只发一次、不解除 force_edit，
+    也不给 read_file/git/普通 shell 开口子。
+    """
+    if tc.name != "grep":
+        return False
+    if str(context.metadata.get("edit_failure_target") or ""):
+        return False  # 目标已知 → 走定向 read 那条路，不重复开口子
+    left = int(context.metadata.get("edit_recovery_grep_allowance", 0) or 0)
+    if left <= 0:
+        return False
+    context.metadata["edit_recovery_grep_allowance"] = left - 1
     return True
 
 
@@ -295,6 +322,19 @@ def _handle_edit_failure(context: AgentContext, cm: ContextManager,
         if not target:                          # 还没记录过源码目标 → 用诊断落点兜底
             target = str(getattr(
                 context.metadata.get("last_failure_issue"), "file", "") or "")
+            # 兜底目标取自 traceback 落点，而**测试失败**的落点就是测试文件本身
+            # （FailureIssue.file = 断言失败的那个 test_*.py）。不过滤就等于把
+            # "恢复目标"指向只读验收文件：定向 read 额度发给它，提示还会要求
+            # "让 target 真实发生修改"——与本函数下方"target 必须是业务源码文件"
+            # 直接矛盾，并把模型持续推回它刚被拒绝的动作（pylint-5859/7228）。
+            # 判据复用 TestGuard 自己的 `_is_test_file`，保证两边口径完全一致：
+            # 凡 TestGuard 拒绝写入的文件，都不得被当作恢复目标。
+            if target:
+                _root = Path((context.config or {}).get("project_path")
+                             or context.workspace or ".")
+                _tp = Path(target)
+                if _is_test_file(_tp if _tp.is_absolute() else _root / _tp, _root):
+                    target = ""
     else:
         target = attempted
         if attempted:
@@ -323,13 +363,20 @@ def _handle_edit_failure(context: AgentContext, cm: ContextManager,
     # 的读取额度一并关掉，让下面那句 "read target first" 变成空头支票。
     # 额度只放行 `read_file`（见 _take_edit_recovery_read），不触及 edit/write_file，
     # TestGuard 对测试文件的写保护语义不受影响。
-    _arm_read = bool(target) and bool(context.metadata.get("force_edit"))
+    _force_edit_active = bool(context.metadata.get("force_edit"))
+    _arm_read = bool(target) and _force_edit_active
     if _arm_read:
         context.metadata["edit_recovery_read_allowance"] = 1
+    # 目标未知（TestGuard 拒绝且从未记录过源码目标）→ 发一次 grep 发现额度。
+    # 此时若不放行 grep，恢复提示里"先用 grep 定位"在 force_edit 下不可执行：
+    # 两个工具都被结构性禁用，模型拿不到任何靶子，只能盲试直到预算耗尽。
+    _arm_grep = not target and _force_edit_active
+    if _arm_grep:
+        context.metadata["edit_recovery_grep_allowance"] = 1
 
     lines = [
         "[EDIT_FAILURE_RECOVERY] 上一次 edit/write_file 执行失败——修改没有落地。",
-        f"target: {target or '(未知——请先用 grep 定位需要修改的业务源码文件)'}",
+        f"target: {target or '(未知——尚无合法的业务源码目标，需要先定位)'}",
         f"error: {first_line}",
     ]
     if _test_rejection:
@@ -337,15 +384,38 @@ def _handle_edit_failure(context: AgentContext, cm: ContextManager,
             "注意：失败原因是目标文件属于测试/验收文件（TestGuard 只读保护）。"
             "测试文件永远不得修改——target 必须是业务源码文件。"
         )
+        if _arm_grep:
+            # 兜底目标（诊断落点）恰好是测试文件、已被过滤掉时，必须说清
+            # "为什么这次没有 target"，否则模型会以为只是暂时拿不到。
+            lines.append(
+                "上一次的失败目标属于测试/验收文件，已被排除，**不得**作为恢复目标"
+                "（它只读，改它等于伪造验收）。本次恢复没有已知 target。"
+            )
+    if _arm_grep:
+        # 目标未知时，恢复提示不能只喊"去用 grep"却把它拦死。明确说明这是
+        # **本次恢复专属的一次性额度**，避免模型把它当成通用读取权限而滥用。
+        lines.append(
+            "本次 recovery 只允许一次 `grep` 用于发现业务源码目标"
+            "（force_edit 下这是唯一一次读取类调用，且不会因此开放 read_file）。\n"
+            "步骤：① 用这次 grep 定位真正需要修改的业务源码文件；"
+            "② 重新规划改法；③ 再用 `edit` / `write_file` 修改该源码文件。\n"
+            "目标确定之前，不要重复尝试修改测试文件——测试文件永远不得修改。"
+        )
     lines += [
         "required:",
         "- read target file first: 先 `read_file` 读 target 的**真实**内容与行号"
-        + ("（读取工具当前被禁用，仅本文件放行一次）" if _arm_read else ""),
+        + ("（读取工具当前被禁用，仅本文件放行一次）" if _arm_read else
+           "（目标未知 → 先用上面那唯一一次 `grep` 定位业务源码文件，再读它）"
+           if _arm_grep else ""),
         "- re-plan the edit: 按读到的真实内容重新确定改法（old_text / 行号 / 新内容）",
-        "- retry modification: 下一次必须用 `edit` 或 `write_file` 让 target 真实发生修改",
+        "- retry modification: " + (
+            "目标确定后，下一次用 `edit` 或 `write_file` 让该源码文件真实发生修改"
+            if _arm_grep else
+            "下一次必须用 `edit` 或 `write_file` 让 target 真实发生修改"
+        ),
         "- do not modify tests or unrelated files: 不得改测试文件、草稿文件或无关路径",
         "不要用重跑 pytest、写草稿脚本或探索无关路径来替代这次修改——"
-        "先把这次失败的修改在 target 上做成。",
+        "先把这次失败的修改在真正的源码目标上做成。",
     ]
     cm.add_message("user", "\n".join(lines))
 
@@ -590,6 +660,15 @@ def _build_fix_state_directive(context: AgentContext) -> str:
                 f"- EXCEPTION (上一次 edit 失败): ONE `read_file` of `{_rt}` is allowed "
                 "now so you can re-read its real content before retrying the edit. "
                 "After that single read, reads are rejected again."
+            )
+        # 目标未知时发的是 grep 发现额度。状态块若不声明它，"读取全禁用"就会
+        # 与恢复提示里的一次性 grep 互相矛盾（同 `_rt` 那条教训）。
+        _gallow = int(context.metadata.get("edit_recovery_grep_allowance", 0) or 0)
+        if _gallow > 0:
+            lines.append(
+                "- EXCEPTION (上一次 edit 失败且目标未知): ONE `grep` is allowed now "
+                "to locate the source file that must be modified. After that single "
+                "grep, reads are rejected again."
             )
     elif test_failed:
         lines.append(
@@ -1024,7 +1103,12 @@ class SWEAgent(Agent):
                 # 例外：edit 失败恢复期内，对**上一次失败的目标文件**放行一次定向
                 # read（消耗式）。不解除 force_edit —— 其余 read/grep/git/非测试
                 # shell 照旧被拒绝，其它文件也拿不到这个额度。
-                _recovery_read = _force_edit and _take_edit_recovery_read(context, tc)
+                # 目标未知时改发一次 grep 发现额度：两个取用函数互斥（read 只认
+                # read_file、grep 只认 grep 且要求 target 为空），不会双重消耗。
+                _recovery_read = _force_edit and (
+                    _take_edit_recovery_read(context, tc)
+                    or _take_edit_recovery_grep(context, tc)
+                )
                 if (_force_edit and not _test_cmd_exempt and not _recovery_read
                         and tc.name not in ("edit", "write_file", "show_to_user")):
                     # 恢复态优先：上一次修改已让项目无法 import 时，正确的下一步是
