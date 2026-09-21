@@ -72,6 +72,13 @@ MAX_REGRESSION_RECOVERIES = 2
 # fail-closed / LoopGuard 收尾 —— 不新增无界循环，也不放宽任何完成门禁。
 MAX_EDIT_FAILURE_RECOVERIES = 3
 
+# SWE agent 写入 memory 时使用的 namespace。
+# 写入端与读取端（step() 注入 ## Memory Context 处）**必须共用这一个常量**：
+# 历史缺陷是写入用 "tools"、读取用 `WorkingMemory.search("")` 的默认
+# namespace="default"，两端口径不一致 → `MemoryManager.restore()` 明明恢复了条目，
+# `## Memory Context` 却永远为空（跨 run 记忆整个失效）。
+_MEMORY_NS_TOOLS = "tools"
+
 
 def _now_ms() -> int:
     """当前时间戳（毫秒）。"""
@@ -949,7 +956,9 @@ class SWEAgent(Agent):
         memory_context = ""
         if context.memory:
             wm = context.memory.working(context.agent_id)
-            mem_items = wm.search("")  # all entries
+            # namespace 必须与写入端（见 _MEMORY_NS_TOOLS）一致：search 的默认
+            # namespace 是 "default"，与写入用的 "tools" 不同，读回来永远是空。
+            mem_items = wm.search("", namespace=_MEMORY_NS_TOOLS)  # all entries
             if mem_items:
                 mem_lines = []
                 for e in mem_items[:10]:  # max 10 entries
@@ -1593,7 +1602,7 @@ class SWEAgent(Agent):
                         "success": result.success,
                         "output": (result.output or "")[:200],
                         "error": result.error,
-                    }, namespace="tools")
+                    }, namespace=_MEMORY_NS_TOOLS)
                 # Add tool results via ContextManager
                 cm.add_tool_result(
                     name=tc.name,
