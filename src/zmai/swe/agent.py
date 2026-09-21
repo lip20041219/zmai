@@ -1321,21 +1321,27 @@ class SWEAgent(Agent):
                         _baseline = context.metadata.get("baseline_test_count")
                         # partial_green：子集全绿但未覆盖完整基线。
                         # 它不是 failed，但也不能算 full_green / complete。
-                        # ── P1-2: 首次"全绿"运行不得自证 baseline ──
-                        # baseline 是"完整套件有多少测试"的断言，只有两种运行有资格
-                        # 建立它：失败的运行（诊断运行，暴露了套件真实规模），或未指定
-                        # 测试目标的运行（裸 `pytest -q`，跑的就是全套件）。
-                        # 首次就"子集 + 全绿"两者都不满足：它既没暴露别的测试、也没
-                        # 覆盖它们。照旧锁成 baseline，等于用"我只跑了这 1 个且它通过
-                        # 了"自证整个套件只有 1 个测试 → 直接拿到 completion 资格。
+                        # ── P1-2 / P2-2: baseline 只能由"可证明覆盖完整套件"的运行建立 ──
+                        # baseline 是"完整套件有多少测试"的断言。唯一能证明这件事的
+                        # 命令形式是未指定测试目标（裸 `pytest -q`）——见
+                        # `_is_full_scope_test_command`。
+                        # P1-2 已堵住"首次子集**全绿**自证 baseline"；P2-2 补上对称的
+                        # 那一半："首次子集**失败**"同样不得自证。
+                        # 失败只暴露**这次跑了多少个**测试，不暴露套件规模：`pytest
+                        # test_x.py` 失败只能证明 test_x.py 里有 1 个测试。旧条件里的
+                        # `not passed` 让失败的子集运行获得了绿运行永远拿不到的授权 ——
+                        # baseline 被锁成子集规模后，同一子集再跑绿即满足
+                        # `_total_tests >= _baseline`，于是"只验证了子集"被当成
+                        # "完整套件全绿"，携带未验证范围判定完成（fail-open）。
                         _full_scope_cmd = _is_full_scope_test_command(_cmd_l)
                         _scope_complete = True
                         if _baseline is None:
-                            if _total_tests > 0 and (not passed or _full_scope_cmd):
+                            if _total_tests > 0 and _full_scope_cmd:
                                 context.metadata["baseline_test_count"] = _total_tests
                             elif _total_tests > 0:
-                                # 首次即子集全绿：不锁定 baseline，本次也不算 full_green。
-                                # 下一轮由 partial_green 分支提示跑完整套件，届时再建立基线。
+                                # 非完整范围（无论成败）：不锁定 baseline，本次也不算
+                                # full_green。下一轮由 partial_green 分支提示跑完整套件，
+                                # 届时再建立基线。
                                 _scope_complete = False
                         elif passed and _baseline > 0 and _total_tests < _baseline:
                             logger.warning(

@@ -48,9 +48,32 @@ def _write_project(tmp_path: Path) -> None:
     (tmp_path / "test_app.py").write_text("".join(sub), encoding="utf-8")
 
 
+def _write_scope9_project(tmp_path: Path) -> None:
+    """专用夹具：裸 `python -m pytest -q` 恰好收集 9 个测试。
+
+    原 `_write_project` 里 test_all.py(9) 与 test_app.py(7) 同目录，裸运行收集 16 个
+    —— "完整套件 = 9"只能靠显式目标 `pytest test_all.py` 表达，而那条命令不是
+    full-scope，没有资格建立 baseline。本夹具只放一个测试文件，使裸运行的收集数
+    就是 9，完整保留原语义："7 个恒过 + 2 个依赖 bug.FIXED"。
+    """
+    (tmp_path / "bug.py").write_text("FIXED = False\n", encoding="utf-8")
+    lines = ["import bug\n"]
+    for i in range(1, 8):
+        lines.append(f"def test_ok{i}():\n    assert True\n")
+    lines.append("def test_fix1():\n    assert bug.FIXED\n")
+    lines.append("def test_fix2():\n    assert bug.FIXED\n")
+    (tmp_path / "test_all.py").write_text("".join(lines), encoding="utf-8")
+
+
 def _pytest(file: str) -> ToolCall:
     return ToolCall(id=f"pt_{file}", name="shell_exec",
                     params={"command": f"python -m pytest {file} -q"})
+
+
+def _subset7() -> ToolCall:
+    """子集命令：`-k ok` 选中 9 个中的 7 个恒过测试（非 full-scope）。"""
+    return ToolCall(id="pt_sub7", name="shell_exec",
+                    params={"command": "python -m pytest test_all.py -q -k ok"})
 
 
 def _bare() -> ToolCall:
@@ -123,15 +146,19 @@ def _messages_text(ctx: AgentContext) -> str:
 
 def test_partial_green_then_full_green(tmp_path):
     """子集 7 全绿(baseline=9) → partial_green，不 complete、不累计；
-    完整 9 全绿 → complete。"""
+    完整 9 全绿 → complete。
+
+    P2-2 起 baseline 只能由 full-scope 命令建立，因此"暴露套件真实规模 9"的那次
+    失败运行改用裸 `pytest -q`（收集 9），子集运行改用 `-k ok`（收集 7）。
+    """
     script = [
-        [_pytest("test_all.py")],  # 7 passed, 2 failed → baseline=9, failed
-        [_fix()],                  # 修复 bug.py
-        [_pytest("test_app.py")],  # 子集 7 passed → partial_green
-        [_pytest("test_all.py")],  # 9 passed → full_green → complete
+        [_bare()],      # 完整 9 → 7 passed, 2 failed → baseline=9, failed
+        [_fix()],       # 修复 bug.py
+        [_subset7()],   # 子集 7 passed → partial_green
+        [_bare()],      # 完整 9 passed → full_green → complete
         None,
     ]
-    ctx, actions = asyncio.run(_run(tmp_path, script))
+    ctx, actions = asyncio.run(_run(tmp_path, script, project=_write_scope9_project))
 
     # failed（round 0）不 complete
     assert actions[0] != "complete"
@@ -155,15 +182,18 @@ def test_partial_green_then_full_green(tmp_path):
 
 
 def test_partial_green_alone_never_completes(tmp_path):
-    """只有子集全绿、从不跑完整套件 → 永不 complete，只 continue。"""
+    """只有子集全绿、从不跑完整套件 → 永不 complete，只 continue。
+
+    同 P2-2：baseline 由裸 `pytest -q` 建立，子集用 `-k ok` 表达。
+    """
     script = [
-        [_pytest("test_all.py")],  # baseline=9, failed
+        [_bare()],      # 完整 9 → baseline=9, failed
         [_fix()],
-        [_pytest("test_app.py")],  # 子集 7 → partial_green
-        [_pytest("test_app.py")],  # 再子集 7 → 仍 partial_green
+        [_subset7()],   # 子集 7 → partial_green
+        [_subset7()],   # 再子集 7 → 仍 partial_green
         None,
     ]
-    ctx, actions = asyncio.run(_run(tmp_path, script))
+    ctx, actions = asyncio.run(_run(tmp_path, script, project=_write_scope9_project))
 
     assert actions[-1] != "complete", f"只子集全绿不应 complete: {actions}"
     assert ctx.metadata.get("test_success_count", 0) == 0
@@ -218,12 +248,12 @@ def test_partial_green_exit0_does_not_complete():
 def test_full_green_sets_success_count_and_scope_complete(tmp_path):
     """TEST 6/7：完整 pytest 全绿后 test_success_count==1 且 should_complete()==True。"""
     script = [
-        [_pytest("test_all.py")],  # baseline=9, failed
+        [_bare()],   # 完整 9 → baseline=9, failed
         [_fix()],
-        [_pytest("test_all.py")],  # 9 passed → full_green
+        [_bare()],   # 9 passed → full_green
         None,
     ]
-    ctx, actions = asyncio.run(_run(tmp_path, script))
+    ctx, actions = asyncio.run(_run(tmp_path, script, project=_write_scope9_project))
     assert actions[-1] == "complete"
     assert ctx.metadata["test_success_count"] == 1
     comp: CompletionState = ctx.metadata["completion"]
@@ -235,15 +265,15 @@ def test_full_green_sets_success_count_and_scope_complete(tmp_path):
 def test_complete_then_no_more_llm_or_tool(tmp_path):
     """TEST 4：complete 后不得再调用 LLM/tool（backend.invoke 不得再被调用）。"""
     script = [
-        [_pytest("test_all.py")],  # baseline=9, failed
+        [_bare()],   # 完整 9 → baseline=9, failed
         [_fix()],
-        [_pytest("test_all.py")],  # 9 passed → full_green → complete
-        [_pytest("test_all.py")],  # 多余调用——应永远不会执行
+        [_bare()],   # 9 passed → full_green → complete
+        [_bare()],   # 多余调用——应永远不会执行
         None,
     ]
     backend = _ScriptedBackend(script)
     # 直接驱动：记录 invoke 次数，complete 后必须不再增长
-    _write_project(tmp_path)
+    _write_scope9_project(tmp_path)
     agent = SWEAgent("pg4")
     ctx = AgentContext(
         agent_id="pg4", task="修复 bug 使全部测试通过",
@@ -277,12 +307,12 @@ def test_stale_verification_does_not_override_green_completion(tmp_path):
     """
     from zmai.swe.verifier import VerificationCheck, VerificationResult
     script = [
-        [_pytest("test_all.py")],  # baseline=9, failed
+        [_bare()],   # 完整 9 → baseline=9, failed
         [_fix()],
-        [_pytest("test_all.py")],  # 9 passed → full_green → complete
+        [_bare()],   # 9 passed → full_green → complete
         None,
     ]
-    _write_project(tmp_path)
+    _write_scope9_project(tmp_path)
     backend = _ScriptedBackend(script)
     agent = SWEAgent("pg6")
     ctx = AgentContext(
@@ -312,17 +342,17 @@ def test_stale_verification_does_not_override_green_completion(tmp_path):
 def test_loopguard_blocks_repeated_subset(tmp_path):
     """TEST 5：重复执行同一子集 → LoopGuard/scope recovery 阻止无限重复。"""
     script = [
-        [_pytest("test_all.py")],  # baseline=9, failed
+        [_bare()],      # 完整 9 → baseline=9, failed
         [_fix()],
-        [_pytest("test_app.py")],  # 子集 7 → partial_green
-        [_pytest("test_app.py")],  # 再子集 → partial_green
-        [_pytest("test_app.py")],  # 再子集
+        [_subset7()],   # 子集 7 → partial_green
+        [_subset7()],   # 再子集 → partial_green
+        [_subset7()],   # 再子集
         None,
     ]
     # 低阈值让 LoopGuard 快速介入
     backend = _ScriptedBackend(script)
     agent = SWEAgent("pg5")
-    _write_project(tmp_path)
+    _write_scope9_project(tmp_path)
     ctx = AgentContext(
         agent_id="pg5", task="修复 bug 使全部测试通过",
         backend=backend, tools=ToolRegistry(),
@@ -349,8 +379,9 @@ def test_loopguard_blocks_repeated_subset(tmp_path):
 # 复现：模型改完代码，**第一次**测试运行就是子集（`pytest -q test_a.py`，1/1 通过）。
 # 修复前 baseline 被直接锁成 1，_scope_complete 保持 True → full_green → complete，
 # 而项目里另外 2 个测试从未运行（且实际失败）。
-# 目标语义：baseline 是"完整套件有多少测试"的断言，只有失败的诊断运行、或未指定
-# 测试目标的裸运行才有资格建立它。
+# 目标语义：baseline 是"完整套件有多少测试"的断言，只有未指定测试目标的裸运行才有
+# 资格建立它。P2-2 起失败的子集运行同样没有资格（失败只暴露"这次跑了多少个"，
+# 不暴露套件规模）。
 
 
 def _write_scope_project(tmp_path: Path) -> None:
