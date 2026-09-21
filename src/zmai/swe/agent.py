@@ -243,15 +243,31 @@ def _norm_target_path(p: object) -> str:
 
 
 def _reset_edit_failure_recovery(context: AgentContext) -> None:
-    """真实修改已落地 → 清零 edit-failure 恢复状态。
+    """真实修改已落地 → 清零 edit-failure 恢复状态 + 完成守卫的 block 计数。
 
-    清零对象是**计数 + 两种一次性额度**（定向 read / 目标发现 grep）：历史 edit
-    失败不得污染后续 repair cycle，也不得在下一次进入强制修改期时留下可用的额度。
+    调用点是全仓唯一的**进展边界**：两个调用方都是"工作区指纹真的变了"的分支
+    （修改成功，或执行失败但真实改写了工作区）。因此这里统一重置所有
+    "按'连续无进展'度量"的状态。
+
+    清零对象：
+      * edit-failure 计数 + 两种一次性额度（定向 read / 目标发现 grep）——
+        历史 edit 失败不得污染后续 repair cycle，也不得在下一次进入强制
+        修改期时留下可用的额度；
+      * `completion_block_count` —— 该守卫的语义是"**连续**没有取得有效进展的
+        completion block 累计到 N 次即明确失败"（见 agent.py 完成守卫处的
+        "blocked Nx without progress" 文案）。计数若只增不减，就变成"整个 run
+        历史累计 N 次"，于是模型每做几次真实修改、又几次过早收尾，就会被判
+        FAILED —— 而它其实一直在推进，与本函数的调用点直接矛盾。
+        在进展边界归零，"N 次"才等价于"N 次连续无进展"。
+        判据落在工作区证据（指纹变化）上，而不是 `ever_modified`：后者只证明
+        历史上改过代码，不证明最近一次 block 之后取得了进展。
+
     判据由调用方按工作区证据（had_modification / ever_modified）给出，而不是
     "工具返回 success"。
     """
     context.metadata["edit_failure_recovery_attempts"] = 0
     context.metadata["edit_recovery_read_allowance"] = 0
+    context.metadata["completion_block_count"] = 0
     context.metadata["edit_recovery_grep_allowance"] = 0
 
 
