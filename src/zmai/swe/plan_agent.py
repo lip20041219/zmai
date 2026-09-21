@@ -171,6 +171,10 @@ class PlanAgent:
             try:
                 repo_info = RepositoryScanner.scan(project_root)
                 context.metadata["repo_info"] = repo_info
+                # P2-1: 这里是第二处扫描点，必须同样记录发现状态。否则 initialize
+                # 扫描失败（unknown）、此处扫描成功时，完成门禁会永远停在 unknown ——
+                # 对确实没有测试的项目造成"永远拿不到正向证据"的假失败。
+                context.metadata["test_discovery"] = "known"
                 logger.info(
                     "Repository scanned: %s (%d source files, %d test files)",
                     project_root, len(repo_info.source_files), len(repo_info.test_files),

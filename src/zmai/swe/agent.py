@@ -648,16 +648,33 @@ class SWEAgent(Agent):
                 context.config["project_path"] = str(project_root)
                 logger.info("Auto-detected project root: %s", project_root)
 
+        # ── P2-1: 显式记录"测试发现状态"，区分 NO_TESTS 与 SCAN_UNKNOWN ──
+        # 修复前 scan() 异常只记一条 warning，repo_info 不写入，完成门禁那条
+        #   `_has_tests = bool(getattr(repo_info, "test_files", None))`
+        # 就把"无法确定有没有测试"静默读成了"没有测试" —— 于是"改过一点代码 +
+        # 扫描失败 + 测试从未失败"可以零验证证据直接 COMPLETED。
+        # 这里把结果记成显式两态，供完成门禁区分处理（未知 → fail-closed）。
         if project_root and "repo_info" not in context.metadata:
             try:
                 repo_info = RepositoryScanner.scan(project_root)
                 context.metadata["repo_info"] = repo_info
+                context.metadata["test_discovery"] = "known"
                 logger.info(
                     "Repository scanned: %s (%d source files, %d test files)",
                     project_root, len(repo_info.source_files), len(repo_info.test_files),
                 )
             except Exception as e:
-                logger.warning("Repository scan failed: %s", e)
+                context.metadata["test_discovery"] = "unknown"
+                logger.warning(
+                    "Repository scan failed — test discovery UNKNOWN "
+                    "(completion gate will fail closed): %s", e,
+                )
+        # 覆盖剩余分支：没有 project_root（无法扫描）、或调用方已预置 repo_info。
+        # 前者无法确定 → unknown；后者是显式提供 → 视为 known。
+        if "test_discovery" not in context.metadata:
+            context.metadata["test_discovery"] = (
+                "known" if context.metadata.get("repo_info") is not None else "unknown"
+            )
 
         # ── 工作区指纹基线（P1-3）────────────────────────────────
         # 必须在任何工具执行**之前**取基线，否则第一次工具调用造成的修改会被
@@ -1918,11 +1935,19 @@ class SWEAgent(Agent):
         # 项目本身有测试时，唯一的正向证据就是 completion.tests_complete
         # ——"存在一次未被后续修改作废的完整套件全绿"。直接复用它，不新增状态。
         # 无测试的项目不受约束（测试不是它的验收标准）。
+        # ── P2-1: "确实没有测试" 与 "无法确定是否有测试" 必须区别对待 ──
+        # 缺省取 "unknown"（fail-closed）：任何没有明确记录过发现状态的路径 —— 包括
+        # 从未调用 initialize、或调用方直接构造 AgentContext —— 都按"未知"处理，
+        # 不允许仅凭"当前没有 failure"宣布完成。
+        _discovery = context.metadata.get("test_discovery", "unknown")
+        _test_status_unknown = _discovery != "known"
         _repo_info = context.metadata.get("repo_info")
         _has_tests = bool(getattr(_repo_info, "test_files", None))
+        # 未知状态下按"可能有测试"处理 → 与 `_has_tests=True` 走同一条正向证据要求
+        # （必须有一次未被后续修改作废的完整套件全绿）。已知无测试的项目保持原样。
         _needs_retest = bool(
             completion and not completion.tests_complete
-            and (_has_tests or _tests_failed_ever)
+            and (_has_tests or _tests_failed_ever or _test_status_unknown)
         )
         # ── SWE eval 守卫：纯文本响应同样不得在零修改时完成 ──
         # 该守卫原先只在 `if response.tool_calls:` 分支内生效，模型只要只回文本就能
