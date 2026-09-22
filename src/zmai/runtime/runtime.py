@@ -129,7 +129,6 @@ class Runtime:
         from zmai.agent import AgentAction, AgentContext, AgentState
         from zmai.runtime.preflight import check as preflight_check
         from zmai.swe.agent import SWEAgent
-        from zmai.swe.scanner import RepositoryScanner
 
         # Preflight Check — 在调用 Backend API 之前检查系统状态
         pf = preflight_check(backend, self._gateway, self._config)
@@ -148,12 +147,15 @@ class Runtime:
         run_config = {**(config or {})}
         auto_plan = run_config.get("auto_plan", False)
 
-        # ── Auto-detect project root if not explicitly set ──────
-        if "project_path" not in run_config or not run_config["project_path"]:
-            detected = RepositoryScanner.find_project_root()
-            if detected:
-                run_config["project_path"] = str(detected)
-                logger.info("Runtime auto-detected project root: %s", detected)
+        # ── Project root：只认调用方显式声明的 ──
+        # 不要在这里用 find_project_root() 把 cwd 推断成 project_path：
+        # SWEAgent.initialize() 在没有 project_path 时本来就会做同样的推断
+        # （并写回 config），预填是纯冗余。代价是真实的：完成门禁要用
+        # "config 里有没有 project_path" 区分"这个 run 就是针对该项目的任务"
+        # （CLI / benchmark / eval harness 都显式声明）与"只是为了给 agent
+        # 提供上下文才推断出的项目根"。预填会把后者洗成前者，于是 "say hello"
+        # 这类任务被套上"必须出示完整套件全绿"的门禁
+        # （test_runtime / test_mocks / test_agent_lifecycle 实测被卡死）。
 
         # ── Plan Mode: PLANNING → PLAN_READY → (确认) → EXECUTING ──────
         if auto_plan:

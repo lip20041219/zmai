@@ -741,6 +741,13 @@ class SWEAgent(Agent):
         # ── Repository discovery: find and scan user project root ──
         # Distinguish: user project root vs agent runtime workspace vs internal state
         project_root = context.config.get("project_path")
+        # 记录项目根的**来源**（在下面的推断回写之前取）：调用方在 config
+        # 里声明（CLI / benchmark / eval harness 都这么做）= 这个 run 就是
+        # 针对该项目的任务；仅从 cwd 推断出来 = 只是给 agent 提供上下文。
+        # 完成门禁据此决定"该项目的测试套件是不是本次验收标准"——
+        # 推断出来的项目根不得让一个 "say hello" 任务变成必须出示完整套件
+        # 全绿的任务。setdefault：调用方（或上游）可显式预置。
+        context.metadata.setdefault("project_root_declared", bool(project_root))
         if project_root:
             project_root = Path(project_root).resolve()
         else:
@@ -1429,6 +1436,26 @@ class SWEAgent(Agent):
                                 # 结构化 recovery 状态：注入下一轮 Agent 上下文，让
                                 # 模型"看到"它只验证了子集，下一步必须跑完整套件，
                                 # 而不是继续 read/edit 或重复跑同一个子集。
+                                # ── 例外：零修改 + 没有"漏跑了测试"的证据 ──
+                                # 走到这里有两种 partial_green：
+                                #   a) `_baseline is None` —— 首次运行就是子集，
+                                #      没有任何证据表明套件比刚跑过的那部分更大；
+                                #   b) 已知基线且 `_total_tests < _baseline` ——
+                                #      **有证据**证明还有测试没跑（可能正是失败的
+                                #      那些），此处的通过不能当完成证据。
+                                # "覆盖完整基线"是**验证改动**的要求。零修改的
+                                # run 没有被验证的对象，只有 a) 才谈得上"一次真实
+                                # 全绿就是它自己的完成证据"（verify-only / smoke /
+                                # autostop"跑一次测试，通过就停"）。只放行
+                                # completion（success_count），不放行证据本身：
+                                # completion.tests_complete 保持 False，模型继续
+                                # 推进时 [TEST_SCOPE_INCOMPLETE] 仍会要求它跑完整
+                                # 套件；一旦修改源码，record_modification 会把这里
+                                # 清零，之后仍必须有一次完整套件全绿（P1-2/P2-2 不变）。
+                                if (_baseline is None
+                                        and not context.metadata.get("ever_modified")):
+                                    context.metadata["test_success_count"] = (
+                                        context.metadata.get("test_success_count", 0) + 1)
                                 context.metadata["test_scope_incomplete"] = True
                                 context.metadata["tests_passed"] = False
                                 context.metadata["required_next_action"] = "run_full_test_suite"
@@ -2051,18 +2078,47 @@ class SWEAgent(Agent):
         # ——"存在一次未被后续修改作废的完整套件全绿"。直接复用它，不新增状态。
         # 无测试的项目不受约束（测试不是它的验收标准）。
         # ── P2-1: "确实没有测试" 与 "无法确定是否有测试" 必须区别对待 ──
-        # 缺省取 "unknown"（fail-closed）：任何没有明确记录过发现状态的路径 —— 包括
-        # 从未调用 initialize、或调用方直接构造 AgentContext —— 都按"未知"处理，
-        # 不允许仅凭"当前没有 failure"宣布完成。
-        _discovery = context.metadata.get("test_discovery", "unknown")
-        _test_status_unknown = _discovery != "known"
+        # 只有**显式记录过**的 unknown 才算 fail-closed —— 那是"扫描过、但无法
+        # 确定"（扫描抛异常 / 找不到项目根，见 initialize 的 test_discovery 写入点）。
+        # 调用方直接构造的 AgentContext（从未 initialize）根本没有发现状态，不得
+        # 据此凭空要求测试证据：那不是"发现失败"，只是"没问过"。
+        _discovery = context.metadata.get("test_discovery")
+        _test_status_unknown = _discovery == "unknown"
         _repo_info = context.metadata.get("repo_info")
         _has_tests = bool(getattr(_repo_info, "test_files", None))
-        # 未知状态下按"可能有测试"处理 → 与 `_has_tests=True` 走同一条正向证据要求
-        # （必须有一次未被后续修改作废的完整套件全绿）。已知无测试的项目保持原样。
+        # 该项目的测试套件是不是**本次任务的验收标准**：项目根由调用方声明
+        # （见 initialize 处的 project_root_declared）。从 cwd 推断出来的项目根
+        # 只提供上下文，不把无关任务（"say hello" / mock smoke）变成测试任务。
+        _tests_are_acceptance = (
+            _has_tests and bool(context.metadata.get("project_root_declared")))
+        # 是否已有"足以作为完成证据"的绿色运行：
+        #   * 完整套件全绿（tests_complete）→ 是；
+        #   * 首次运行即子集全绿（未建立过基线 → 没有证据表明还有测试没跑）→
+        #     同样按"本 run 自己的证据"接受（与硬终止处的判据一致）；
+        #   * 已知基线却没跑到基线的子集全绿 → **不是**：那有证据表明还有测试
+        #     没跑（可能正是失败的那些），不能当完成证据。
+        _has_completion_evidence = bool(
+            completion and completion.tests_passed
+            and (completion.tests_complete
+                 or context.metadata.get("baseline_test_count") is None))
+        # 判据的作用域 —— 只阻止"真正需要阻止完成"的情况：
+        #   * 测试失败过 → 必须有一次完整套件全绿（失败是负面证据，与是否
+        #     改过代码无关）；
+        #   * 该项目以测试为验收标准（或发现状态显式未知）且 改过代码 /
+        #     没有可用的完成证据 → 必须有一次完整套件全绿；
+        #   * 零修改 + 有可用的完成证据 → 放行：没有修改就没有"未验证的
+        #     改动"，一次真实全绿就是本 run 自己的完成证据（verify-only /
+        #     autostop "跑一次测试，通过就停" 属于这一类）。partial_green 的
+        #     [TEST_SCOPE_INCOMPLETE] 提示与 tests_complete=False 都不受影响
+        #     —— 一旦修改源码，record_modification 会作废这条绿色证据。
         _needs_retest = bool(
             completion and not completion.tests_complete
-            and (_has_tests or _tests_failed_ever or _test_status_unknown)
+            and (
+                _tests_failed_ever
+                or ((_tests_are_acceptance or _test_status_unknown)
+                    and (bool(context.metadata.get("ever_modified"))
+                         or not _has_completion_evidence))
+            )
         )
         # ── SWE eval 守卫：纯文本响应同样不得在零修改时完成 ──
         # 该守卫原先只在 `if response.tool_calls:` 分支内生效，模型只要只回文本就能

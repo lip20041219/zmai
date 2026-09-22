@@ -143,36 +143,47 @@ def _edit(tag: str, fix: dict[str, str]) -> ToolCall:
     return ToolCall(id=f"edit_{tag}", name="edit", params=params)
 
 
-def _build_script() -> list[list[ToolCall] | None]:
+TEXT = "I have fixed one bug; the failing tests still need work."
+
+
+def _build_script() -> list[list[ToolCall] | str]:
     """逐轮迭代：每轮 跑测试→读源码→修一个 bug；最后一轮只跑测试验证全绿。"""
-    script: list[list[ToolCall] | None] = []
+    script: list[list[ToolCall] | str] = []
     for i, (tag, fix) in enumerate(_FIXES):
         script.append([PYTEST, _read_app(f"{tag}_{i}"), _edit(tag, fix)])
     script.append([PYTEST])  # 全绿验证轮
-    script.append(None)
+    script.append(TEXT)
     return script
 
 
 class _ScriptedBackend(Backend):
-    """按预写脚本依次返回工具调用；无脚本时返回 end_turn。工具真实执行。"""
+    """按预写脚本返回工具调用；脚本耗尽后返回纯文本（end_turn）。工具真实执行。
+
+    脚本项可以是 `list[ToolCall]`（工具调用）或 `str`（真正的纯文本响应，
+    无 tool_calls —— 即"模型不再调用工具"的正常形态）。
+    不要用"空 content + 无 tool_calls"表达结束：那是**退化响应**，会被
+    `_degenerate_response_reason` 判为后端故障并重试到 fail-closed
+    （见 agent.py 的 DegenerateResponse 分支），走不到完成门禁。
+    """
 
     name = "scripted_flask_demo"
 
-    def __init__(self, script: list[list[ToolCall] | None]):
+    def __init__(self, script: list[list[ToolCall] | str]):
         self._script = script
         self._idx = 0
         self.calls_seen: list[str] = []
 
     def invoke(self, request: BackendRequest) -> BackendResponse:
-        calls = None
-        if self._idx < len(self._script):
-            calls = self._script[self._idx]
+        item = (self._script[self._idx]
+                if self._idx < len(self._script) else TEXT)
         self._idx += 1
+        calls = None if isinstance(item, str) else item
+        content = item if isinstance(item, str) else ""
         if calls:
             for c in calls:
                 self.calls_seen.append(c.name)
         return BackendResponse(
-            content="",
+            content=content,
             tool_calls=calls,
             usage=TokenUsage(input_tokens=10, output_tokens=5),
             stop_reason="tool_use" if calls else "end_turn",
@@ -282,14 +293,17 @@ class TestFlaskMultiBugAutonomousFix:
         project = tmp_path / "flask_site2"
         _write_flask_site(project)
 
-        # 脚本只修 bug1，然后结束（无全绿 pytest）
+        # 脚本只修 bug1，然后（模型）宣布结束（无全绿 pytest）
         script = [
             [PYTEST, _read_app("only"), _edit("bug1", _FIXES[0][1])],
             [PYTEST],
-            None,
+            TEXT,
         ]
         backend = _ScriptedBackend(script)
-        ctx, action = asyncio.run(_run_agent(project, backend))
+        # max_steps=3：只观察到"模型停在完成点上、被守卫挡回一次"这一步。
+        # 守卫是有界的（MAX_COMPLETION_BLOCKS 次后判 fail），继续空转只会让
+        # 该用例断言到守卫的收敛行为，而不是"未全绿不得完成"这一条。
+        ctx, action = asyncio.run(_run_agent(project, backend, max_steps=3))
 
         # 由于 3 个 bug 仍未修复、测试未全绿 —— Agent 必须 NOT claim 完成，
         # 而是被 completion_guard 强制进入重测（continue）。

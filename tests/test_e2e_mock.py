@@ -100,7 +100,13 @@ class TestSWEAgentMockConversation:
             backend = MockBackend(responses=[
                 {
                     "content": "我用 shell 命令查看文件列表。",
-                    "tool": [{"name": "shell_exec", "params": {"command": "dir /b *.py"}}],
+                    # 用例意图是"工具真的执行了，然后完成"。命令必须是**成功**的：
+                    # 空工作区里 `dir /b *.py` 无匹配 → exit 1，会生成
+                    # `Command failed: shell_exec` 失败 check（见
+                    # test_swe_autoverify_evidence：非测试命令的失败必须阻断
+                    # 完成），于是该用例句变成"断言一条失败命令之后仍可完成"，
+                    # 与守卫冲突。
+                    "tool": [{"name": "shell_exec", "params": {"command": "dir /b"}}],
                 },
                 {
                     "content": "找到文件了，任务完成。",

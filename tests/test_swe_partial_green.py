@@ -385,8 +385,14 @@ def test_loopguard_blocks_repeated_subset(tmp_path):
 
 
 def _write_scope_project(tmp_path: Path) -> None:
-    """完整套件 3 个测试全绿；test_sub.py 是其中 1 个测试的子集。"""
-    (tmp_path / "bug.py").write_text("FIXED = True\n", encoding="utf-8")
+    """完整套件 3 个测试全绿；test_sub.py 是其中 1 个测试的子集。
+
+    bug.py 写成 `FIXED = False`：本文件所有脚本都以 `[_fix()]`（把 False 改成
+    True）开场，夹具若写成 True，这条 edit 就是**空操作**（EDIT_NO_CHANGE），
+    `ever_modified` 永远为假 —— 而这些用例的场景是"模型改完代码后验证"，
+    夹具必须让那次修改真实落地。
+    """
+    (tmp_path / "bug.py").write_text("FIXED = False\n", encoding="utf-8")
     (tmp_path / "test_g.py").write_text(
         "def test_g1():\n    assert True\n\n\ndef test_g2():\n    assert True\n",
         encoding="utf-8")
