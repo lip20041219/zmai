@@ -76,6 +76,34 @@ def _validate_written_py(full: Path) -> tuple[bool, str]:
     return False, structured
 
 
+def _invalidate_bytecode_cache(full: Path) -> None:
+    """写入 .py 后作废它自己的 __pycache__ 字节码缓存。
+
+    CPython 的时间戳式 .pyc 校验只比较 (int(source_mtime), source_size)：同一秒
+    内改写**且文件大小不变**时（`VALUE = 1` → `VALUE = 0`），旧 .pyc 仍被判为
+    有效，解释器继续执行修改前的代码 —— 于是"改完立刻重跑 pytest"观测到的是
+    上一轮的测试结果。regression 判定、测试证据、完成门禁全部建立在这个观测上，
+    必须保证下一次 import 看到新源码。
+
+    只删被改文件自己的缓存（含 pytest assertion-rewrite 的
+    `<name>.cpython-311-pytest-<ver>.pyc` 变体），不遍历删除整个 __pycache__，
+    不使用 shell。缓存不存在、同名目录不可写等情况一律静默跳过：这是正确性
+    兜底，不是写入流程的一部分，绝不能让它把一次成功的写入判成失败。
+    """
+    if full.suffix.lower() != ".py":
+        return
+    try:
+        entries = list((full.parent / "__pycache__").iterdir())
+    except OSError:
+        return
+    for pyc in entries:
+        if pyc.name.startswith(f"{full.stem}.") and pyc.name.endswith(".pyc"):
+            try:
+                pyc.unlink()
+            except OSError:
+                pass
+
+
 def _write_checked(full: Path, content: str, orig_text: str, label: str) -> tuple[bool, str]:
     """写入前做 diff 安全检查，写入后做 Python 语法验证。
 
@@ -100,6 +128,8 @@ def _write_checked(full: Path, content: str, orig_text: str, label: str) -> tupl
         full.write_text(content, encoding="utf-8")
     except OSError as e:
         return False, f"[EDIT_WRITE_ERROR] 写入失败: {e}"
+    # 写完立刻作废旧字节码，保证下一次 pytest/import 看到的是刚写下的源码。
+    _invalidate_bytecode_cache(full)
     return _validate_written_py(full)
 
 
@@ -553,6 +583,7 @@ class WriteFileTool(Tool):
         # ── Attempt 1: Path.write_text() ──
         try:
             full.write_text(content, encoding="utf-8")
+            _invalidate_bytecode_cache(full)
             valid, verr = _validate_written_py(full)
             if not valid:
                 result = ToolResult.err(verr)
@@ -568,6 +599,7 @@ class WriteFileTool(Tool):
         try:
             with open(str(full), "w", encoding="utf-8", errors="strict") as f:
                 f.write(content)
+            _invalidate_bytecode_cache(full)
             valid, verr = _validate_written_py(full)
             if not valid:
                 result = ToolResult.err(verr)
