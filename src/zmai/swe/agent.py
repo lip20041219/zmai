@@ -17,6 +17,7 @@ from zmai.gateway.base import BackendRequest, BackendResponse
 from zmai.swe._async_utils import run_sync
 from zmai.swe.completion import CompletionState
 from zmai.swe.context import ContextManager
+from zmai.swe.graph import GraphRuntime, Node, SWEState
 from zmai.swe.loop_guard import LoopGuard
 from zmai.swe.models import MAX_REPLANS, Plan, format_plan_summary
 from zmai.swe.planner import generate_plan
@@ -32,6 +33,7 @@ from zmai.swe.tools import (
     WriteFileTool,
     _is_test_file,
     is_test_command,
+    test_scope_targets,
 )
 from zmai.swe.verifier import (
     VerificationResult,
@@ -120,10 +122,6 @@ def _fmt_test_totals(t: dict[str, int]) -> str:
     if t.get("errors"):
         s += f", {t['errors']} errors"
     return s
-
-
-# 测试运行器的子命令（不是测试目标）。`python -m unittest discover` 跑的是全套件。
-_RUNNER_SUBCOMMANDS = {"discover"}
 
 
 # 工作区指纹要跳过的目录：构建产物 / VCS / 缓存 / 依赖。这些目录在每次 pytest
@@ -229,19 +227,21 @@ def _workspace_fingerprint(root: Path, *, prefer_git: bool = False,
 def _is_full_scope_test_command(command: str) -> bool:
     """测试命令是否**可证明**覆盖整个套件（未显式指定测试目标）。
 
-    `python -m pytest -q`            → True（跑项目配置的全部测试）
-    `python -m pytest -q test_a.py`  → False（只跑指定目标，是子集）
+    `python -m pytest -q`                  → True（跑项目配置的全部测试）
+    `python -m pytest -q 2>&1 | tail -50`  → True（重定向/管道是输出处理，不是目标）
+    `python -m pytest -q test_a.py`        → False（只跑指定目标，是子集）
 
-    只认"完全没有非选项参数"这一种证明方式。`-k` / `-m` 这类带参数的选择器因此
+    判定口径是**实际被执行的那条 runner 命令**：由 tools.test_scope_targets()
+    剥掉 shell 重定向、按管道/`&&` 切段后，只看 runner 后面有没有非选项参数。
+    不这么做的话，`pytest -q 2>&1`（重定向是 shell 语法）会被读成"指定了一个
+    名为 `2>&1` 的测试目标"，于是**任何带管道的完整套件运行都拿不到完成资格**。
+
+    只认"完全没有测试目标"这一种证明方式。`-k` / `-m` 这类带参数的选择器因此
     也会被判为子集——它们确实无法证明覆盖完整套件，被提示去跑完整套件是正确方向，
     不是误判。找不到运行器时返回 True（保守：保持既有行为）。
     """
-    tokens = command.split()
-    for i, tok in enumerate(tokens):
-        if "pytest" in tok or "unittest" in tok or "nosetests" in tok:
-            return not [t for t in tokens[i + 1:]
-                        if not t.startswith("-") and t not in _RUNNER_SUBCOMMANDS]
-    return True
+    targets = test_scope_targets(command)
+    return True if targets is None else not targets
 
 
 def _norm_target_path(p: object) -> str:
@@ -473,6 +473,19 @@ def _log_stop() -> None:
     logger.info("[ZMAI] Task completed.")
     logger.info("[ZMAI] Stopping execution loop.")
     logger.info("[ZMAI] No further tool calls allowed.")
+
+
+def _graph_enter(context: AgentContext, node: Node, reason: str = "") -> None:
+    """Graph Runtime 接入点：只记录控制流**实际到达**的节点。
+
+    纯观察层 —— 不做任何判定、不改变任何分支、不写除 graph_trace /
+    graph_violations 之外的 metadata。默认 enforce=False，非法转移只记录。
+    """
+    graph: GraphRuntime | None = context.metadata.get("graph")
+    if graph is None:
+        graph = GraphRuntime(SWEState(context.metadata))
+        context.metadata["graph"] = graph
+    graph.enter(node, reason, step=context.step_count)
 
 
 def _eval_blocking_completion(context: AgentContext,
@@ -857,6 +870,7 @@ class SWEAgent(Agent):
         logger.debug("SWEAgent step %d/%d", context.step_count, context.max_steps)
 
         if not context.backend:
+            _graph_enter(context, Node.FAILED, "no_backend")
             _l = context.metadata.get("__log__")
             if _l:
                 try:
@@ -867,6 +881,7 @@ class SWEAgent(Agent):
             return AgentAction.fail("No available Backend. Please configure an API Key.")
 
         context.step_count += 1
+        _graph_enter(context, Node.ENTRY, f"step {context.step_count}")
         cm: ContextManager | None = context.metadata.get("cm")
         if cm is None:
             cm = ContextManager(config=context.config)
@@ -902,6 +917,7 @@ class SWEAgent(Agent):
                 context.agent_id, context.step_count, completion.summary(),
             )
             _log_stop()
+            _graph_enter(context, Node.DONE, f"completion_state: {completion.summary()}")
             _l = context.metadata.get("__log__")
             if _l:
                 try:
@@ -922,6 +938,7 @@ class SWEAgent(Agent):
         plan: Plan | None = context.metadata.get("execution_plan")
 
         if auto_plan and plan is None:
+            _graph_enter(context, Node.PLAN, "auto_plan")
             on_progress = context.metadata.get("on_progress")
             if on_progress:
                 on_progress("info", "Generating execution plan...")
@@ -955,6 +972,7 @@ class SWEAgent(Agent):
                                        success=False, error=str(e)[:500])
                     except Exception:
                         pass
+                _graph_enter(context, Node.FAILED, "plan_generation_failed")
                 return AgentAction.fail(f"Plan generation failed: {e}")
 
         tool_defs = context.tools.definitions() if context.tools else []
@@ -1014,6 +1032,7 @@ class SWEAgent(Agent):
         last_error: Exception | None = None
         response: BackendResponse | None = None
 
+        _graph_enter(context, Node.BACKEND, "invoke")
         for attempt in range(max_retries):
             try:
                 response = await run_sync(context.backend.invoke, request)
@@ -1059,6 +1078,7 @@ class SWEAgent(Agent):
                                    error=str(last_error or "Backend produced no response"))
                 except Exception:
                     pass
+            _graph_enter(context, Node.FAILED, "backend_call_failed")
             return AgentAction.fail(str(last_error or "Backend produced no response"))
 
         # ── Token 用量累积（G1）──────────────────────────
@@ -1079,12 +1099,16 @@ class SWEAgent(Agent):
             cm.add_message("assistant", response.content)
 
         if response.tool_calls:
+            _graph_enter(context, Node.TOOL, f"{len(response.tool_calls)} tool call(s)")
             on_progress = context.metadata.get("on_progress")
             # Count tool call success/failure for this round
             step_tool_ok = 0
             step_tool_fail = 0
             guard: LoopGuard | None = context.metadata.get("loop_guard")
             had_modification = False
+            # B-1: 本 step 是否发生过"测试命令超时"。超时既非通过也非失败证据，
+            # 但必须能被计数（见下方"连续超时预算"），否则同一条命令会无限重跑。
+            _step_timed_out = False
             # ── Read-limit tracking ──────────────────────────
             reads_without_test = context.metadata.get("reads_without_test", 0)
             has_run_test = context.metadata.get("has_run_test", False)
@@ -1310,6 +1334,10 @@ class SWEAgent(Agent):
                                 and _totals["errors"] > 0
                             )
                             _stats(context, regression_detected=1)
+                            _graph_enter(context, Node.REGRESSION,
+                                         f"{_fmt_test_totals(_prev_totals)} → "
+                                         f"{_fmt_test_totals(_totals)}"
+                                         + (" (module_broken)" if _module_broken else ""))
                             logger.warning(
                                 "[Regression] %s step %d: %s → %s%s",
                                 context.agent_id, context.step_count,
@@ -1391,8 +1419,33 @@ class SWEAgent(Agent):
                         # 没跑测试的命令换到"完整套件全绿"资格，绕过 P0 门禁。
                         # 零计数既不是 green（没验证任何东西）也不是 failure（没有失败证据），
                         # 因此两个分支都不进，只要求补一次能产出计数的完整套件运行。
-                        _no_test_evidence = _total_tests == 0
-                        if _no_test_evidence:
+                        # ── B-1: 超时 ≠ 零测试证据 ─────────────────────────
+                        # 测试命令超时（ShellTool: exit 124 + error "timeout (Ns)"）时
+                        # 计数同样为 0，但它与"根本没跑测试"是两件事：命令跑了、只是没跑完。
+                        # 归进 [NO_TEST_EVIDENCE] 会让 Loop 指令模型重跑**同一条必然再次
+                        # 超时**的完整套件命令，而那条路径既不置 test_failed、也不进
+                        # FixDriving，没有任何超时语义能把模型拉出来（只能烧墙钟到
+                        # max_steps / force_edit 预算）。超时照旧不产生任何判定
+                        # （既非通过证据也非失败证据，fail-closed —— 见下面 _no_verdict），
+                        # 只把指令换成可执行的方向，并交给连续超时预算收尾。
+                        _timeout_evidence = exit_code == 124 or "timeout (" in test_out
+                        _no_test_evidence = _total_tests == 0 and not _timeout_evidence
+                        # 无判定：零证据或超时 —— 都不得写进 CompletionState、不得
+                        # 进 green 计数、不得当失败处理。
+                        _no_verdict = _no_test_evidence or _timeout_evidence
+                        if _timeout_evidence:
+                            _step_timed_out = True
+                            context.metadata["required_next_action"] = "narrow_test_scope"
+                            cm.add_message("user",
+                                "[TEST_TIMEOUT] 测试命令在时限内没有跑完 —— 它既不构成"
+                                "通过证据，也不构成失败证据，不要据此判断修改是否生效。\n"
+                                "不要重复运行同一条命令（它还会超时）。下一步二选一：\n"
+                                "1) 缩小范围：先运行与本次修改最相关的单个测试文件或用例；\n"
+                                "2) 显式提高时限：在 shell_exec 参数里传 `timeout`，"
+                                "或调大 config 的 timeout.test。\n"
+                                "在取得结构化测试计数（passed/failed）之前，任务不得判定完成。"
+                            )
+                        elif _no_test_evidence:
                             context.metadata["test_scope_incomplete"] = True
                             context.metadata["required_next_action"] = "run_full_test_suite"
                             cm.add_message("user",
@@ -1402,7 +1455,7 @@ class SWEAgent(Agent):
                                 "下一步必须运行完整测试套件取得结构化计数："
                                 "python -m pytest -q"
                             )
-                        if completion and not _no_test_evidence:
+                        if completion and not _no_verdict:
                             completion.record_test_result(
                                 exit_code=exit_code,
                                 passed=passed,
@@ -1412,9 +1465,9 @@ class SWEAgent(Agent):
                         # ── P0-2B: green 计数只在 full_green 时累计，其余结果一律清零 ──
                         # 失败 / partial_green 同样使"历史 green"失效，否则 `or _green_once`
                         # 旁路可以在当前 verification 无效时宣布完成。
-                        if not _no_test_evidence and not (passed and _scope_complete):
+                        if not _no_verdict and not (passed and _scope_complete):
                             context.metadata["test_success_count"] = 0
-                        if passed and not _no_test_evidence:
+                        if passed and not _no_verdict:
                             # 测试通过 → 退出修复态，清空失败后读取计数，进入"验证"阶段
                             test_failed = False
                             reads_after_fail = 0
@@ -1474,7 +1527,7 @@ class SWEAgent(Agent):
                                     "下一步必须运行完整测试套件：python -m pytest -q\n"
                                     "只有完整测试数量达到基线且全部通过后才能完成任务。"
                                 )
-                        elif not _no_test_evidence:
+                        elif not _no_verdict:
                             # 测试失败 → 进入修复态：强制后续进入修改阶段
                             if not test_failed:
                                 # 首次进入修复态才清零读数。若每次失败 pytest 都清零，
@@ -1547,6 +1600,10 @@ class SWEAgent(Agent):
                                     f"{_truncate_head_tail(_fail_text, cm.test_evidence_chars)}"
                                     f"\n{_plan_msg}"
                                 )
+                                _graph_enter(
+                                    context, Node.REPAIR_PLAN,
+                                    "plan_injected" if repair_plan_injected
+                                    else "analysis_failed")
                                 _l = context.metadata.get("__log__")
                                 if _l:
                                     try:
@@ -1664,6 +1721,9 @@ class SWEAgent(Agent):
                         tc.params.get("path", ""), _repair_attempts, _max_repair, _err_type,
                     )
                     if _repair_attempts >= _max_repair:
+                        _graph_enter(context, Node.EDIT_RECOVERY,
+                                     f"edit_validation_repair_exhausted "
+                                     f"{_repair_attempts}/{_max_repair}")
                         context.metadata["force_edit"] = True
                         context.metadata["repair_phase"] = "plan"
                         cm.add_message("user",
@@ -1684,6 +1744,8 @@ class SWEAgent(Agent):
                 # 有界、不改测试、不放宽完成门禁。
                 elif (tc.name in ("edit", "write_file") and not result.success
                         and result.error and not _intercepted):
+                    _graph_enter(context, Node.EDIT_RECOVERY,
+                                 f"{tc.name} failed: {tc.params.get('path', '')}")
                     _handle_edit_failure(context, cm, tc, result)
             # ── LoopGuard: track no-modification steps ──
             if guard and not had_modification:
@@ -1695,8 +1757,31 @@ class SWEAgent(Agent):
             context.metadata["tool_calls_ok"] = prev_ok + step_tool_ok
             context.metadata["tool_calls_fail"] = prev_fail + step_tool_fail
 
+            # ── 连续超时预算（B-1）──────────────────────────────
+            # 超时不能变成无限重试：同一条命令反复超时既烧墙钟（每次 timeout.test 秒），
+            # 又永远拿不到测试结论。复用 completion_block_count —— 它的语义正是"**连续**
+            # 没有取得有效进展"，且在每次真实工作区进展时归零（_reset_edit_failure_
+            # recovery，判据是工作区指纹），因此"改一次 → 超时一次"不会耗尽预算，
+            # 只有连续超时才收敛到明确失败。
+            # 位置必须在下面的完成门禁**之前**：门禁在 eval 模式（未修改源码）会直接
+            # return cont，放在门禁之后就永远轮不到计数，超时又变成无限循环。
+            if _step_timed_out:
+                _timeout_blocks = context.metadata.get("completion_block_count", 0) + 1
+                context.metadata["completion_block_count"] = _timeout_blocks
+                if _timeout_blocks > MAX_COMPLETION_BLOCKS:
+                    logger.warning(
+                        "Test command timed out %d times without progress — failing (%s)",
+                        _timeout_blocks, context.agent_id,
+                    )
+                    _graph_enter(context, Node.FAILED, "test_timeout_no_progress")
+                    return AgentAction.fail(
+                        error=(f"Test command timed out {_timeout_blocks} times without "
+                               "progress: no structured test evidence was obtained")
+                    )
+
             # ── 硬终止条件（最高优先级）：测试通过 → 任务完成，立即结束执行循环 ──
             # 一旦成立必须立即 return complete，禁止继续进入下一轮 shell/read/test。
+            _graph_enter(context, Node.COMPLETION_GATE, "post_tool")
             # 双重判定：
             #   1) CompletionState.should_complete()（全绿 + exit0 + 无后续修改）
             #   2) 防御机制：test_success_count >= 1 —— 已有一次全绿即强制停止，
@@ -1740,6 +1825,7 @@ class SWEAgent(Agent):
                                                  "reason": completion.summary()})
                     except Exception:
                         pass
+                _graph_enter(context, Node.DONE, "post_tool_complete")
                 return AgentAction.complete(
                     output=f"Tests passed. Task completed in {context.step_count} step(s)."
                 )
@@ -1760,6 +1846,7 @@ class SWEAgent(Agent):
                         "— failing (%s)",
                         context.step_count - _fe_since, context.agent_id,
                     )
+                    _graph_enter(context, Node.FAILED, "force_edit_budget_exhausted")
                     return AgentAction.fail(
                         error=(f"force_edit armed for {context.step_count - _fe_since} "
                                f"steps without any code modification")
@@ -1775,6 +1862,7 @@ class SWEAgent(Agent):
                     "Destructive regression repeated %d times without recovery — failing (%s)",
                     context.metadata["regression_recoveries"], context.agent_id,
                 )
+                _graph_enter(context, Node.FAILED, "regression_recoveries_exhausted")
                 return AgentAction.fail(
                     error=(f"{context.metadata['regression_recoveries']} destructive "
                            "regressions left the project uncollectable without recovery")
@@ -1789,6 +1877,7 @@ class SWEAgent(Agent):
             context.metadata["repair_phase"] = repair_phase
             context.metadata["repair_plan_injected"] = repair_plan_injected
             read_limit = int(context.config.get("workflow.read_limit", 8))
+            _graph_enter(context, Node.READ_LIMIT, f"reads_without_test={reads_without_test}")
             if not has_run_test and reads_without_test >= read_limit:
                 cm.add_message("user",
                     f"[Workflow] 你已读取 {reads_without_test} 个文件但尚未运行测试。\n"
@@ -1808,6 +1897,7 @@ class SWEAgent(Agent):
             # repair_plan_injected 保持 False，此时不得强制修改——否则就是对一条
             # 运行时自己都没能定位的失败强行要求改代码（fail-open）。定位未就绪时
             # 继续允许读取，由 LoopGuard（no_progress）与 max_steps 兜底。
+            _graph_enter(context, Node.FIX_DRIVING, f"reads_after_fail={reads_after_fail}")
             if test_failed and repair_plan_injected and reads_after_fail >= fix_read_limit:
                 logger.warning(
                     "FixDriving: test failed, %d reads after failure without modification — forcing fix phase",  # noqa: E501
@@ -1843,6 +1933,7 @@ class SWEAgent(Agent):
 
             # ── LoopGuard: check for loops ────────────────────
             if guard:
+                _graph_enter(context, Node.LOOP_GUARD, "check")
                 loop_result = guard.check()
                 if loop_result.blocked:
                     logger.warning(
@@ -1933,6 +2024,7 @@ class SWEAgent(Agent):
         # ── Pre-completion check: is the Plan fully executed? ──
         plan = context.metadata.get("execution_plan")
         if plan and not plan.is_finished:
+            _graph_enter(context, Node.REPLAN, f"{plan.completed_steps}/{len(plan.steps)} done")
             replan_count = context.metadata.get("replan_count", 0)
             if replan_count < MAX_REPLANS:
                 context.metadata["replan_count"] = replan_count + 1
@@ -1973,6 +2065,7 @@ class SWEAgent(Agent):
 
         # ── Objective verification ────────────────────────────
         # Agent must not claim completion based solely on tool call success.
+        _graph_enter(context, Node.AUTO_VERIFY, "text_only")
         vresult = self._auto_verify(context)
         if vresult is not None:
             context.metadata["verification"] = vresult
@@ -2013,6 +2106,7 @@ class SWEAgent(Agent):
                         "Auto-verify blocked %d times with no progress — failing (%s)",
                         _blocks - 1, context.agent_id,
                     )
+                    _graph_enter(context, Node.FAILED, "auto_verify_blocked")
                     return AgentAction.fail(
                         error=(f"Verification blocked {_blocks - 1}x without progress: "
                                f"{vresult.summary}")
@@ -2126,6 +2220,7 @@ class SWEAgent(Agent):
         # （requests-1963 实测：5 步 / 0 次 pytest / 0 次修改 / status=completed / diff 空）。
         _needs_change = _eval_blocking_completion(context, at_completion_point=True)
 
+        _graph_enter(context, Node.COMPLETION_GATE, "text_only")
         if _needs_retest or _needs_change:
             _blocks = context.metadata.get("completion_block_count", 0) + 1
             context.metadata["completion_block_count"] = _blocks
@@ -2136,6 +2231,7 @@ class SWEAgent(Agent):
                     "Completion guard blocked %d times with no progress — failing (%s)",
                     _blocks - 1, context.agent_id,
                 )
+                _graph_enter(context, Node.FAILED, "completion_gate_blocked")
                 return AgentAction.fail(
                     error=(f"Completion blocked {_blocks - 1}x without progress: "
                            f"ever_modified={bool(context.metadata.get('ever_modified'))}, "
@@ -2186,6 +2282,7 @@ class SWEAgent(Agent):
                         "No code change yet; completion blocked until source is modified")
             )
 
+        _graph_enter(context, Node.DONE, "text_only_complete")
         return AgentAction.complete(output=response.content or "")
 
     def _auto_verify(self, context: AgentContext) -> VerificationResult | None:
@@ -2333,6 +2430,9 @@ class SWEAgent(Agent):
                 "edit_validation_failures": context.metadata.get(
                     "swe_stats", {}
                 ).get("edit_validation_failures", 0),
+                # Graph Runtime：显式化的转移轨迹（观察层，不影响判定）
+                "graph_trace": context.metadata.get("graph_trace", []),
+                "graph_violations": context.metadata.get("graph_violations", []),
             },
         )
         logger.info(

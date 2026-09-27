@@ -415,6 +415,16 @@ def test_full_scope_command_detection():
     assert not full("pytest tests/")
     # -k/-m 选择器无法证明覆盖完整套件 → 同样按子集处理（会提示跑完整套件）
     assert not full("python -m pytest -k foo")
+    # ── 口径是"实际执行的那条命令"：重定向/管道是 shell 语法，不是测试目标 ──
+    # 模型实际发往 shell 的完整套件命令几乎都带输出处理（见 smoke 日志），
+    # 若把 `2>&1 | tail` 读成目标，任何完整套件运行都拿不到完成资格。
+    assert full("python -m pytest -q 2>&1")
+    assert full("python -m pytest -q 2>&1 | tail -50")
+    assert full("python -m pytest -q | more")
+    assert full("python -m pytest -q > pytest.log 2>&1")
+    # 带目标时仍必须是子集——不得靠"删掉所有非 pytest token"蒙混成完整套件
+    assert not full("python -m pytest tests/test_x.py -q")
+    assert not full("python -m pytest tests/test_x.py -q 2>&1 | tail -20")
 
 
 def test_first_green_subset_does_not_lock_baseline(tmp_path):

@@ -320,6 +320,10 @@ _TEST_INVOCATION_ERROR_SIGNALS = (
     "no tests ran",                         # 收集到 0 个测试
     "no tests collected",                   # 同上
     "collected 0 items",                    # 收集头（非 -q）
+    # ShellTool 的测试命令超时（`timeout (600s)`）：命令根本没跑完，既没有通过
+    # 证据也没有失败证据。不列为信号的话，一次超时会变成 `Command failed` 的
+    # **失败**证据，把"还没跑完"判成"测试失败"。
+    "timeout (",
 )
 
 

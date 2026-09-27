@@ -329,6 +329,16 @@ class OpenInBrowserTool(Tool):
         return result
 
 
+def _range_read_key(content_hash: str, start: int, end: int) -> str:
+    """read_key 同时标识文件内容与本次实际交付的行范围。
+
+    只带文件 hash 会让 read(1,5) 与 read(100,105) 生成同一个 key：第二次读被
+    判"内容未变化且仍可见"，回一句"请复用之前的读取结果"，而 100-105 行模型
+    从未见过。
+    """
+    return hashlib.sha256(f"{content_hash}:{start}:{end}".encode()).hexdigest()
+
+
 def _read_visible(context: ToolContext, read_key: object) -> bool:
     """上下文可见性探针（P1-1）。
 
@@ -403,7 +413,15 @@ class ReadFileTool(Tool):
                 cur_hash = ""
             _cache_hit = cur_hash == _cached_hash
             if _cache_hit:
-                _read_key = _cached_hash
+                # 命中路径与 fresh 路径必须对同一范围生成完全一致的 key：
+                # start 取参数默认 1，end 取参数默认"整文件行数"（即 fresh 路径
+                # 的 len(lines)；hash 一致时二者相等）。
+                _read_key = (
+                    _range_read_key(_cached_hash,
+                                    params.get("start_line", 1),
+                                    params.get("end_line", _line_count))
+                    if _cached_hash else None
+                )
             # ── P1-1: 轻量命中需要**两个**维度同时成立 ──
             #   ① 文件没变（sha256 一致）—— 已有判据，不动；
             #   ② 这份内容仍在模型可见窗口 —— 新增判据。
@@ -478,7 +496,9 @@ class ReadFileTool(Tool):
             if len(self._read_cache_order) > 400:  # 简单 LRU 上限，防无限增长
                 oldest = self._read_cache_order.pop(0)
                 self._read_cache.pop(oldest, None)
-            _read_key = content_hash or None
+            # read_key 用**最终实际交付的范围**（上面的 start/end），不是入参原文。
+            _read_key = (_range_read_key(content_hash, start, end)
+                         if content_hash else None)
         result = ToolResult.ok(
             output=f"{path} ({total} lines, {start}-{min(end, total)})\n{numbered}",
             metadata={"line_count": total, "size": fsize,
@@ -936,18 +956,66 @@ _TEST_CMD_RE = re.compile(r"pytest|unittest|nosetests", re.IGNORECASE)
 # 拿到 tests_complete。因此这里按 shell 段拆开，只认"段首可执行的就是 runner"。
 _SHELL_SEGMENT_RE = re.compile(r"&&|\|\||[;|&\n]")
 _ENV_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=\S*")
+# shell 重定向（`2>&1` / `> out.txt` / `>>log` / `< in.txt`）：它们是 shell 语法，
+# 不是被调用命令的参数。只在**判定测试目标**时剥离（is_test_command 的段首识别
+# 不剥，保持既有行为）：不剥的话 `pytest -q 2>&1` 会被读成"带了一个目标 2>&1"。
+_SHELL_REDIRECT_RE = re.compile(r"\d*(?:>>?|<)\s*&?\d*\S*")
 # 段首即 runner 的命令
 _BARE_RUNNERS = frozenset({"pytest", "py.test", "nosetests"})
 # `python -m <module>` 形式的测试模块
 _RUNNER_MODULES = frozenset({"pytest", "unittest", "nose", "nose2"})
 # `poetry run pytest` / `uv run pytest` 之类的包装前缀（漏判会让合法运行拿不到证据）
 _RUN_PREFIXES = frozenset({"poetry", "uv", "pipenv", "pdm", "hatch", "rye"})
+# 测试运行器的子命令（不是测试目标）。`python -m unittest discover` 跑的是全套件。
+_RUNNER_SUBCOMMANDS = frozenset({"discover"})
 
 
 def _exe_name(token: str) -> str:
     """取段首 token 的可执行名：去引号、取路径末段、去 .exe、转小写。"""
     t = token.strip().strip("\"'").replace("/", "\\").rsplit("\\", 1)[-1].lower()
     return t[:-4] if t.endswith(".exe") else t
+
+
+def _runner_head(tokens: list[str]) -> int | None:
+    """段首若是测试运行器，返回**运行器之后**第一个 token 的下标；否则 None。
+
+    只认段首为可执行 runner 的形态：
+      pytest / py.test / nosetests
+      python[-X.Y] -m pytest|unittest|nose|nose2   （`py -3 -m pytest` 亦可）
+    包装前缀（`poetry run …`）已由 `_shell_segments` 剥掉。
+    """
+    if not tokens:
+        return None
+    exe = _exe_name(tokens[0])
+    if exe in _BARE_RUNNERS:
+        return 1
+    if exe != "py" and not exe.startswith("python"):
+        return None
+    rest = tokens[1:]
+    if "-m" in rest:
+        i = rest.index("-m")
+        if i + 1 < len(rest) and _exe_name(rest[i + 1]) in _RUNNER_MODULES:
+            return i + 3
+    return None
+
+
+def _shell_segments(command: str, *, strip_redirects: bool = False) -> list[list[str]]:
+    """把 shell 命令切成段，每段是已剥环境变量赋值与包装前缀的 token 列表。
+
+    strip_redirects=True 时先剥重定向：此时每段描述的是"实际被执行的命令"。
+    """
+    text = _SHELL_REDIRECT_RE.sub(" ", command or "") if strip_redirects \
+        else (command or "")
+    segments: list[list[str]] = []
+    for segment in _SHELL_SEGMENT_RE.split(text):
+        tokens = segment.split()
+        while tokens and _ENV_ASSIGN_RE.fullmatch(tokens[0]):
+            tokens.pop(0)
+        if len(tokens) >= 2 and _exe_name(tokens[0]) in _RUN_PREFIXES \
+                and tokens[1] == "run":
+            tokens = tokens[2:]
+        segments.append(tokens)
+    return segments
 
 
 def is_test_command(command: str) -> bool:
@@ -961,26 +1029,29 @@ def is_test_command(command: str) -> bool:
     反例（一律 False）：`type pytest.log`、`cat pytest.ini`、`pip install pytest`、
     `echo pytest`、`python -c "...pytest..."`、`# pytest`。
     """
-    for segment in _SHELL_SEGMENT_RE.split(command or ""):
-        tokens = segment.split()
-        while tokens and _ENV_ASSIGN_RE.fullmatch(tokens[0]):
-            tokens.pop(0)
-        if len(tokens) >= 2 and _exe_name(tokens[0]) in _RUN_PREFIXES \
-                and tokens[1] == "run":
-            tokens = tokens[2:]
-        if not tokens:
+    return any(_runner_head(tokens) is not None
+               for tokens in _shell_segments(command))
+
+
+def test_scope_targets(command: str) -> list[str] | None:
+    """命令**实际执行**的测试调用所带的测试目标（非选项参数）。
+
+    None  → 命令里没有测试运行器；
+    []    → 跑的是完整套件（未指定任何目标）；
+    非空  → 只跑了指定目标（子集）。
+
+    判定口径是"真正被执行的那条命令"：先剥 shell 重定向、再按管道/`&&` 切段，
+    因此 `pytest -q 2>&1 | tail -50` 看到的是 `pytest -q`（完整套件），
+    而不是"测了名为 `2>&1` 和 `tail` 的东西"。`-k foo` 这类选择器仍算目标，
+    因为它确实无法证明覆盖完整套件。
+    """
+    for tokens in _shell_segments(command, strip_redirects=True):
+        at = _runner_head(tokens)
+        if at is None:
             continue
-        exe = _exe_name(tokens[0])
-        if exe in _BARE_RUNNERS:
-            return True
-        if exe != "py" and not exe.startswith("python"):
-            continue
-        rest = tokens[1:]
-        if "-m" in rest:
-            i = rest.index("-m")
-            if i + 1 < len(rest) and _exe_name(rest[i + 1]) in _RUNNER_MODULES:
-                return True
-    return False
+        return [t for t in tokens[at:]
+                if not t.startswith("-") and t not in _RUNNER_SUBCOMMANDS]
+    return None
 
 
 def _strip_trailing_pager(cmd: str) -> str:
@@ -1021,6 +1092,12 @@ def _test_summary_prefix(output: str) -> str:
         f"[test summary] {totals['passed']} passed, {totals['failed']} failed, "
         f"{totals['errors']} errors\n"
     )
+
+
+# 测试命令的默认超时（秒）。完整测试套件远超普通 shell 命令的 30s 预算，用同一个
+# 预算会把"套件还没跑完"变成下游的"测试失败证据"。可用 config["timeout.test"] 覆盖；
+# 非测试命令仍走 context.timeout（默认 30s），行为不变。
+TEST_COMMAND_TIMEOUT = 600
 
 
 class ShellTool(Tool):
@@ -1064,7 +1141,12 @@ class ShellTool(Tool):
             result = ToolResult.ok(output="cancelled by user")
             _emit_tool_result(self.name, context, params, result, _st)
             return result
-        timeout = params.get("timeout", context.timeout or 30)
+        # 测试命令走独立超时预算：完整套件不是"30s 没跑完就等于失败"的普通命令。
+        # 模型显式传的 timeout 优先；普通 shell 命令行为完全不变。
+        timeout = params.get("timeout")
+        if timeout is None:
+            timeout = (context.config.get("timeout.test", TEST_COMMAND_TIMEOUT)
+                       if is_test_command(cmd) else (context.timeout or 30))
         stdin_input = params.get("input")
         try:
             cwd = str(context.project_path or context.workspace_path)
@@ -1102,7 +1184,11 @@ class ShellTool(Tool):
                     output=summary + _cap_shell_output(output, cmd, 10000),
                     metadata={"exit_code": exit_code})
         except subprocess.TimeoutExpired:
-            result = ToolResult.err(f"timeout ({timeout}s)")
+            # 超时 = 这次命令没有产出任何测试结果，既不是通过证据也不是失败证据。
+            # 退出码记 124（timeout(1) 惯例），避免下游把缺失的 exit_code 默认读成 0
+            # ——那会让一次超时看起来像一次"exit 0 的干净运行"。
+            result = ToolResult.err(f"timeout ({timeout}s)",
+                                    metadata={"exit_code": 124})
         except Exception as e:
             result = ToolResult.err(f"failed: {e}")
         _emit_tool_result(self.name, context, params, result, _st)
