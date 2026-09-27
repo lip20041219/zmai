@@ -11,7 +11,7 @@ ZMAI supports a configurable LLM backend; this validation run used the DeepSeek 
 
 ## SWE-bench Evaluation Status
 
-- **Not yet evaluated**: no official SWE-bench (Full / Verified / Lite) runs so far
+- **No published score**: no official SWE-bench (Full / Verified / Lite) evaluation has been released. An internal SWE-bench Lite smoke run (5 instances, real runs) is recorded in `benchmarks/results/swebench_lite/PROGRESS.md` — 1 resolved (`pallets__flask-4992`), the rest failed for model / infrastructure reasons. It is not a benchmark score and must not be compared across projects.
 - Planned pipeline:
   1. Prepare SWE-bench environment and data split
   2. Configure an Anthropic-compatible endpoint (local LLM or cloud API)

@@ -124,6 +124,22 @@ verification            ← Verifier 客观确认全绿
 complete                ← CompletionState 判定完成，自主停止
 ```
 
+失败不是终点，而是循环里的一等状态。完整 SWE Loop 为：
+
+```
+failure → diagnosis → repair plan → edit → verification
+             ↑                                  │
+             │                          regression / recovery
+             │                                  │
+             └────────── bounded retry ←────────┘
+                                                │
+                     completion（全绿且覆盖基线）/ failure（预算耗尽）
+```
+
+- **回归检测** — 逐轮比较**同一条测试命令**下的 passed/failed 计数；退化时注入 `[Regression]`；项目被改到 import 失败（collection/import error）时注入 `[Recovery]`，要求先回退再谈修复
+- **有界恢复** — 每条恢复路径都有预算（force_edit 步数、灾难性回归次数、completion block 次数、edit 失败恢复次数），耗尽即明确 `FAILED`，不无限重试、也不伪装成 timeout
+- **Graph trace** — 控制流**实际到达**的节点（entry / plan / backend / tool / regression / repair plan / edit recovery / read limit / fix driving / loop guard / completion gate / done / failed）与节点间转移写入 `graph_trace`，`validate_trace` / `analyze_trace` 供审计；`enforce=False`，非法转移只记录不抛错，**不参与任何判定**
+
 ---
 
 ## 6. Demo
@@ -184,6 +200,8 @@ ZMAI 内置多层防护，防止空转、伪造成功与无限循环：
 - **LoopGuard** — 检测连续相同调用 / 相同失败 / 无进展，触发结构化恢复信号
 - **FixDriving** — 测试失败后达到读取阈值即强制进入修改阶段，结构性阻断继续只读
 - **CompletionState** — 跨轮累积完成判定；partial_green（子集全绿未达基线）不完成、不累计，强制运行完整套件
+- **Bounded recovery** — 强制修改期、灾难性回归、完成拦截、edit 失败恢复各自独立预算（`MAX_FORCE_EDIT_STEPS` / `MAX_REGRESSION_RECOVERIES` / `MAX_COMPLETION_BLOCKS` / `MAX_EDIT_FAILURE_RECOVERIES`），超预算即明确失败
+- **Test command timeout** — 测试命令走独立超时预算（`timeout.test`，默认 600s），不再套用普通 shell 的 30s；超时**既不构成通过证据也不构成失败证据**，连续超时有界失败
 - **Workspace Sandbox** — 路径穿越防护、文件大小限制、符号链接检测
 - **Hard stop** — `max_steps=300` 硬上限，杜绝无限循环
 
@@ -198,8 +216,12 @@ ZMAI 的完成判定依赖**客观验证**而非工具调用成功：
 3. 测试套件覆盖达到基线（`parse_test_totals`）
 4. `CompletionState.should_complete()` 为真
 5. 测试通过后无新的业务修改
+6. 本次运行**确实执行了测试**（计数为 0 的命令，如 `--collect-only`/`--help`，不构成证据）
+7. 测试命令超时不计入通过证据，也不计入失败证据
 
 满足以上条件后返回 `complete`，Runtime 立即 `break`，不再调用 LLM / read / edit / pytest。
+
+判定是 **fail-closed** 的：拿不到结构化测试计数、测试曾失败后没有覆盖基线的全绿重测、改过代码却没有修改后的有效验证 —— 都不判完成。判据落在工作区真实状态（git 索引 / 文件指纹）与测试计数上，而不是"工具调用返回 success"。
 
 ---
 
@@ -257,14 +279,25 @@ ZMAI 配置按优先级解析：**file → env → CLI**。
 ```
 pytest
 
-1311 passed, 9 skipped
+1657 passed, 9 skipped
 ```
 
-- 测试覆盖 auth、credential store、gateway、runtime、loop guard、termination、workspace security、SWE workflow、CLI 等
+- 测试覆盖 auth、credential store、gateway、runtime、loop guard、termination、workspace security、SWE workflow（completion gate / test scope / timeout / trace graph）、CLI 等
 - **无需 API Key 即可运行**（mock backend）
 - CI 运行于 Ubuntu + Windows × Python 3.10/3.11/3.12
 
-> ⚠️ 测试结果 ≠ SWE-bench 成绩。本项目**尚未发布**公开标准基准（SWE-bench Full/Verified/Lite）分数。内部真实运行的验证数据见 [BENCHMARK.md](BENCHMARK.md)。
+> ⚠️ 测试结果 ≠ SWE-bench 成绩。本项目**尚未发布**公开标准基准（SWE-bench Full/Verified/Lite）分数。
+
+### 内部 SWE-bench Lite smoke（真实运行，非官方成绩）
+
+数据与逐例分析见 [`benchmarks/results/swebench_lite/PROGRESS.md`](benchmarks/results/swebench_lite/PROGRESS.md)，模型为 DeepSeek 后端，`max_steps=60`、`eval.require_code_change=true`：
+
+- `pallets__flask-4992` — **resolved**（39 步 / 271s，FAIL_TO_PASS 由 FAIL 转 PASS，PASS_TO_PASS 保持通过）
+- `psf__requests-3362`、`pylint-dev__pylint-5859` — 未解决；agent 产生的 diff 存在语法错误，另有网络/配额中断
+- `pydata__xarray-4248` — 未解决；耗尽步数未产生 git diff
+- `mwaskom__seaborn-3010` — 基础设施失败（模型配额 HTTP 402，agent 未执行）
+
+单批次 5 个实例，失败中包含基础设施与模型能力原因，**不能作为 SWE-bench 成绩或能力对比依据**。
 
 ---
 
@@ -278,7 +311,8 @@ zmai/
 │   ├── gateway/          # 多后端网关（DeepSeek / Claude / Gemini / 插件）
 │   ├── runtime/          # Runtime 执行循环
 │   ├── swe/
-│   │   ├── agent.py      # SWE Agent 主逻辑
+│   │   ├── agent.py      # SWE Agent 主逻辑（含 SWE Loop 与 trace 接线）
+│   │   ├── graph.py      # 控制流 trace（观察层，enforce=False）
 │   │   ├── completion.py # CompletionState 完成判定
 │   │   ├── loop_guard.py # LoopGuard 循环保护
 │   │   ├── failure.py    # FailureParser 失败解析
@@ -287,7 +321,7 @@ zmai/
 │   │   └── tools.py      # 工具（含 TestGuard / ReadCache）
 │   ├── workspace/        # Workspace Sandbox
 │   └── ...
-├── tests/                # 1311+ 测试
+├── tests/                # 1650+ 测试
 ├── examples/             # 使用示例
 └── docs/                 # 文档 / zmai-demo.mp4
 ```
@@ -298,7 +332,8 @@ zmai/
 
 - **Shell 执行风险** — `shell_exec` 直接在本机运行命令；headless 模式**无确认提示**，请视为可信贡献者
 - **凭证加密为混淆而非硬件级** — 密钥文件与凭证同机，本地加密防 casual 读取
-- **尚未发布标准基准** — 无官方 SWE-bench 分数；内部数据见 BENCHMARK.md，勿跨项目对比
+- **尚未发布标准基准** — 无官方 SWE-bench 分数；只有内部 SWE-bench Lite smoke（5 实例，1 resolved），勿跨项目对比
+- **大仓 timeout 未经 E2E 验证** — 测试命令独立超时（`timeout.test`）已实现并有确定性测试覆盖，但"真实大仓跑满 600s 超时"这条路径**尚未在 E2E 中验证**；当前环境的 SWE-bench 实例存在依赖代差，不作为可靠验证目标
 - **Windows 优先** — 内置命令翻译与 UTF-8 处理，但 Linux/macOS 覆盖以 CI 为准
 
 ---
