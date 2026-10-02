@@ -8,6 +8,8 @@ on:
 
 jobs:
   test:
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -43,10 +45,18 @@ jobs:
           python -m pytest tests/ --tb=short --ignore=tests/test_live_api.py -q > pytest.out 2>&1
           code=$?
           tail -60 pytest.out
-          {
-            echo '## pytest failures'
-            echo '```'
-            grep -E '^(FAILED|ERROR)' pytest.out | head -40
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
           exit $code
+
+      - name: Report failures (temporary triage)
+        if: failure() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        shell: bash
+        run: |
+          {
+            echo "=== FAILED/ERROR ==="
+            grep -E '^(FAILED|ERROR)' pytest.out | head -40
+            echo "=== tail ==="
+            tail -80 pytest.out
+          } > ci-failures.txt
+          git -c user.email=ci@ci -c user.name=ci add -f ci-failures.txt
+          git -c user.email=ci@ci -c user.name=ci commit -m "ci: failure report"
+          git push
