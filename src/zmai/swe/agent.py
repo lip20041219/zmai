@@ -150,18 +150,26 @@ _READ_ONLY_TOOLS = frozenset({"read_file", "grep", "show_to_user", "open_in_brow
 
 
 def _explicit_workspace_root(context: AgentContext) -> Path | None:
-    """显式配置的工作区根；未配置时返回 None（此时 CWD 只是兜底，不代表项目范围）。
-
-    "显式" = 调用方在 config 里声明的 project_path。`SWEAgent.initialize()` 会
-    用 find_project_root() 从 CWD 推断出仓库根并回写进 config —— 那只是给 agent
-    提供上下文，不是本次任务的验收范围（metadata 里 project_root_declared 记了
-    区别）。把它当显式 root 会让指纹走全树 os.walk：CWD 是仓库根时单次遍历
-    数万文件（ZMAI 自测 9 秒/次，每次工具调用都来一遍）。
-    """
-    if not context.metadata.get("project_root_declared", True):
-        return context.workspace or None
+    """显式配置的工作区根；未配置时返回 None（此时 CWD 只是兜底，不代表项目范围）。"""
     v = context.config.get("project_path") or context.workspace
     return Path(v) if v else None
+
+
+def _prefer_git_fingerprint(context: AgentContext) -> bool:
+    """指纹是否该走 git 快路径。
+
+    config 里的 project_path 有两个来源：调用方**声明**（CLI/benchmark/eval，
+    这就是本次任务的项目）和 `SWEAgent.initialize()` 用 find_project_root()
+    从 CWD **推断**后回写（只是给 agent 提供上下文）。后者在真实仓库根上会让
+    全树 os.walk 每次工具调用都跑一遍（ZMAI 自测 4.4 万文件 / 9 秒）。
+    metadata.project_root_declared 记的正是这个区别。
+
+    只影响指纹；`_workspace_root()`（shell cwd、TestGuard 的 root）仍按原口径，
+    否则 shell 会跑到别处（CI 上表现为 git status 报 not a git repository）。
+    """
+    if context.metadata.get("project_root_declared", True) is False:
+        return True
+    return _explicit_workspace_root(context) is None
 
 
 def _workspace_root(context: AgentContext) -> Path:
@@ -1278,7 +1286,7 @@ class SWEAgent(Agent):
         if "__ws_fingerprint__" not in context.metadata:
             _explicit_root = _explicit_workspace_root(context)
             context.metadata["__ws_fingerprint__"] = _workspace_fingerprint(
-                _explicit_root or Path("."), prefer_git=_explicit_root is None,
+                _explicit_root or Path("."), prefer_git=_prefer_git_fingerprint(context),
             )
 
         # ── CR-3: 验收文件内容基线 ───────────────────────────────
@@ -1705,7 +1713,7 @@ class SWEAgent(Agent):
                     _explicit_root = _explicit_workspace_root(context)
                     _fp = _workspace_fingerprint(
                         _explicit_root or Path("."),
-                        prefer_git=_explicit_root is None,
+                        prefer_git=_prefer_git_fingerprint(context),
                     )
                     _prev_fp = context.metadata.get("__ws_fingerprint__")
                     # ── CR-1: 测试文件从工作区消失 = TestGuard 违规 ──────────
