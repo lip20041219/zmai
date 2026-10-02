@@ -150,7 +150,16 @@ _READ_ONLY_TOOLS = frozenset({"read_file", "grep", "show_to_user", "open_in_brow
 
 
 def _explicit_workspace_root(context: AgentContext) -> Path | None:
-    """显式配置的工作区根；未配置时返回 None（此时 CWD 只是兜底，不代表项目范围）。"""
+    """显式配置的工作区根；未配置时返回 None（此时 CWD 只是兜底，不代表项目范围）。
+
+    "显式" = 调用方在 config 里声明的 project_path。`SWEAgent.initialize()` 会
+    用 find_project_root() 从 CWD 推断出仓库根并回写进 config —— 那只是给 agent
+    提供上下文，不是本次任务的验收范围（metadata 里 project_root_declared 记了
+    区别）。把它当显式 root 会让指纹走全树 os.walk：CWD 是仓库根时单次遍历
+    数万文件（ZMAI 自测 9 秒/次，每次工具调用都来一遍）。
+    """
+    if not context.metadata.get("project_root_declared", True):
+        return context.workspace or None
     v = context.config.get("project_path") or context.workspace
     return Path(v) if v else None
 

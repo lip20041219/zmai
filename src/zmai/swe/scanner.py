@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
@@ -290,49 +291,43 @@ class RepositoryScanner:
 
         scanned = 0
 
-        for entry in sorted(root_path.rglob("*")):
-            # 跳过根目录自身
-            if entry == root_path:
-                continue
+        # os.walk 原地剪枝：排除目录不下降，max_files 才真的截断。
+        # 用 rglob("*") + 事后过滤会把整棵树先物化成列表（ZMAI 仓库含
+        # benchmarks 数据后 1.6G / 数万文件，单次扫描 57 秒），
+        # max_files 形同虚设 —— 剪枝必须发生在下降之前。
+        for dirpath, dirnames, filenames in os.walk(root_path):
+            dirnames[:] = sorted(
+                d for d in dirnames if not RepositoryScanner.is_excluded_dir(d)
+            )
+            for name in sorted(filenames):
+                entry = Path(dirpath) / name
+                rel = entry.relative_to(root_path)
 
-            # 检查是否需要排除此路径
-            rel = entry.relative_to(root_path)
-            parts = rel.parts
+                # 跳过隐藏文件（以 '.' 开头的文件，白名单除外）
+                if name.startswith(".") and name not in {".github", ".claude", ".gitignore", ".env"}:  # noqa: E501
+                    continue
 
-            # 跳过排除目录内的所有文件
-            skip = False
-            for part in parts[:-1]:  # 只检查目录部分（不检查文件名本身）
-                if RepositoryScanner.is_excluded_dir(part):
-                    skip = True
+                scanned += 1
+                if scanned > max_files:
+                    logger.warning("扫描文件数超过 %d，已截断", max_files)
                     break
-            if skip:
+
+                # 相对路径
+                all_files.append(rel)
+
+                if RepositoryScanner.is_source_file(entry):
+                    source_files.append(rel)
+                    ext = entry.suffix.lower()
+                    lang = RepositoryScanner.SOURCE_EXTENSIONS.get(ext, "other")
+                    language_counts[lang] = language_counts.get(lang, 0) + 1
+
+                    if RepositoryScanner.is_test_file(entry):
+                        test_files.append(rel)
+                elif RepositoryScanner.is_config_file(entry):
+                    config_files.append(rel)
+            else:
                 continue
-
-            # 跳过隐藏文件（以 '.' 开头的文件，白名单除外）
-            if entry.name.startswith(".") and entry.name not in {".github", ".claude", ".gitignore", ".env"}:  # noqa: E501
-                continue
-
-            if not entry.is_file():
-                continue
-
-            scanned += 1
-            if scanned > max_files:
-                logger.warning("扫描文件数超过 %d，已截断", max_files)
-                break
-
-            # 相对路径
-            all_files.append(rel)
-
-            if RepositoryScanner.is_source_file(entry):
-                source_files.append(rel)
-                ext = entry.suffix.lower()
-                lang = RepositoryScanner.SOURCE_EXTENSIONS.get(ext, "other")
-                language_counts[lang] = language_counts.get(lang, 0) + 1
-
-                if RepositoryScanner.is_test_file(entry):
-                    test_files.append(rel)
-            elif RepositoryScanner.is_config_file(entry):
-                config_files.append(rel)
+            break
 
         # 确定主要语言
         primary_lang = "unknown"

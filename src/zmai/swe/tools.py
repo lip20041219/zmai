@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import sys
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -196,6 +197,14 @@ _TEST_DIR_NAMES = {"tests"}
 _TEST_CONFIG_FILES = {"conftest.py", "pytest.ini", "tox.ini", ".coveragerc"}
 
 
+@lru_cache(maxsize=64)
+def _resolved_root(root: Path) -> Path:
+    """缓存 root.resolve()：`_is_test_file` 每个候选路径都调一次，
+    而 Windows 上 resolve() 走 nt._getfinalpathname（~0.27ms/次），
+    上万次调用就是几十秒。root 在一次扫描内是同一个值。"""
+    return root.resolve()
+
+
 def _is_test_file(path: Path, root: Path) -> bool:
     """判断文件是否为测试/验收文件（只读，禁止修改）。
 
@@ -207,7 +216,7 @@ def _is_test_file(path: Path, root: Path) -> bool:
         True 表示该文件是测试文件，禁止写操作。
     """
     try:
-        rel = path.resolve().relative_to(root.resolve())
+        rel = path.resolve().relative_to(_resolved_root(root))
     except (ValueError, OSError):
         return False  # 无法判定为项目内测试文件 → 不拦截（保守）
     name = rel.name

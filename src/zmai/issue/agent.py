@@ -222,7 +222,7 @@ class IssueAgent:
         lines.append("")
 
         # For local files, scan the workspace if available
-        workspace = Path.cwd()
+        workspace = self._work_dir
         py_files = list(workspace.rglob("*.py"))[:20]
         if py_files:
             lines.append("### 项目文件")
@@ -284,13 +284,15 @@ class IssueAgent:
 
         # Use the project's Workspace as the project path
         if issue.source == "file":
-            # Local file: work in CWD
-            project_path = str(Path.cwd())
+            # 本地文件：在 work_dir 里改（构造时显式传入，默认才是临时目录）。
+            # 不能用 Path.cwd() —— CLI 从仓库根启动时那是整个仓库，
+            # SWE 指纹每次工具调用都全树 os.walk，分钟级甚至卡死。
+            project_path = str(self._work_dir)
         else:
             # GitHub issue: clone the repo
             project_path = self._ensure_repo(issue)
             if not project_path:
-                project_path = str(Path.cwd())
+                project_path = str(self._work_dir)
 
         config.set("project_path", project_path)
 
@@ -445,7 +447,9 @@ class IssueAgent:
             repo_dir = self._work_dir / issue.repo
             if repo_dir.exists():
                 return str(repo_dir)
-        return str(Path.cwd())
+        # 与 _modify 同一口径：work_dir（默认临时目录），不是 CLI 的 CWD ——
+        # 后者在仓库根启动时会让 pytest 收集整个仓库。
+        return str(self._work_dir)
 
     def _ensure_repo(self, issue: IssueDescription) -> str | None:
         """确保 GitHub 仓库已克隆。"""
