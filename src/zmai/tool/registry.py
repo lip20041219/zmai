@@ -205,12 +205,22 @@ class ToolRegistry:
     def _execute_with_timeout(
         tool: Tool, context: ToolContext, params: dict[str, Any], timeout: int
     ) -> ToolResult:
-        """在单独的线程中执行工具，超时后强制终止。"""
+        """在单独的线程中执行工具，超时后放弃等待。
+
+        不能用 `with ThreadPoolExecutor(...)`：退出时 __exit__ 调
+        shutdown(wait=True)，会 join 那个卡住的线程 —— 于是 fut.result(timeout)
+        的超时形同虚设，整个 run 照样阻塞到线程自己跑完（CI 里表现为 pytest
+        卡死到 job 超时）。必须 shutdown(wait=False)。
+
+        ponytail: 线程无法强杀，卡住的工具线程会泄漏到进程结束。要真正回收
+        需要子进程隔离 —— 先按"不再阻塞调用方"修，泄漏留到需要时。
+        """
         import concurrent.futures
         import time
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            start = time.monotonic()
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        start = time.monotonic()
+        try:
             fut = pool.submit(tool.execute, context, params)
             try:
                 result = fut.result(timeout=timeout)
@@ -230,3 +240,5 @@ class ToolRegistry:
                 return ToolResult(
                     success=False, output="", error=str(e), duration_ms=elapsed,
                 )
+        finally:
+            pool.shutdown(wait=False)
