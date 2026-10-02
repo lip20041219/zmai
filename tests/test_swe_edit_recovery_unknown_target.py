@@ -42,15 +42,14 @@ from pathlib import Path
 from typing import Any
 
 from tests.test_swe_edit_failure_recovery import (
-    APP_BUGGY,
-    HELPERS,
     _PYTEST,
-    _ScriptedBackend,
+    HELPERS,
     _capture_messages,
     _capture_tool_results,
     _diagnostic_reads,
     _read_file,
     _run_agent,
+    _ScriptedBackend,
     _write_flask_project,
 )
 from zmai.agent import AgentContext

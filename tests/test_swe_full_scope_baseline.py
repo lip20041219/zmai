@@ -35,8 +35,8 @@ from tests.test_swe_edit_failure_recovery import (
     APP_BUGGY,
     HELPERS,
     TEST_APP,
-    _ScriptedBackend,
     _run_agent,
+    _ScriptedBackend,
 )
 from zmai.agent import AgentContext
 from zmai.tool import ToolCall
