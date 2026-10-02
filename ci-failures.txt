@@ -1,0 +1,88 @@
+=== FAILED/ERROR ===
+FAILED test_extra.py::test_broken - assert 1 == 2
+ERROR    zmai.swe.agent:agent.py:1563 Backend call permanently failed (attempt 3/3): [DEGENERATE_RESPONSE] empty response (no content, no tool calls)
+FAILED test_all.py::test_b - assert 1 == 2
+FAILED tests/test_e2e_mock.py::TestSWEAgentMockConversation::test_agent_step_with_tool_execution - AssertionError: 预期 complete, 实际 continue
+FAILED tests/test_swe_pytest_addopts_guard.py::TestCounterfactualWithoutEnvAddoptsCheck::test_attack_completes_when_env_parsing_disabled - AssertionError: 关掉环境变量解析后该攻击必须仍然成功（否则本条对照无意义）: ['continue', 'continue', 'fail']
+FAILED tests/test_swe_regression_detect.py::test_git_status_is_not_a_modification - AssertionError: git status 应真正执行而非被拦截
+=== tail ===
+  Workspace: .
+  Project:  /tmp/pytest-of-runner/pytest-0/test_attack_completes_when_env0
+  Result:   FAIL (0.20s)
+  Reason:   [test summary] 1 passed, 1 failed, 0 errors
+exit 1: .F                                                                       [100%]
+=================================== FAILURES ===================================
+_________________________________ test_broken __________________________________
+
+    def test_broken():
+>       assert value() == 2
+E       assert 1 == 2
+E        +  where 1 = value()
+
+test_extra.py:5: AssertionError
+=========================== short test summary info ============================
+FAILED test_extra.py::test_broken - assert 1 == 2
+ +  where 1 = value()
+1 failed, 1 passed in 0.02s
+
+------------------------------ Captured log call -------------------------------
+WARNING  zmai.swe.agent:agent.py:1549 [DegenerateResponse] attempt 1/3: empty response (no content, no tool calls) (cr4)
+WARNING  zmai.swe.agent:agent.py:1549 [DegenerateResponse] attempt 2/3: empty response (no content, no tool calls) (cr4)
+WARNING  zmai.swe.agent:agent.py:1549 [DegenerateResponse] attempt 3/3: empty response (no content, no tool calls) (cr4)
+ERROR    zmai.swe.agent:agent.py:1563 Backend call permanently failed (attempt 3/3): [DEGENERATE_RESPONSE] empty response (no content, no tool calls)
+____________________ test_git_status_is_not_a_modification _____________________
+tests/test_swe_regression_detect.py:352: in test_git_status_is_not_a_modification
+    assert ctx.metadata.get("tool_calls_fail", 0) == 1, "git status 应真正执行而非被拦截"
+E   AssertionError: git status 应真正执行而非被拦截
+E   assert 2 == 1
+E    +  where 2 = <built-in method get of dict object at 0x7fcd39b7f380>('tool_calls_fail', 0)
+E    +    where <built-in method get of dict object at 0x7fcd39b7f380> = {'cm': <zmai.context.manager.ContextManager object at 0x7fcd39b7ddd0>, 'project_root_declared': True, 'repo_info': Rep... (根目录)/\n    bug.py\n    helper.py\n    test_all.py\n\n### 测试文件 (1)\n  - test_all.py'), 'test_discovery': 'known', ...}.get
+E    +      where {'cm': <zmai.context.manager.ContextManager object at 0x7fcd39b7ddd0>, 'project_root_declared': True, 'repo_info': Rep... (根目录)/\n    bug.py\n    helper.py\n    test_all.py\n\n### 测试文件 (1)\n  - test_all.py'), 'test_discovery': 'known', ...} = AgentContext(agent_id='reg', task='修复 bug 使全部测试通过', config={'project_path': '/tmp/pytest-of-runner/pytest-0/test_git_s... repository (or any of the parent directories): .git\n', 'metadata': {'exit_code': 128, 'tool': 'git'}}]}, memory=None).metadata
+----------------------------- Captured stderr call -----------------------------
+[shell_exec]
+  Target:   python -m pytest -q
+  Workspace: .
+  Project:  /tmp/pytest-of-runner/pytest-0/test_git_status_is_not_a_modif0
+  Result:   FAIL (0.20s)
+  Reason:   [test summary] 1 passed, 1 failed, 0 errors
+exit 1: .F                                                                       [100%]
+=================================== FAILURES ===================================
+____________________________________ test_b ____________________________________
+
+    def test_b():
+>       assert bug.VALUE == 2
+E       assert 1 == 2
+E        +  where 1 = bug.VALUE
+
+test_all.py:5: AssertionError
+=========================== short test summary info ============================
+FAILED test_all.py::test_b - assert 1 == 2
+ +  where 1 = bug.VALUE
+1 failed, 1 passed in 0.02s
+
+[git]
+  Target:   status --porcelain
+  Workspace: .
+  Project:  /tmp/pytest-of-runner/pytest-0/test_git_status_is_not_a_modif0
+  Result:   FAIL (0.00s)
+  Reason:   exit 128: 
+[stderr]
+fatal: not a git repository (or any of the parent directories): .git
+
+=========================== short test summary info ============================
+FAILED tests/test_e2e_mock.py::TestSWEAgentMockConversation::test_agent_step_with_tool_execution - AssertionError: 预期 complete, 实际 continue
+assert 'continue' == 'complete'
+  
+  - complete
+  + continue
+FAILED tests/test_swe_pytest_addopts_guard.py::TestCounterfactualWithoutEnvAddoptsCheck::test_attack_completes_when_env_parsing_disabled - AssertionError: 关掉环境变量解析后该攻击必须仍然成功（否则本条对照无意义）: ['continue', 'continue', 'fail']
+assert 'fail' == 'complete'
+  
+  - complete
+  + fail
+FAILED tests/test_swe_regression_detect.py::test_git_status_is_not_a_modification - AssertionError: git status 应真正执行而非被拦截
+assert 2 == 1
+ +  where 2 = <built-in method get of dict object at 0x7fcd39b7f380>('tool_calls_fail', 0)
+ +    where <built-in method get of dict object at 0x7fcd39b7f380> = {'cm': <zmai.context.manager.ContextManager object at 0x7fcd39b7ddd0>, 'project_root_declared': True, 'repo_info': Rep... (根目录)/\n    bug.py\n    helper.py\n    test_all.py\n\n### 测试文件 (1)\n  - test_all.py'), 'test_discovery': 'known', ...}.get
+ +      where {'cm': <zmai.context.manager.ContextManager object at 0x7fcd39b7ddd0>, 'project_root_declared': True, 'repo_info': Rep... (根目录)/\n    bug.py\n    helper.py\n    test_all.py\n\n### 测试文件 (1)\n  - test_all.py'), 'test_discovery': 'known', ...} = AgentContext(agent_id='reg', task='修复 bug 使全部测试通过', config={'project_path': '/tmp/pytest-of-runner/pytest-0/test_git_s... repository (or any of the parent directories): .git\n', 'metadata': {'exit_code': 128, 'tool': 'git'}}]}, memory=None).metadata
+3 failed, 1734 passed, 16 skipped in 368.67s (0:06:08)
