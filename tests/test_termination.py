@@ -30,6 +30,10 @@ class PassThenDeliverBackend(Backend):
 
     测试期望：因为测试已通过，Agent 必须在第 1 轮即终止，
     invoke 永远不被第 2 次调用。
+
+    命令必须是**完整套件**（裸 `pytest -q`）：零修改的 run 只有可证明覆盖完整范围的
+    全绿才是完成证据（子集全绿只算 partial_green，见
+    tests/test_swe_green_evidence_scope.py）。断言本身与命令形态无关。
     """
 
     name = "pass_then_deliver"
@@ -44,7 +48,7 @@ class PassThenDeliverBackend(Backend):
                 content="Running tests...",
                 tool_calls=[ToolCall(
                     id="c1", name="shell_exec",
-                    params={"command": "python -m pytest test_pass.py -q"},
+                    params={"command": "python -m pytest -q"},
                 )],
                 usage=TokenUsage(input_tokens=10, output_tokens=5),
                 stop_reason="tool_use",

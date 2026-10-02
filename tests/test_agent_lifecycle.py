@@ -498,7 +498,12 @@ class TestRuntimeLifecycleIntegration:
     # ── 3. Tool 失败 ────────────────────────────────────
 
     def test_all_tools_fail(self, runtime: Runtime):
-        """所有工具反复失败 → max_steps 耗尽 → timeout。"""
+        """所有工具反复失败 → 有界失败（force_edit 预算或 max_steps），绝不 completed。
+
+        边界由哪一条先到取决于恢复预算：模型始终不产出修改时，force-edit 预算
+        （MAX_FORCE_EDIT_STEPS）通常先耗尽 → `failed`；预算被放行到结尾时才是
+        max_steps 的 `timeout`。两者都是"有界 + 未完成"，测试保护的是这条不变量。
+        """
         runtime._gateway.register("all_fail", _AllFailBackend, default=True)
         runtime._tools.register(_FailingTool())
 
@@ -508,8 +513,7 @@ class TestRuntimeLifecycleIntegration:
             )
 
         result = asyncio.run(run())
-        # 所有工具都反复失败，直到 max_steps → timeout
-        assert result["status"] == "timeout"
+        assert result["status"] in ("failed", "timeout"), result
 
     def test_tool_fail_once_reports_failed(self, runtime: Runtime):
         """工具失败一次且无成功 → 正确报告 failed。"""

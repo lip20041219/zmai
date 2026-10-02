@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import shlex
 import subprocess
@@ -1033,6 +1034,48 @@ def is_test_command(command: str) -> bool:
                for tokens in _shell_segments(command))
 
 
+# ── CR-6: PYTEST_ADDOPTS 传入的参数 ────────────────────────────────
+# PYTEST_ADDOPTS 被 pytest 插在命令行参数**之前**，对"收集范围"有与命令行选项完全
+# 相同的权力，但它不在任何既有判据的视野里：POSIX 前置赋值
+# (`PYTEST_ADDOPTS=-k x pytest -q`) 会被 `_shell_segments` 当环境变量剥掉，cmd 的
+# `set "PYTEST_ADDOPTS=..."` 是独立段（段首不是 runner）。于是
+# `set "PYTEST_ADDOPTS=-k value" && python -m pytest -q` 只跑了子集，却被判成
+# "完整范围"：baseline 锁成缩小后的数量，同一次运行即 full_green → COMPLETED。
+#
+# 这里**不新增第三套 scope 判据**：把环境变量的值归一化成 pytest 参数，交给既有的
+# `test_scope_targets` / `cli_scope_filter` 判定，与 N-1 的 CLI 判据同源同档。
+#: 值里不含 `&` / `|` / `;`：引号形态**不得跨段**匹配，否则 `set "X=" & python -c "..."`
+#: 会把后面的命令整段吃成"值"（把无关的 `-c` / `-m` 报成缩范围选项），既误报又掩盖真实判定。
+_ADDOPTS_ASSIGN_RE = re.compile(
+    r"""(?:set\s+|\$env:|export\s+|(?:^|[;&|]\s*))["']?PYTEST_ADDOPTS["']?\s*=\s*"""
+    r"""(?:"([^"&|;<>\n]*)"|'([^'&|;<>\n]*)'|([^\s;&|<>]*))""",
+    re.IGNORECASE | re.MULTILINE,
+)
+#: 出现 PYTEST_ADDOPTS 却解析不出赋值（变量插值 / 未知写法）→ fail-closed 哨兵：
+#: 它不是白名单选项，等价于"本次运行带了无法确认安全的选项"。
+_ADDOPTS_UNKNOWN = "--zmai-pytest-addopts-unparsed"
+
+
+def env_addopts_tokens(command: str) -> list[str]:
+    """命令里由 PYTEST_ADDOPTS 传入的 pytest 参数（CR-6）。
+
+    覆盖 cmd `set` / PowerShell `$env:` / POSIX `X=v`、`export X=v` 四种赋值形态，
+    返回归一化后的参数（可能含位置目标）。出现 PYTEST_ADDOPTS 但解析不出赋值时
+    返回 fail-closed 哨兵：无法确认它是否改变收集范围，就不得建立完整范围基线。
+    显式清空（`set PYTEST_ADDOPTS=`）是可解析的空值，不触发哨兵。
+    """
+    text = command or ""
+    found = _ADDOPTS_ASSIGN_RE.findall(text)
+    if not found:
+        return [_ADDOPTS_UNKNOWN] if "PYTEST_ADDOPTS" in text.upper() else []
+    out: list[str] = []
+    for dq, sq, raw in found:
+        # 无引号分支会连 cmd `set "X=v"` 的收尾引号一起吃进来（开头引号已被名字部分
+        # 消费）：剥掉首尾引号，才是 shell 实际赋给变量的值。
+        out.extend((dq or sq or raw.strip("\"'")).split())
+    return out
+
+
 def test_scope_targets(command: str) -> list[str] | None:
     """命令**实际执行**的测试调用所带的测试目标（非选项参数）。
 
@@ -1044,14 +1087,92 @@ def test_scope_targets(command: str) -> list[str] | None:
     因此 `pytest -q 2>&1 | tail -50` 看到的是 `pytest -q`（完整套件），
     而不是"测了名为 `2>&1` 和 `tail` 的东西"。`-k foo` 这类选择器仍算目标，
     因为它确实无法证明覆盖完整套件。
+
+    CR-6：PYTEST_ADDOPTS 里的**位置目标**同样是"只跑了子集"
+    （`set "PYTEST_ADDOPTS=test_app.py" && pytest -q`），一并计入。
     """
     for tokens in _shell_segments(command, strip_redirects=True):
         at = _runner_head(tokens)
         if at is None:
             continue
-        return [t for t in tokens[at:]
+        return [t for t in [*tokens[at:], *env_addopts_tokens(command)]
                 if not t.startswith("-") and t not in _RUNNER_SUBCOMMANDS]
     return None
+
+
+#: 明确**不改变收集范围**的 pytest 选项 —— 白名单，而不是黑名单。
+#: pytest 的选项面（含插件）无法穷举，靠"列出会缩范围的选项"必然漏一个；这里反过来，
+#: 只认已知安全的那几个，**没见过的选项一律不作完整范围证据**（fail-closed）。
+#: 代价是模型要多跑一次裸套件（运行时会给指令），换来的是不会把一次缩小范围的运行
+#: 当成"完整套件全绿"。
+_FULL_SCOPE_SAFE_OPTIONS = frozenset({
+    # 输出/报告形态
+    "-q", "--quiet", "-v", "--verbose", "--verbosity", "-s", "--capture",
+    "-r", "--tb", "--color", "--durations", "--durations-min", "-l", "--showlocals",
+    "--no-header", "--no-summary", "--no-fold-skipped", "--disable-warnings",
+    "--code-highlight",
+    # 收集期严格性：只影响"配置写错时是否报错"，不改变集合
+    "--strict-markers", "--strict-config",
+    # 失败即停：全绿时与跑完整套件等价
+    "-x", "--exitfirst", "--maxfail", "--continue-on-collection-errors",
+})
+
+#: 允许**贴值**写法的短选项（`-rA` == `-r A`）：只有确实不改变收集范围的那几个。
+#: 贴值形态的 `-k` / `-m` / `-o` / `-p` 一律不在白名单内 —— 它们本来就缩范围。
+_FULL_SCOPE_SAFE_ATTACHED = ("-r",)
+
+
+def cli_scope_filter(command: str) -> list[str]:
+    """命令行里会改变 pytest 收集范围的选项（含无法确认安全的未知选项）。
+
+    与 `test_scope_targets` 互补：那个只看**位置目标**（`pytest test_a.py`），这个看
+    **选项**。pytest 的选项同样能缩范围：
+
+        --ignore[=PATH] / --ignore-glob[=PAT] / --deselect[=NODEID] / -k EXPR /
+        -m MARKEXPR / --lf / --sw / --confcutdir / --rootdir / --override-ini（-o）/ -c
+
+    判据是白名单（见 `_FULL_SCOPE_SAFE_OPTIONS`）：不在其中的选项一律算"可能改变收集
+    范围"。`--deselect X` 这类**分离取值**形态即使按位置目标也已不算完整范围，这里
+    仍把选项本身标出来 —— 调用方要能区分"命令行显式过滤过"与"只是跑了子集"：前者
+    连"本 run 自己的全绿证据"都不成立（是模型自己的命令说它跳过了测试）。
+    """
+    for tokens in _shell_segments(command, strip_redirects=True):
+        at = _runner_head(tokens)
+        if at is None:
+            continue
+        out: list[str] = []
+        # CR-6：PYTEST_ADDOPTS 里的选项与命令行选项同权 —— 归一化后进同一白名单。
+        for t in [*env_addopts_tokens(command), *tokens[at:]]:
+            if not t.startswith("-"):
+                continue
+            name = t.split("=", 1)[0]
+            if name in _FULL_SCOPE_SAFE_OPTIONS:
+                continue
+            if len(name) > 2 and name[:2] in _FULL_SCOPE_SAFE_ATTACHED:
+                continue
+            out.append(t)
+        return out
+    return []
+
+
+#: 命令行里**点名**"跳过谁 / 换哪份收集配置"的选项（N-1 第二档判据）。
+#: 它们与 `-k` / `-m` 这类**选择表达式**的区别是：命令本身写明了被排除的对象或
+#: 被替换的配置 —— 于是"没有任何证据表明套件比刚跑过的那部分更大"这个前提直接被
+#: 命令自己推翻，连"零修改 + 本 run 自己的全绿就是完成证据"的例外也不成立。
+_CLI_DECLARED_EXCLUSIONS = ("--ignore", "--deselect", "--confcutdir", "--rootdir",
+                            "--override-ini", "-o", "-c", "-p")
+
+
+def cli_scope_names_exclusions(command: str) -> bool:
+    """命令行是否点名了被排除的测试 / 替换了收集配置（见 `_CLI_DECLARED_EXCLUSIONS`）。
+
+    `cli_scope_filter()` 回答的是"这次运行能不能作为完整范围证据"（白名单，fail-closed，
+    包含 `-k` / `--collect-only` / 未知插件选项）；本函数回答一个更窄的问题："命令自己
+    有没有声明它在跳过测试"。只有后者会让本次运行在证据层**完全作废**（既非通过也非
+    失败）—— 选择表达式（`-k` / `-m`）与位置目标仍走既有的 partial_green 语义。
+    """
+    return any(t.split("=", 1)[0].startswith(_CLI_DECLARED_EXCLUSIONS)
+               for t in cli_scope_filter(command))
 
 
 def _strip_trailing_pager(cmd: str) -> str:
@@ -1150,8 +1271,15 @@ class ShellTool(Tool):
         stdin_input = params.get("input")
         try:
             cwd = str(context.project_path or context.workspace_path)
+            # ── CR-4: 测试命令注入验收文件守卫 ─────────────────────
+            # 守卫必须在**测试进程内部**核对验收文件：一次调用内部"改写 → 跑
+            # pytest → 还原"的端状态与起始相同，事后判据看不到。注入只走环境变量
+            # （PYTHONPATH + PYTEST_ADDOPTS），不做任何命令字符串处理；非测试命令
+            # 不注入，普通 shell 行为完全不变。
+            env = ({**os.environ, **context.env}
+                   if context.env and is_test_command(cmd) else None)
             r = subprocess.run(cmd, shell=True, cwd=cwd,
-                               input=stdin_input,
+                               input=stdin_input, env=env,
                                capture_output=True, text=True, timeout=timeout,
                                encoding="utf-8", errors="replace")
             output = r.stdout or ""

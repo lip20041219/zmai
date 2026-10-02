@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
+import hashlib
+import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from typing import Any
 
 from zmai.agent import Agent, AgentAction, AgentContext, AgentResult, AgentState
 from zmai.context.memory import _truncate_head_tail
@@ -15,6 +21,7 @@ from zmai.errors import BackendError
 from zmai.gateway import Backend
 from zmai.gateway.base import BackendRequest, BackendResponse
 from zmai.swe._async_utils import run_sync
+from zmai.swe.acceptance_guard import MARKER as ACCEPTANCE_GUARD_MARKER
 from zmai.swe.completion import CompletionState
 from zmai.swe.context import ContextManager
 from zmai.swe.graph import GraphRuntime, Node, SWEState
@@ -32,6 +39,8 @@ from zmai.swe.tools import (
     ShowToUserTool,
     WriteFileTool,
     _is_test_file,
+    cli_scope_filter,
+    cli_scope_names_exclusions,
     is_test_command,
     test_scope_targets,
 )
@@ -225,11 +234,13 @@ def _workspace_fingerprint(root: Path, *, prefer_git: bool = False,
 
 
 def _is_full_scope_test_command(command: str) -> bool:
-    """测试命令是否**可证明**覆盖整个套件（未显式指定测试目标）。
+    """测试命令是否**可证明**覆盖整个套件（既没有测试目标，也没有缩范围的选项）。
 
     `python -m pytest -q`                  → True（跑项目配置的全部测试）
     `python -m pytest -q 2>&1 | tail -50`  → True（重定向/管道是输出处理，不是目标）
     `python -m pytest -q test_a.py`        → False（只跑指定目标，是子集）
+    `python -m pytest -q --ignore=test_b.py` → False（选项同样能缩小收集范围）
+    `python -m pytest -q -k foo`           → False（`-k` 选择器，且 `foo` 是位置目标）
 
     判定口径是**实际被执行的那条 runner 命令**：由 tools.test_scope_targets()
     剥掉 shell 重定向、按管道/`&&` 切段后，只看 runner 后面有没有非选项参数。
@@ -239,14 +250,430 @@ def _is_full_scope_test_command(command: str) -> bool:
     只认"完全没有测试目标"这一种证明方式。`-k` / `-m` 这类带参数的选择器因此
     也会被判为子集——它们确实无法证明覆盖完整套件，被提示去跑完整套件是正确方向，
     不是误判。找不到运行器时返回 True（保守：保持既有行为）。
+
+    ── N-1：选项也必须过一遍 ──
+    光看位置目标不够：`--ignore=test_bug.py` / `--deselect=...` 这类 **flag=值** 形态
+    不产生位置 token，于是被判成"完整范围"，而失败的验收测试根本没被收集 —— baseline
+    被锁成缩小后的数量，剩余全绿即 COMPLETED。选项按白名单判定（见
+    tools.cli_scope_filter）：只有已知不改变收集范围的选项（`-q` / `-v` / `-s` / `-x`
+    / `--tb=...` …）才保留完整范围资格，"没见过的选项"一律 fail-closed。
     """
     targets = test_scope_targets(command)
-    return True if targets is None else not targets
+    if targets is None:
+        return True
+    if targets:
+        return False
+    return not cli_scope_filter(command)
 
 
 def _norm_target_path(p: object) -> str:
     """路径归一化 —— 只用于"是不是同一个目标文件"的比较，不做安全判定。"""
     return os.path.normpath(str(p or "")).replace("\\", "/")
+
+
+def _fp_key(key: object) -> str:
+    """指纹 key → 可解析为路径的形式。
+
+    git 快路径（无显式 project_path 时）的 key 形如 `git: M:tests/test_x.py`，
+    目录树路径的 key 就是相对路径本身。两者都要能被还原成路径，否则 CR-1 的
+    "测试文件消失"判定会在 git 路径下静默失配。
+    """
+    k = str(key or "")
+    return k.split(":", 2)[2] if k.startswith("git:") else k
+
+
+# ── CR-3: 验收文件**内容**基线 ────────────────────────────────────
+# CR-1 判"路径消失"（滚动指纹的路径集合），CR-3 判"内容变化"（与 run 起始基线的
+# 内容摘要比对）。两条判据都落在 workspace evidence 上，因此 shell / git / 一切
+# 间接改写路径被同一条规则覆盖，不需要任何命令字符串解析。
+_ACCEPTANCE_BASELINE_KEY = "__test_files_baseline__"
+
+
+def _content_digest(p: Path) -> str | None:
+    """文件内容摘要；不存在 / 不可读 → None。"""
+    try:
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _git_tracked_paths(root: Path) -> set[str]:
+    """git 仓库里全部已跟踪文件（相对路径）；非仓库返回空集。
+
+    只在**没有显式工作区根**时用：那时 `_workspace_fingerprint` 走 git 快路径，
+    指纹里只有**变更**文件 —— 拿它当验收文件的枚举来源会得到近乎空的基线，
+    "改写一个本来干净的测试文件"就没有前值可比。本函数只在建立基线时调一次。
+    """
+    try:
+        r = subprocess.run(["git", "ls-files", "-z"], cwd=str(root),
+                           capture_output=True, text=True, timeout=10,
+                           encoding="utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if r.returncode != 0:
+        return set()
+    return {p for p in (r.stdout or "").split("\0") if p}
+
+
+def _capture_acceptance_baseline(context: AgentContext) -> dict[str, str]:
+    """**拍下**当前磁盘上的验收文件内容身份：{相对路径: 内容摘要}。
+
+    名字刻意是"拍一次"而不是"读基线"：它每次都按当前磁盘重算，只有
+    `initialize()` 里那一次调用得到的才是合法基线，结果存进 metadata 后
+    **永不刷新** —— 这是 CR-3 的全部要害。
+    滚动指纹（`__ws_fingerprint__`）不能兼任这个角色：它每一步都被覆写，
+    模型"先改坏测试 → 再跑 pytest"就会把改坏后的状态当成新常态，漏洞原样存在。
+    基线只能来自"模型还没动过任何东西"的那一刻。
+
+    ponytail: 每个验收文件读一遍全文；SWE-bench 量级是毫秒级。真成为瓶颈再加
+    mtime 未变的增量复用 —— 但那必须同时处理 mtime 伪造，别为性能牺牲正确性。
+    """
+    root = _explicit_workspace_root(context) or Path(".")
+    # 验收文件的枚举来源：显式根下是目录树指纹的全部 key；无显式根时指纹只含
+    # 变更文件，另行用 git 索引补齐（见 _git_tracked_paths）。
+    cands = {_norm_target_path(_fp_key(k))
+             for k in (context.metadata.get("__ws_fingerprint__") or {})}
+    if _explicit_workspace_root(context) is None:
+        cands |= {_norm_target_path(p) for p in _git_tracked_paths(root)}
+    out: dict[str, str] = {}
+    for rel in sorted(cands):
+        if not _is_test_file(root / rel, root):
+            continue
+        d = _content_digest(root / rel)
+        if d is not None:                   # 建立基线时就不存在的 → 不入基线
+            out[rel] = d
+    return out
+
+
+def _acceptance_files_changed(context: AgentContext) -> list[str]:
+    """当前内容 ≠ run 起始基线的验收文件（**含已消失的**，消失记 inode 读不到）。
+
+    身份用**内容摘要**而非 (mtime_ns, size)：`os.utime` 还原 mtime + 等长替换
+    可以让滚动指纹完全看不出变化，而内容摘要描述的是模型控制不了的事实。
+
+    消失也在这里报，而不是只靠 CR-1：CR-1 判据是**滚动**指纹的**路径集合**变化，
+    在 git 快路径（无显式工作区根）下，一个 run 起始时干净的文件被删除只会让
+    git 多出一行 ` D path`，没有 key 消失 —— 那条路径上 CR-1 静默失效。基线是
+    真正的状态判据，顺带把这一格补上（恢复判据也随之统一为"内容回到 run 起始"）。
+    """
+    baseline = context.metadata.get(_ACCEPTANCE_BASELINE_KEY) or {}
+    root = _explicit_workspace_root(context) or Path(".")
+    out = []
+    for rel, want in baseline.items():
+        if _content_digest(root / rel) != want:   # None（消失）同样满足
+            out.append(rel)
+    return sorted(out)
+
+
+def _acceptance_violation(context: AgentContext) -> tuple[list[str], list[str]]:
+    """当前处于违规态的验收文件：(被删除的, 内容被改写的)。
+
+    CR-1（路径消失）与 CR-3（内容变化）两条判据互补，合成一个入口给完成门禁用。
+    """
+    return (sorted(context.metadata.get("test_files_removed") or ()),
+            sorted(context.metadata.get("test_files_modified") or ()))
+
+
+# ── CR-5: pytest scope 配置基线 ────────────────────────────────────
+# `baseline_test_count` 由"首次完整范围运行"建立，而"完整范围"由 pytest 的配置
+# 定义：addopts / testpaths / python_files / python_classes / python_functions /
+# norecursedirs / collect_ignore。这些配置**不在**验收文件集合里（`_is_test_file`
+# 只认 tests/、test_*.py、conftest.py、pytest.ini、tox.ini、.coveragerc），于是
+# 模型可以在首次 pytest 之前写 `addopts = "--ignore=<失败的测试>"`，用**缩小后**的
+# 套件跑出全绿，把缩小后的规模锁成 baseline —— 数量判据在这里失效：它只能证明
+# "这次跑到的数量 == 之前跑到的数量"，从来没有证明过"完整"。
+#
+# 判据因此落在配置本身：run 起始把**定义 pytest scope 的那一段**取一次内容摘要，
+# 之后每次测试结果判定都重新比对，不一致 → 本次运行不产生任何判定、不得建立
+# baseline、不得 complete（fail-closed）。只取那一段、不取整个文件：pyproject.toml /
+# setup.cfg 的大部分内容是普通项目配置（依赖、打包、格式化），"加个依赖"这样的
+# 合法修改不得被当成验收标准被改。
+_SCOPE_CONFIG_KEY = "__pytest_scope_baseline__"
+#: 文件 → 定义 pytest scope 的段（pytest 自己的读法：pyproject 用点号表名，
+#: 其余 ini 用段名）。tox.ini / pytest.ini 另有 CR-3 整文件保护，这里按同样的
+#: 段口径纳入 scope 基线，顺带覆盖"运行期间**新增**一个配置文件"的形态。
+_SCOPE_CONFIG_SECTIONS = {
+    "pyproject.toml": ("tool", "pytest", "ini_options"),
+    "setup.cfg": ("tool:pytest",),
+    "pytest.ini": ("pytest",),
+    "tox.ini": ("pytest",),
+}
+#: 文件不存在 / 没有该段 —— 同一件事（"后来才出现"同样算变化）
+_SCOPE_ABSENT = "absent"
+
+
+def _ini_section(text: str, header: str) -> str | None:
+    """取 ini 段原文（`[header]` 到下一个段头）；没有该段 → None。
+
+    行扫描而非 configparser：不引入插值 / 重复段 / 续行带来的语义分歧，段内容
+    逐字节可比 —— 正好是"这段配置有没有被改"要的东西。
+    """
+    want = header.strip().lower()
+    body: list[str] = []
+    inside = False
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s.startswith("[") and s.endswith("]"):
+            if inside:
+                break
+            inside = s.lower() == want
+            continue
+        if inside:
+            body.append(ln)
+    return "\n".join(body) if inside else None
+
+
+def _pyproject_scope_section(raw: bytes) -> str | None:
+    """pyproject.toml 里 `[tool.pytest.ini_options]` 表的规范化文本。
+
+    用 tomllib（与 pytest 的读法一致）：`[tool.pytest]` + `ini_options = {...}`
+    这类等价写法也能认出来，行扫描会漏。py<3.11 没有 tomllib、或文件不是合法
+    TOML → 返回整份文本：判据退化为"整个文件的摘要"，仍确定、仍 fail-closed。
+    """
+    text = raw.decode("utf-8", "replace")
+    try:
+        import tomllib
+    except ImportError:
+        return text
+    try:
+        node: object = tomllib.loads(text)
+    except Exception:
+        return text
+    for key in _SCOPE_CONFIG_SECTIONS["pyproject.toml"]:
+        if not isinstance(node, dict) or key not in node:
+            return None
+        node = node[key]
+    return json.dumps(node, sort_keys=True, default=str)
+
+
+def _scope_config_identity(path: Path) -> str:
+    """一个配置文件对 pytest scope 的贡献（内容摘要）。
+
+    文件不存在、或没有 pytest 段 → `_SCOPE_ABSENT`（固定值，与任何摘要都不同）。
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return _SCOPE_ABSENT
+    if path.name.lower() == "pyproject.toml":
+        section = _pyproject_scope_section(raw)
+    else:
+        section = _ini_section(raw.decode("utf-8", "replace"),
+                               f"[{_SCOPE_CONFIG_SECTIONS[path.name.lower()][0]}]")
+    if section is None:
+        return _SCOPE_ABSENT
+    return hashlib.sha256(section.encode("utf-8")).hexdigest()
+
+
+def _capture_scope_baseline(context: AgentContext) -> dict[str, str]:
+    """run 起始拍一次 scope 配置身份；**永不刷新**（与 CR-3 基线同理）。"""
+    root = _explicit_workspace_root(context) or Path(".")
+    return {name: _scope_config_identity(root / name) for name in _SCOPE_CONFIG_SECTIONS}
+
+
+def _pytest_scope_drift(context: AgentContext) -> list[str]:
+    """当前 scope 配置身份 ≠ run 起始的文件（含"运行期间才出现的段"）。"""
+    baseline = context.metadata.get(_SCOPE_CONFIG_KEY)
+    if not baseline:
+        return []
+    root = _explicit_workspace_root(context) or Path(".")
+    return sorted(name for name, want in baseline.items()
+                  if _scope_config_identity(root / name) != want)
+
+
+def _cli_scope_msg(options: list[str]) -> str:
+    """命令行显式缩范围时的指令（N-1）。"""
+    return "\n".join([
+        "[TestGuard] 本次测试命令**显式缩小了收集范围**：",
+        *(f"- {o}" for o in options),
+        "被这些选项排除的测试没有运行，因此这次全绿不能证明完整套件通过 —— "
+        "本结果既不是通过证据，也不是失败证据，不得据此建立基线或判定完成。",
+        "请用未指定目标、不带过滤选项的完整套件命令重新验证：python -m pytest -q",
+    ])
+
+
+def _scope_config_msg(files: list[str]) -> str:
+    """scope 配置偏离时的指令（测试结果判定与完成门禁共用同一段话）。"""
+    return "\n".join([
+        "[TestGuard] 定义 pytest 收集范围的配置与本次运行开始时不一致：",
+        *(f"- {p}" for p in files),
+        "pytest 跑哪些测试由这些配置决定（addopts / testpaths / python_files / "
+        "norecursedirs ...）。改掉它们之后，\"这一轮收集到多少测试\"就不再能证明"
+        "覆盖了完整验收范围 —— 本次结果既不是通过证据，也不是失败证据。",
+        "在恢复之前任务不得判定完成，也不得据此建立测试基线。",
+        "请把它们恢复到本次运行开始时的内容（例如 `git restore <path>`）。"
+        "与 pytest 范围无关的普通项目配置不受此限制。",
+    ])
+
+
+# ── CR-4: 测试窗口内的验收文件守卫 ────────────────────────────────
+# CR-1/CR-3 的判据都取自**工具调用返回之后**的端状态。一次调用内部完成
+# "改写验收文件 → 跑 pytest → 还原原内容"（A → B → pytest → A）时，端状态与 run
+# 起始逐字节相同，中间态没有任何观测点，而被污染的 green 已经产生 —— 判定点晚于
+# 证据产生点，事后追证据追不回来。修复把判定点移进**测试进程内部**（见
+# acceptance_guard 模块）：pytest 会话启动时（改写已发生、还原未发生）核对验收
+# 文件清单，不一致就中止会话（非 0 退出、不产出任何计数）。这里只负责三件事 ——
+# 把 run 起始清单交给守卫、把守卫注入测试命令的子进程环境、把守卫的判定接进
+# 测试证据判定。
+_GUARD_METADATA_KEY = "__acceptance_guard__"
+
+#: 守卫目录里自动加载的 sitecustomize（标准库-only，见 acceptance_guard 模块头）。
+#: 解释器启动时由 `site` 自动 import —— 此刻 shell 里的 `set "PYTEST_ADDOPTS="`
+#: 早已生效完毕，所以这里写回的环境变量是模型**覆盖不掉**的那一份。
+_GUARD_SITECUSTOMIZE = '''\
+"""把验收窗口守卫强制注入本解释器启动的 pytest 会话（由 Runtime 生成）。
+
+模型可以在 shell 命令里覆盖/清空 PYTEST_ADDOPTS，从而抹掉 Runtime 注入的 `-p`；
+本模块由解释器在启动时自动加载（守卫目录在 PYTHONPATH 上），此时不再有 shell
+的环境变量操作，注入因此不可被命令改写。
+"""
+import os
+
+_FLAG = "-p zmai_acceptance_guard"
+_addopts = os.environ.get("PYTEST_ADDOPTS", "").strip()
+if _FLAG not in _addopts:
+    os.environ["PYTEST_ADDOPTS"] = (_addopts + " " if _addopts else "") + _FLAG
+'''
+
+
+def _install_acceptance_guard(context: AgentContext) -> None:
+    """把 run 起始的验收文件清单（= CR-3 基线）交给测试窗口守卫。
+
+    守卫目录放在**工作区之外**：它只是被测解释器要 import 的一个模块 + 一份清单
+    ——放进工作区会被计入工作区指纹，也会污染 agent diff。清单与 CR-3 基线同一
+    时刻产生、同样**永不刷新**：守卫比对的必须是"run 起始"，不是"上一次"。
+    """
+    baseline = context.metadata.get(_ACCEPTANCE_BASELINE_KEY) or {}
+    if not baseline:
+        return                          # 没有验收文件 → 无可保护对象，不注入
+    root = (_explicit_workspace_root(context) or Path(".")).resolve()
+    guard_dir = Path(tempfile.mkdtemp(prefix="zmai-acceptance-guard-"))
+    # 进程退出时清理；长驻进程（harness）在 run 期间保留，退出时统一回收。
+    atexit.register(shutil.rmtree, str(guard_dir), ignore_errors=True)
+    shutil.copy2(Path(__file__).with_name("acceptance_guard.py"),
+                 guard_dir / "zmai_acceptance_guard.py")
+    # ── CR-4 残余：注入不得被命令内的环境变量改写 ────────────────────
+    # `-p zmai_acceptance_guard` 走 PYTEST_ADDOPTS，而模型可以在 shell 命令里
+    # `set "PYTEST_ADDOPTS="` 把它整车抹掉 —— 守卫静默消失。这里补三层：
+    #   1) sitecustomize.py：解释器启动时（shell 的环境变量操作**已经结束**）把
+    #      `-p` 重新写回 os.environ，模型无法在命令里覆盖它；
+    #   2) receipt：守卫加载时留凭据，Runtime 事后核对（见 _guard_receipt_advanced）
+    #      —— PYTHONPATH 连 sitecustomize 一起被清掉时，本次运行 fail-closed；
+    #   3) 守卫产物摘要（见下面的 module_digest / sitecustomize_digest）：改写守卫
+    #      本体同样 fail-closed。
+    (guard_dir / "sitecustomize.py").write_text(_GUARD_SITECUSTOMIZE, encoding="utf-8")
+    manifest = guard_dir / "manifest.json"
+    manifest.write_text(json.dumps({"root": str(root), "files": baseline}),
+                        encoding="utf-8")
+    receipt = guard_dir / "receipt"
+    receipt.write_text("", encoding="utf-8")
+    context.metadata[_GUARD_METADATA_KEY] = {
+        "dir": str(guard_dir),
+        "manifest": str(manifest),
+        "digest": _content_digest(manifest),
+        "receipt": str(receipt),
+        "receipt_seen": "",
+        # 守卫自身的代码摘要：目录在工作区之外，但模型仍可能顺着 PYTHONPATH 找到
+        # 并改写它（改成空壳 + 照写凭据）。与清单同理：摘要不符 → 本次运行不作数。
+        "module_digest": _content_digest(guard_dir / "zmai_acceptance_guard.py"),
+        "sitecustomize_digest": _content_digest(guard_dir / "sitecustomize.py"),
+    }
+    logger.info("Acceptance window guard installed: %d file(s) (%s)",
+                len(baseline), guard_dir)
+
+
+def _acceptance_guard_env(context: AgentContext) -> dict[str, str]:
+    """测试命令子进程的环境增量：把守卫模块注入被测解释器。
+
+    只"追加"不覆盖：PYTHONPATH 前置守卫目录、PYTEST_ADDOPTS 追加 `-p`，项目自己
+    的取值原样保留（漏掉这条会让合法运行的 pytest 行为被改变）。
+    """
+    g = context.metadata.get(_GUARD_METADATA_KEY)
+    if not g:
+        return {}
+    pypath = os.environ.get("PYTHONPATH", "")
+    addopts = os.environ.get("PYTEST_ADDOPTS", "").strip()
+    return {
+        "PYTHONPATH": g["dir"] + (os.pathsep + pypath if pypath else ""),
+        "PYTEST_ADDOPTS": ((addopts + " ") if addopts else "") + "-p zmai_acceptance_guard",
+    }
+
+
+def _guard_receipt_advanced(context: AgentContext, g: dict[str, Any]) -> bool:
+    """守卫是否真的在本次 pytest 进程里加载过（CR-4 残余）。
+
+    守卫每次加载都会往 receipt 追加一行；Runtime 记住上一次的内容，要求**本次调用
+    之后必须变化**。命令里清掉 PYTEST_ADDOPTS（或连 PYTHONPATH 一起清）会让守卫
+    静默消失、receipt 原地不动 —— 这正是要 fail-closed 的形态。
+    """
+    try:
+        raw = Path(g["receipt"]).read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if raw == g.get("receipt_seen", ""):
+        return False
+    g["receipt_seen"] = raw
+    return True
+
+
+def _acceptance_guard_broken(context: AgentContext, test_out: str, cmd: str = "",
+                             *, counts: int = 0) -> bool:
+    """本次测试运行是否被守卫否掉（或守卫自身已不可信）。
+
+    * 输出里有守卫的中止标记 → 会话在验收文件偏离时被中止：本次运行不产生任何
+      判定（既非通过也非失败）；
+    * 清单文件与 run 起始记录不一致（被删/被改）→ 守卫的判据不再可信，本次结果
+      一律不作为证据（fail-closed：不给"改掉清单就把守卫变成摆设"留静默通道）；
+    * 命令**确实调用了 pytest**，却没有留下守卫的运行凭据 → 注入被命令内的环境变量
+      覆盖/清除，守卫根本没加载：同样不产生任何判定（fail-closed，见
+      `_guard_receipt_advanced`）。非 pytest 运行器（unittest / nose）不要求凭据 ——
+      守卫本来就只注入 pytest。
+
+    ── 凭据只在本次运行**产出结构化计数**时是判据 ──
+    零计数（`--collect-only` / 超时 / 被中止）的运行本来就不产生任何判定
+    （见 step 里的 `_no_verdict`）：凭据缺失不改变结论，却会把消息分支从
+    `[TEST_TIMEOUT]` / `[NO_TEST_EVIDENCE]` 抢走 —— 超时的有界预算（按
+    `completion_block_count` 收敛）因此永不计数。凭据核对照旧无条件执行
+    （`receipt_seen` 必须跟上），只是**缺失**仅在 counts > 0 时才算"守卫被覆盖"。
+    """
+    g = context.metadata.get(_GUARD_METADATA_KEY)
+    if not g:
+        return False
+    if ACCEPTANCE_GUARD_MARKER in test_out:
+        return True
+    if _content_digest(Path(g["manifest"])) != g["digest"]:
+        return True
+    guard_dir = Path(g["dir"])
+    if (_content_digest(guard_dir / "zmai_acceptance_guard.py") != g["module_digest"]
+            or _content_digest(guard_dir / "sitecustomize.py") != g["sitecustomize_digest"]):
+        logger.warning("Acceptance guard module was modified during the run (%s)",
+                       context.agent_id)
+        return True
+    _cmd = (cmd or "").lower()
+    _advanced = _guard_receipt_advanced(context, g)
+    if ("pytest" in _cmd or "py.test" in _cmd) and counts > 0 and not _advanced:
+        logger.warning(
+            "Acceptance guard receipt not advanced — guard injection was overridden "
+            "(%s): %s", context.agent_id, (cmd or "")[:120],
+        )
+        return True
+    return False
+
+
+def _acceptance_guard_msg() -> str:
+    """守卫否掉本次运行时的指令（测试结果与完成门禁共用同一段话）。"""
+    return "\n".join([
+        "[TestGuard] 本次测试运行没有产生有效的守卫判定，两种原因之一：",
+        "1) 测试执行期间验收/测试文件与本次运行开始时的内容不一致（守卫已中止会话）；",
+        "2) 守卫根本没有加载 —— 命令改写了 PYTHONPATH / PYTEST_ADDOPTS，"
+        "把 Runtime 注入的 pytest 插件覆盖或清掉了。",
+        "该运行的结果既不是通过证据，也不是失败证据 —— 它描述的不是项目的"
+        "验收标准，不得作为完成依据。",
+        "请先（1）把测试文件恢复到本次运行开始时的原始内容"
+        "（例如 `git restore <path>` / `git checkout -- <path>`），并"
+        "（2）不要用 shell 命令覆盖 PYTHONPATH / PYTEST_ADDOPTS，"
+        "再重新运行完整测试套件：python -m pytest -q",
+    ])
 
 
 def _reset_edit_failure_recovery(context: AgentContext) -> None:
@@ -443,6 +870,28 @@ def _handle_edit_failure(context: AgentContext, cm: ContextManager,
     cm.add_message("user", "\n".join(lines))
 
 
+def _acceptance_files_msg(removed: list[str], rewritten: list[str]) -> str:
+    """CR-1/CR-3: 验收文件违规期间的统一指令（检测点 / 测试结果 / 完成门禁三处共用）。
+
+    删除（CR-1）与改写（CR-3）共用一段文字：两者的处置完全一致 —— 都不是修复、
+    都不产生任何验证证据、都必须先恢复到 run 起始状态再重跑完整套件。
+    """
+    lines = ["[TestGuard] 验收/测试文件处于违规状态："]
+    lines += [f"- {p}（已从工作区删除）" for p in removed]
+    lines += [f"- {p}（内容与本次运行开始时不一致）"
+              for p in rewritten if p not in removed]
+    lines += [
+        "测试文件是只读验收标准，删除或改写它都不构成修复，也不能作为完成依据。",
+        "在恢复之前：测试结果既不是通过证据也不是失败证据，任务不得判定完成，"
+        "也不得据此建立测试基线。",
+        "请先把这些文件恢复到**本次运行开始时**的原始内容"
+        "（例如 `git restore <path>` / `git checkout -- <path>`；"
+        "若起始状态与 git 中的版本不同，则写回该原始内容），"
+        "恢复后再运行完整测试套件验证。",
+    ]
+    return "\n".join(lines)
+
+
 def _degenerate_response_reason(response: BackendResponse) -> str | None:
     """退化响应判定：退化时返回原因字符串，正常响应返回 None（P1-B）。
 
@@ -486,6 +935,22 @@ def _graph_enter(context: AgentContext, node: Node, reason: str = "") -> None:
         graph = GraphRuntime(SWEState(context.metadata))
         context.metadata["graph"] = graph
     graph.enter(node, reason, step=context.step_count)
+
+
+def _has_full_scope_green_evidence(context: AgentContext) -> bool:
+    """是否已有"足以作为完成证据"的绿色运行 —— 唯一判据是**完整范围全绿**。
+
+    `completion.tests_complete` = 有一次达到完整范围基线、且未被后续修改作废的
+    全绿运行（record_modification / 失败 / partial_green 都会把它置 False）。
+
+    ── N-2：这里曾经还有第二条分支（"未建立基线 ⇒ 子集全绿也算证据"）──
+    它与 partial_green 里那条例外同源，放行的是"模型自选范围的全绿"：没建立基线
+    不等于套件只有这么大，只等于"还没跑过完整套件"。零修改要完成，只能靠一次
+    可证明覆盖完整范围的运行（裸 `pytest -q`）—— 那条路径会锁定 baseline，
+    `tests_complete` 为真，走正常分支即可，不需要旁路。
+    """
+    completion = context.metadata.get("completion")
+    return bool(completion and completion.tests_passed and completion.tests_complete)
 
 
 def _eval_blocking_completion(context: AgentContext,
@@ -806,6 +1271,28 @@ class SWEAgent(Agent):
             context.metadata["__ws_fingerprint__"] = _workspace_fingerprint(
                 _explicit_root or Path("."), prefer_git=_explicit_root is None,
             )
+
+        # ── CR-3: 验收文件内容基线 ───────────────────────────────
+        # 同样必须在任何工具执行**之前**建立，且**只建立一次、永不刷新**：
+        # 它唯一的合法来源就是"模型还没动过任何东西"的那一刻（见基线函数注释）。
+        # 依赖上面的 `__ws_fingerprint__`（枚举来源），故顺序固定。
+        if _ACCEPTANCE_BASELINE_KEY not in context.metadata:
+            context.metadata[_ACCEPTANCE_BASELINE_KEY] = _capture_acceptance_baseline(context)
+            logger.info(
+                "Acceptance-file content baseline: %d file(s)",
+                len(context.metadata[_ACCEPTANCE_BASELINE_KEY]),
+            )
+
+        # ── CR-5: pytest scope 配置基线 ───────────────────────────
+        # 同样在任何工具执行之前、同样只建立一次：它定义的是"run 起始的收集范围"。
+        if _SCOPE_CONFIG_KEY not in context.metadata:
+            context.metadata[_SCOPE_CONFIG_KEY] = _capture_scope_baseline(context)
+
+        # ── CR-4: 测试窗口内的验收文件守卫 ────────────────────────
+        # 清单来源就是上面的 CR-3 基线：同一时刻（模型还没动过任何东西）、
+        # 同样只建立一次。守卫在测试进程内部核对它（见 acceptance_guard）。
+        if _GUARD_METADATA_KEY not in context.metadata:
+            _install_acceptance_guard(context)
 
         # ── LoopGuard — 循环检测 ────────────────────────────────
         if "loop_guard" not in context.metadata:
@@ -1133,6 +1620,8 @@ class SWEAgent(Agent):
                     # P1-1: 把"这份内容是否仍在模型可见窗口"的判据交给 ContextManager。
                     # 工具只拿探针，不持有 cm 引用。
                     read_visible=cm.is_read_visible,
+                    # CR-4: 测试命令的子进程环境（守卫注入）。非测试命令不使用。
+                    env=_acceptance_guard_env(context),
                 )
                 _ts = _now_ms()
                 # 用 execute_tool 容错分发：LLM 幻觉出不存在的工具名时返回
@@ -1210,7 +1699,67 @@ class SWEAgent(Agent):
                         prefer_git=_explicit_root is None,
                     )
                     _prev_fp = context.metadata.get("__ws_fingerprint__")
+                    # ── CR-1: 测试文件从工作区消失 = TestGuard 违规 ──────────
+                    # 判据放在**证据层**（指纹的路径集合），不放在命令形态上：
+                    # 于是 `git rm` / `git mv` / `git checkout <ref> -- tests/` /
+                    # `git clean` / `git stash` / `python -c "os.remove(...)"` 等
+                    # 一切间接路径被同一条规则覆盖，GitTool 不需要任何命令解析。
+                    # 测试文件是只读验收标准：它消失既不是"进展"，也不是合法的
+                    # 验证范围变更 —— 收缩后的套件不得被锁成新 baseline。
+                    _root = _explicit_root or Path(".")
+                    _gone = sorted(
+                        p for p in (_prev_fp or {})
+                        if p not in _fp
+                        and _is_test_file(_root / _norm_target_path(_fp_key(p)), _root)
+                    )
+                    # ── CR-3: 验收文件**内容**被改写 = TestGuard 违规 ────────
+                    # 判据同样是 workspace evidence：与 run 起始的内容摘要基线比对。
+                    # shell 改写 / `git checkout <ref> -- tests/...`（回退旧版本）/
+                    # sed / 等长替换 + mtime 还原 —— 全部被这一条覆盖：文件还在、
+                    # 测试数量也没变，但验收标准的内容已经不是 run 起始的那份了。
+                    # 必须用**内容摘要**：等长替换 + `os.utime` 还原后，滚动指纹
+                    # (mtime_ns, size) 连"变过"都看不出来。
+                    _rewritten = _acceptance_files_changed(context)
+                    if _gone or _rewritten:
+                        if _gone:
+                            context.metadata["test_files_removed"] = sorted(
+                                set(context.metadata.get("test_files_removed", ())) | set(_gone))
+                        if _rewritten:
+                            context.metadata["test_files_modified"] = _rewritten
+                        else:
+                            # 同一步内已恢复原内容 → 违规态不必建立
+                            context.metadata.pop("test_files_modified", None)
+                        # 违规态下的旧 green 立即失效：它描述的是一份已被删掉/改写的
+                        # 验收标准（防 subset green 后删测试，在下一步 step 入口靠
+                        # _green_once 完成；也防同一步内"先全绿再动测试"靠
+                        # CompletionState 完成）。只作废旧证据，不记 ever_modified。
+                        context.metadata["test_success_count"] = 0
+                        if completion:
+                            completion.record_modification(step=context.step_count)
+                        # 立刻把恢复指令交给模型（step 末随上下文进入下一轮）
+                        cm.add_message("user", _acceptance_files_msg(
+                            list(context.metadata.get("test_files_removed") or ()),
+                            _rewritten))
+                        logger.warning(
+                            "[TestGuard] acceptance file(s) tampered — removed=%s "
+                            "rewritten=%s (%s)",
+                            _gone or "-", _rewritten or "-", context.agent_id,
+                        )
+                    else:
+                        if context.metadata.get("test_files_removed"):
+                            # 全部恢复原状 → 解除违规态（恢复是唯一合法出口）
+                            if all((_root / _norm_target_path(_fp_key(p))).exists()
+                                   for p in context.metadata["test_files_removed"]):
+                                context.metadata.pop("test_files_removed", None)
+                        # `_rewritten` 为空 = 每个基线文件都**在**且内容 == run 起始状态
+                        # （消失也算 changed，所以这里连"文件还没回来"都排除了）。
+                        context.metadata.pop("test_files_modified", None)
                     _ws_changed = _prev_fp is not None and _fp != _prev_fp
+                    # ── CR-1/CR-3: 动验收文件不算"进展" ──────────────────
+                    # 该次调用不得计入 had_modification / ever_modified，也不得
+                    # 向 LoopGuard 提供 progress（_ws_changed 同源）。违规态下
+                    # 整次调用都不算进展，即使同一命令里也改了源码 —— 违规主导。
+                    _ws_changed = _ws_changed and not (_gone or _rewritten)
                     context.metadata["__ws_fingerprint__"] = _fp
                 # ── 修改证据独立于工具 success ──
                 # 判据是"工作区**实际**有没有变"（工作区指纹），而不是"命令是否返回 0"。
@@ -1283,6 +1832,17 @@ class SWEAgent(Agent):
                         )
                         # 失败时 output 为空、错误在 error 里；合并供 verify_test_output 判定
                         test_out = (result.output or "") + (result.error or "")
+                        # ── CR-4: 测试进程内部守卫的判定 ──────────────────
+                        # 守卫在测试进程里核对 run 起始清单：被改写的会话会中止并打印
+                        # 标记（无任何计数），因此这里的"本次运行不作数"是守卫**在运行
+                        # 期间**给出的判定，而不是事后从端状态推断 —— A → B → pytest →
+                        # A 的端状态与起始完全相同，端状态判据看不到它。
+                        # 判定延后到计数解析之后（凭据判据需要"本次是否产出计数"）。
+                        # ── CR-5: pytest 收集范围配置偏离 run 起始 ──────────
+                        # "完整范围"是配置定义的，不是数量定义的：模型在首次 pytest
+                        # 之前改掉 addopts / testpaths / python_files 等，就能让**缩小
+                        # 后**的套件跑出全绿，把缩小后的规模锁成 baseline。
+                        _scope_drift = _pytest_scope_drift(context)
                         # 真实退出码交给 verify_test_output 作权威判据：
                         # exit 0 + 结构化汇总无失败 = 通过，输出里的普通文本
                         # （测试名含失败词、被测代码打印的 traceback）不得推翻它。
@@ -1295,6 +1855,8 @@ class SWEAgent(Agent):
                         _totals = parse_test_totals(test_out)
                         _total_tests = (_totals["passed"] + _totals["failed"]
                                         + _totals["errors"])
+                        _guard_broken = _acceptance_guard_broken(
+                            context, test_out, _cmd_l, counts=_total_tests)
                         # ── Regression Detection（本轮 vs 上一轮）──
                         # 2 passed,2 failed → 0 passed,4 failed 不能被当作普通失败：
                         # Agent 必须知道"刚才的修改让测试状态变差了"，否则会继续沿
@@ -1394,9 +1956,33 @@ class SWEAgent(Agent):
                         # `_total_tests >= _baseline`，于是"只验证了子集"被当成
                         # "完整套件全绿"，携带未验证范围判定完成（fail-open）。
                         _full_scope_cmd = _is_full_scope_test_command(_cmd_l)
+                        # ── N-1: 命令行缩范围 ────────────────────────────
+                        # 与 CR-5（配置文件改范围）是同一件事的两种载体。两档判据：
+                        #   1) 白名单之外的一切选项 → 本次不作**完整范围证据**（不锁
+                        #      baseline）。`-k` / `--collect-only` / 未知插件选项都在内，
+                        #      走既有的 partial_green / [NO_TEST_EVIDENCE] 语义。
+                        #   2) 命令**点名**了跳过谁 / 换了哪份配置（`--ignore` /
+                        #      `--deselect` / `--override-ini` …）→ 连"本 run 自己的
+                        #      全绿证据"也不成立：命令本身就证明了它没跑完整套件。
+                        _cli_scope_options = cli_scope_filter(_cmd_l)
+                        _scope_declared = bool(_cli_scope_options) and \
+                            cli_scope_names_exclusions(_cmd_l)
                         _scope_complete = True
+                        # ── CR-1/CR-3: 验收文件违规期间不得建立/刷新 baseline ──
+                        # 否则"删掉失败测试 → 首次裸 pytest"会把**收缩后**的套件
+                        # 规模锁成 baseline，剩余测试全绿即拿到 tests_complete；
+                        # 同理"改写失败测试 → 首次裸 pytest"会把**被掏空后**的
+                        # 验收标准锁成新常态，两条路径合起来就是 CR-3 的 baseline
+                        # 绕过（基线只能来自 run 起始，不得被攻击后的状态污染）。
+                        # CR-4: 守卫否掉的运行同样不得建立/刷新 baseline —— 被中止的
+                        # 会话没有"这个套件有多大"的任何证据。
+                        # CR-5: scope 配置偏离期间同样不得建立/刷新 baseline ——
+                        # "完整范围"正是由这份配置定义的，它被改过，"完整"就没有依据。
+                        _acceptance_files_intact = (not any(_acceptance_violation(context))
+                                                    and not _guard_broken
+                                                    and not _scope_drift)
                         if _baseline is None:
-                            if _total_tests > 0 and _full_scope_cmd:
+                            if _total_tests > 0 and _full_scope_cmd and _acceptance_files_intact:
                                 context.metadata["baseline_test_count"] = _total_tests
                             elif _total_tests > 0:
                                 # 非完整范围（无论成败）：不锁定 baseline，本次也不算
@@ -1410,6 +1996,8 @@ class SWEAgent(Agent):
                                 _total_tests, _baseline,
                             )
                             _stats(context, test_guard_triggered=1)
+                            _scope_complete = False
+                        if not _acceptance_files_intact:
                             _scope_complete = False
                         # ── P0: 零测试计数 = 无证据，不得作为完成依据 ──
                         # verifier 的"exit 0 + 通过信号"对**没跑测试**的命令同样成立：
@@ -1430,10 +2018,39 @@ class SWEAgent(Agent):
                         # 只把指令换成可执行的方向，并交给连续超时预算收尾。
                         _timeout_evidence = exit_code == 124 or "timeout (" in test_out
                         _no_test_evidence = _total_tests == 0 and not _timeout_evidence
-                        # 无判定：零证据或超时 —— 都不得写进 CompletionState、不得
-                        # 进 green 计数、不得当失败处理。
-                        _no_verdict = _no_test_evidence or _timeout_evidence
-                        if _timeout_evidence:
+                        # ── CR-1: 测试文件缺失期间的测试结果不作为任何判定证据 ──
+                        # 与超时同理：它既不能证明通过，也不能证明失败。测试文件
+                        # 已从工作区消失时，"剩下全绿"描述的是一个被收缩过的验收
+                        # 标准 —— 不得据此完成、不得据此锁定 baseline。
+                        _files_missing = any(_acceptance_violation(context))
+                        # ── CR-4: 守卫在测试运行期间否掉的运行也不产生任何判定 ──
+                        # 与"验收文件当前处于违规态"同源但成因不同：这里文件可能已经
+                        # 被还原（端状态合法），偏离只发生在**运行期间** —— 只有守卫
+                        # 看得到。既不得据此完成，也不得据此建立 baseline。
+                        # ── CR-5: scope 配置偏离期间的测试结果同样不作数 ──────
+                        # 这一条不能退化成数量比较：数量只能证明"这次跑到的 == 上次
+                        # 跑到的"，证明不了"完整"。偏离的是定义范围的配置，范围本身
+                        # 就有问题，本次运行既不是通过证据也不是失败证据。
+                        # ── N-1: 命令点名跳过了测试 → 本次运行不作任何判定 ────
+                        # 必须堵得比"不能建 baseline"更早：否则"零修改 + 无基线"的
+                        # 两处放行分支（本文件的 I2′ 例外与完成门禁的
+                        # _has_completion_evidence）会各自把它当成"本 run 自己的
+                        # 证据"，绕过 baseline 直接完成。
+                        # 无判定：零证据 / 超时 / 验收文件缺失 / 守卫中止 / scope
+                        # 配置偏离 / 命令点名排除 —— 都不得写进 CompletionState、
+                        # 不得进 green 计数、不得当失败处理。
+                        _no_verdict = (_no_test_evidence or _timeout_evidence
+                                       or _files_missing or _guard_broken
+                                       or bool(_scope_drift) or _scope_declared)
+                        if _files_missing:
+                            cm.add_message("user", _acceptance_files_msg(
+                                *_acceptance_violation(context)))
+                        # 超时判定优先于其余"无判定"原因：它是本次运行的**事实**
+                        # （命令没跑完），其余判据（守卫凭据 / scope 偏离）都只是
+                        # 结论层面不可信 —— 两者都不产生证据，但只有超时分支会置
+                        # `_step_timed_out`，进而驱动连续超时的有界终止。被抢占的
+                        # 话超时预算永不计数，模型只能烧到 max_steps。
+                        elif _timeout_evidence:
                             _step_timed_out = True
                             context.metadata["required_next_action"] = "narrow_test_scope"
                             cm.add_message("user",
@@ -1445,6 +2062,24 @@ class SWEAgent(Agent):
                                 "或调大 config 的 timeout.test。\n"
                                 "在取得结构化测试计数（passed/failed）之前，任务不得判定完成。"
                             )
+                        elif _guard_broken:
+                            cm.add_message("user", _acceptance_guard_msg())
+                        elif _scope_drift:
+                            logger.warning(
+                                "TestGuard: pytest scope config drifted from run start "
+                                "(%s): %s", context.agent_id, ", ".join(_scope_drift),
+                            )
+                            _stats(context, test_guard_triggered=1)
+                            cm.add_message("user", _scope_config_msg(_scope_drift))
+                        elif _scope_declared:
+                            logger.warning(
+                                "TestGuard: test command declared exclusions "
+                                "(%s): %s", context.agent_id, " ".join(_cli_scope_options),
+                            )
+                            _stats(context, test_guard_triggered=1)
+                            context.metadata["test_scope_incomplete"] = True
+                            context.metadata["required_next_action"] = "run_full_test_suite"
+                            cm.add_message("user", _cli_scope_msg(_cli_scope_options))
                         elif _no_test_evidence:
                             context.metadata["test_scope_incomplete"] = True
                             context.metadata["required_next_action"] = "run_full_test_suite"
@@ -1489,26 +2124,20 @@ class SWEAgent(Agent):
                                 # 结构化 recovery 状态：注入下一轮 Agent 上下文，让
                                 # 模型"看到"它只验证了子集，下一步必须跑完整套件，
                                 # 而不是继续 read/edit 或重复跑同一个子集。
-                                # ── 例外：零修改 + 没有"漏跑了测试"的证据 ──
-                                # 走到这里有两种 partial_green：
-                                #   a) `_baseline is None` —— 首次运行就是子集，
-                                #      没有任何证据表明套件比刚跑过的那部分更大；
-                                #   b) 已知基线且 `_total_tests < _baseline` ——
-                                #      **有证据**证明还有测试没跑（可能正是失败的
-                                #      那些），此处的通过不能当完成证据。
-                                # "覆盖完整基线"是**验证改动**的要求。零修改的
-                                # run 没有被验证的对象，只有 a) 才谈得上"一次真实
-                                # 全绿就是它自己的完成证据"（verify-only / smoke /
-                                # autostop"跑一次测试，通过就停"）。只放行
-                                # completion（success_count），不放行证据本身：
-                                # completion.tests_complete 保持 False，模型继续
-                                # 推进时 [TEST_SCOPE_INCOMPLETE] 仍会要求它跑完整
-                                # 套件；一旦修改源码，record_modification 会把这里
-                                # 清零，之后仍必须有一次完整套件全绿（P1-2/P2-2 不变）。
-                                if (_baseline is None
-                                        and not context.metadata.get("ever_modified")):
-                                    context.metadata["test_success_count"] = (
-                                        context.metadata.get("test_success_count", 0) + 1)
+                                # ── N-2: 这里**没有例外** ────────────────────
+                                # 曾经有一条放行：`_baseline is None`（首次运行就是子集）
+                                # + 零修改 + 验收文件完好 ⇒ 把这唯一一次子集全绿记成
+                                # "本 run 自己的完成证据"（为了 autostop / "跑一次测试，
+                                # 通过就停"）。它同时是一条绕过口：模型**不改任何源码**、
+                                # 自己挑一个测试子集跑绿，就能宣布整个任务完成 ——
+                                # 既没有完整 scope 的证据，也没有被验证的改动，
+                                # 剩下的测试（可能正是失败的）从来没被看过。
+                                #
+                                # 现在零修改要完成，只能靠**可证明的完整范围运行**全绿：
+                                # 未指定目标、不带缩范围选项、配置与 run 起始一致（裸
+                                # `python -m pytest -q`）—— 那条路径会锁定 baseline 并直接
+                                # 走 full_green，不需要例外。子集全绿只作为"本次运行通过"
+                                # 反馈，不作完成证据；模型收到的指令是去跑完整套件。
                                 context.metadata["test_scope_incomplete"] = True
                                 context.metadata["tests_passed"] = False
                                 context.metadata["required_next_action"] = "run_full_test_suite"
@@ -2185,26 +2814,18 @@ class SWEAgent(Agent):
         # 只提供上下文，不把无关任务（"say hello" / mock smoke）变成测试任务。
         _tests_are_acceptance = (
             _has_tests and bool(context.metadata.get("project_root_declared")))
-        # 是否已有"足以作为完成证据"的绿色运行：
-        #   * 完整套件全绿（tests_complete）→ 是；
-        #   * 首次运行即子集全绿（未建立过基线 → 没有证据表明还有测试没跑）→
-        #     同样按"本 run 自己的证据"接受（与硬终止处的判据一致）；
-        #   * 已知基线却没跑到基线的子集全绿 → **不是**：那有证据表明还有测试
-        #     没跑（可能正是失败的那些），不能当完成证据。
-        _has_completion_evidence = bool(
-            completion and completion.tests_passed
-            and (completion.tests_complete
-                 or context.metadata.get("baseline_test_count") is None))
+        _has_completion_evidence = _has_full_scope_green_evidence(context)
         # 判据的作用域 —— 只阻止"真正需要阻止完成"的情况：
         #   * 测试失败过 → 必须有一次完整套件全绿（失败是负面证据，与是否
         #     改过代码无关）；
         #   * 该项目以测试为验收标准（或发现状态显式未知）且 改过代码 /
         #     没有可用的完成证据 → 必须有一次完整套件全绿；
-        #   * 零修改 + 有可用的完成证据 → 放行：没有修改就没有"未验证的
-        #     改动"，一次真实全绿就是本 run 自己的完成证据（verify-only /
-        #     autostop "跑一次测试，通过就停" 属于这一类）。partial_green 的
-        #     [TEST_SCOPE_INCOMPLETE] 提示与 tests_complete=False 都不受影响
-        #     —— 一旦修改源码，record_modification 会作废这条绿色证据。
+        #   * 零修改 + 有可用的完成证据（= 完整范围全绿）→ 放行：没有修改就没有
+        #     "未验证的改动"，一次真实全绿就是本 run 自己的完成证据（verify-only /
+        #     autostop "跑一次测试，通过就停" 属于这一类，**但那次运行必须覆盖完整
+        #     范围**：N-2 之前"首次子集全绿"也算证据，那让模型能自选范围完成）。
+        #     partial_green 的 [TEST_SCOPE_INCOMPLETE] 提示与 tests_complete=False
+        #     都不受影响 —— 一旦修改源码，record_modification 会作废这条绿色证据。
         _needs_retest = bool(
             completion and not completion.tests_complete
             and (
@@ -2219,9 +2840,17 @@ class SWEAgent(Agent):
         # 绕过 FixDriving / force_edit / LoopGuard 全部机制直接 complete
         # （requests-1963 实测：5 步 / 0 次 pytest / 0 次修改 / status=completed / diff 空）。
         _needs_change = _eval_blocking_completion(context, at_completion_point=True)
+        # ── CR-1: 验收文件缺失 → 无论项目形态/模式，纯文本都不得完成 ──
+        # _no_verdict 已让缺失期内的测试结果不产生通过证据，这里再补上纯文本路径
+        # （未声明项目根的 run 会走"零修改 + 本 run 证据"的放行分支）。
+        _files_missing = any(_acceptance_violation(context))
+        # ── CR-5: scope 配置偏离 run 起始 → 纯文本路径同样不得完成 ──
+        # 与 CR-1 同理：_no_verdict 已让偏离期内的测试结果不产生证据，这里再补上
+        # 纯文本路径（未声明项目根的 run 会走"零修改 + 本 run 证据"的放行分支）。
+        _scope_drift = _pytest_scope_drift(context)
 
         _graph_enter(context, Node.COMPLETION_GATE, "text_only")
-        if _needs_retest or _needs_change:
+        if _needs_retest or _needs_change or _files_missing or _scope_drift:
             _blocks = context.metadata.get("completion_block_count", 0) + 1
             context.metadata["completion_block_count"] = _blocks
             if _blocks > MAX_COMPLETION_BLOCKS:
@@ -2241,7 +2870,20 @@ class SWEAgent(Agent):
             # tests_ever_failed 同样让 _needs_retest 为真，此处若照旧说"你修改了
             # 代码"，模型会在强制修改期收到"去跑 pytest"的指令——恰好把它从 edit
             # 推回重跑测试（实测 e2e 的 read/pytest 空转正是这条指令的形态）。
-            if _needs_retest and context.metadata.get("ever_modified"):
+            if _files_missing:
+                logger.warning(
+                    "Completion blocked: acceptance file(s) removed/rewritten (%s, step %d)",
+                    context.agent_id, context.step_count,
+                )
+                cm.add_message("user", _acceptance_files_msg(
+                    *_acceptance_violation(context)))
+            elif _scope_drift:
+                logger.warning(
+                    "Completion blocked: pytest scope config differs from run start "
+                    "(%s): %s", context.agent_id, ", ".join(_scope_drift),
+                )
+                cm.add_message("user", _scope_config_msg(_scope_drift))
+            elif _needs_retest and context.metadata.get("ever_modified"):
                 logger.warning(
                     "Completion blocked: tests failed earlier but no full-scope green "
                     "re-run; forcing full-suite pytest re-test instead of completing"
@@ -2251,6 +2893,23 @@ class SWEAgent(Agent):
                     "全绿运行（部分测试通过不能作为完成验证）。\n"
                     "不要停止——请运行完整测试套件 `python -m pytest -q` 验证你的修改。\n"
                     "只有完整测试全部通过（达到基线数量）才算完成。"
+                )
+            elif _needs_retest and not _needs_change:
+                # ── N-2: 还没改代码、但也没有"完整范围全绿" —— 不能靠自选子集完成 ──
+                # 这条以前落在下面的 else 里，会得到"请先修改源码"的指令：对纯验证
+                # 类任务那是错误方向（本来就没有要改的东西）。正确方向是跑完整套件。
+                # eval 模式（_needs_change）优先走下面的 EvalGuard 指令：那里要求的
+                # 正是"先改源码"，与"跑完整套件"是不同的动作，不能混。
+                logger.warning(
+                    "Completion blocked: no full-scope green evidence yet (%s, step %d)",
+                    context.agent_id, context.step_count,
+                )
+                cm.add_message("user",
+                    "[Workflow] 还没有取得『完整测试套件全绿』这一完成证据。\n"
+                    "只跑一部分测试（指定文件、`-k`/`-m` 选择器、缩范围选项）即使全绿，"
+                    "也不能证明整个套件通过——剩下的测试可能正是失败的。\n"
+                    "请运行未指定目标、不带过滤选项的完整套件：`python -m pytest -q`，"
+                    "并在其全绿后再结束任务。"
                 )
             else:
                 logger.warning(

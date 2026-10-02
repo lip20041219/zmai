@@ -47,6 +47,10 @@ class RequirementsThenRunBackend(Backend):
 
     测试期望：测试通过后 Agent 必须短路，invoke 仅 1 次 ——
     证明 Requirements 段没有产生额外任务循环。
+
+    命令必须是**完整套件**（裸 `pytest -q`）：零修改的 run 只有可证明覆盖完整范围的
+    全绿才是完成证据（子集全绿只算 partial_green，见
+    tests/test_swe_green_evidence_scope.py）。断言本身与命令形态无关。
     """
 
     name = "requirements_run"
@@ -61,7 +65,7 @@ class RequirementsThenRunBackend(Backend):
             tool_calls=[ToolCall(
                 id=f"c{self.calls}",
                 name="shell_exec",
-                params={"command": "python -m pytest test_pass.py -q"},
+                params={"command": "python -m pytest -q"},
             )],
             usage=TokenUsage(input_tokens=10, output_tokens=5),
             stop_reason="tool_use",

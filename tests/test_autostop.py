@@ -39,12 +39,14 @@ class LoopTilToldBackend(Backend):
 
     若 loop 未正确停止，它会无休止返回 shell_exec(pytest)，
     从而暴露"测试通过后仍继续"的原始 bug。
+
+    命令必须是**完整套件**（裸 `pytest -q`）：零修改的 run 只有可证明覆盖完整范围的
+    全绿才是完成证据（子集全绿只算 partial_green，见 tests/test_swe_green_evidence_scope.py）。
     """
 
     name = "autostop_ever_loops"
 
-    def __init__(self, test_file: str) -> None:
-        self.test_file = test_file
+    def __init__(self) -> None:
         self.calls = 0
         self.pytest_tool_calls = 0
 
@@ -55,7 +57,7 @@ class LoopTilToldBackend(Backend):
             content="re-running tests",
             tool_calls=[ToolCall(
                 id=f"c{self.calls}", name="shell_exec",
-                params={"command": f"python -m pytest {self.test_file} -q"},
+                params={"command": "python -m pytest -q"},
             )],
             usage=TokenUsage(input_tokens=10, output_tokens=5),
             stop_reason="tool_use",
@@ -74,7 +76,7 @@ def test_autostop_runtime_exits_after_one_green(tmp_path):
     (tmp_path / "test_pass.py").write_text(
         "def test_ok():\n    assert True\n", encoding="utf-8"
     )
-    backend = LoopTilToldBackend(str(tmp_path / "test_pass.py"))
+    backend = LoopTilToldBackend()
 
     async def run() -> dict:
         runtime = Runtime()
@@ -106,7 +108,7 @@ def test_autostop_step_short_circuits_next_round(tmp_path):
     (tmp_path / "test_pass.py").write_text(
         "def test_ok():\n    assert True\n", encoding="utf-8"
     )
-    backend = LoopTilToldBackend(str(tmp_path / "test_pass.py"))
+    backend = LoopTilToldBackend()
 
     async def run():
         agent = SWEAgent("autostop_step")
@@ -151,7 +153,7 @@ def test_autostop_green_never_runs_second_pytest(tmp_path):
     (tmp_path / "test_pass.py").write_text(
         "def test_ok():\n    assert True\n", encoding="utf-8"
     )
-    backend = LoopTilToldBackend(str(tmp_path / "test_pass.py"))
+    backend = LoopTilToldBackend()
 
     async def run():
         agent = SWEAgent("autostop_pytest")
