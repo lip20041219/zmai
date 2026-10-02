@@ -37,4 +37,16 @@ jobs:
         continue-on-error: true
 
       - name: Test with pytest
-        run: python -m pytest tests/ --tb=short --ignore=tests/test_live_api.py -q
+        shell: bash
+        run: |
+          set +e
+          python -m pytest tests/ --tb=short --ignore=tests/test_live_api.py -q > pytest.out 2>&1
+          code=$?
+          tail -60 pytest.out
+          {
+            echo '## pytest failures'
+            echo '```'
+            grep -E '^(FAILED|ERROR)' pytest.out | head -40
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $code
