@@ -9,7 +9,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](pyproject.toml)
 
-`pip install zmai` · **Zero third-party dependencies** · **1311 tests passing**
+`pip install zmai` · **Zero third-party dependencies** · **1753 tests · CI green**
 
 </div>
 
@@ -29,7 +29,7 @@ ZMAI 是一个**开源自主软件工程 Agent 运行时**。给它一个任务�
 Bug → 分析测试失败 → 定位业务代码 → 修改代码 → 运行测试 → 验证 → 自主停止
 ```
 
-**它不是简单的 LLM API 封装** —— 从问题理解、测试驱动调试、代码定位、修复规划、验证闭环到完成检测与自主停止，整个 Agent 循环都在本项目内实现。约 2 万行纯 Python 标准库（`urllib` / `subprocess` / `pathlib` / `json`），零第三方依赖。
+**它不是简单的 LLM API 封装** —— 从问题理解、测试驱动调试、代码定位、修复规划、验证闭环到完成检测与自主停止，整个 Agent 循环都在本项目内实现。约 2.5 万行纯 Python 标准库（`urllib` / `subprocess` / `pathlib` / `json`），零第三方依赖。
 
 默认后端为 **DeepSeek**，默认模型 **deepseek-v4-flash**（OpenAI-compatible API）。
 
@@ -41,8 +41,8 @@ Bug → 分析测试失败 → 定位业务代码 → 修改代码 → 运行测
 - **🔌 Provider-agnostic** — 运行时切换 DeepSeek / Claude / Gemini / 自定义插件
 - **📦 零依赖** — 纯 Python stdlib，无 `requests` / `httpx` / `pydantic`，无 lock 文件
 - **🧩 可嵌入** — `import zmai` 当库用
-- **🛡️ 多层防护** — TestGuard / LoopGuard / FixDriving / CompletionState，杜绝空转与伪造成功
-- **🛑 自主停止** — 测试全绿即停，不耗尽 token
+- **🛡️ 多层防护** — TestGuard / AcceptanceGuard / LoopGuard / FixDriving / CompletionState，拦截常见的空转与伪完成路径，阻断测试证据被篡改后的完成判定
+- **🛑 受控停止** — 满足完整验证范围与有效 evidence 条件的测试通过后，Runtime 才允许进入完成状态，不耗尽 token
 
 ---
 
@@ -51,11 +51,11 @@ Bug → 分析测试失败 → 定位业务代码 → 修改代码 → 运行测
 - **SWE Agent 工作流闭环** — 发现 → 先跑测试 → 分析失败 → 修改代码 → 验证
 - **FailureParser** — 从 pytest traceback 语义化解析失败根因（expected / actual / line / 候选业务文件）
 - **FixPlanner** — 基于失败解析自动生成"诊断→计划→修改→验证"的有序修复计划
-- **TestGuard** — 测试文件只读保护，杜绝通过改测试 / 删测试 / 放宽断言伪造成功；并按基线测试数拦截套件收缩
+- **TestGuard** — 测试文件只读保护，阻止通过删除测试、缩小 scope、修改验收文件等方式伪造有效 green evidence；并按基线测试数拦截套件收缩
 - **LoopGuard** — 相同调用 / 相同失败 / 无进展 三重循环检测
 - **FixDriving** — 测试失败后强制进入修改阶段，阻断"只读不修"空转
 - **ReadCache** — 重复读取同一未变化文件自动命中缓存并提示复用，避免无效 read
-- **CompletionState** — 跨轮累积完成判定，测试全绿立即停止
+- **CompletionState** — 跨轮累积完成判定；只有覆盖完整基线范围、且未被后续修改作废的全绿运行才被接受
 - **Verifier** — 客观验证（auto_verify），不因"工具调用成功"就判定任务完成
 - **Workspace Sandbox** — 路径穿越防护、文件大小限制、符号链接检测
 - **Multi-model Gateway** — 统一 Backend 接口 + 加密凭证存储
@@ -197,13 +197,17 @@ zmai --backend gemini "写一个单元测试"
 ZMAI 内置多层防护，防止空转、伪造成功与无限循环：
 
 - **TestGuard** — 测试文件（`tests/`、`test_*.py`、`*_test.py`、`conftest.py`）只读；拦截编辑测试、删除测试、放宽断言、修改 pytest 配置；并按**基线测试数**拦截"套件收缩"伪造成功
+- **AcceptanceGuard** — 验收文件（测试文件）在 pytest **会话启动与结束两个时点**核对内容摘要。守卫经 `PYTHONPATH` + pytest 插件注入被测解释器；测试窗口内验收文件发生违规变化时**中止该会话**（非 0 退出、不产出任何 passed/failed 计数），使被污染的 green 无从产生。Runtime 另外要求"确实跑了 pytest 且产出计数"的运行留下**新的 receipt 凭据**：守卫被环境变量覆盖 / 清除而根本没加载时，本次结果不作有效完成证据
+- **pytest scope guards** — 三层范围约束：命令点名排除测试的运行**完全作废**（既非通过也非失败证据）；run 起始记录定义 pytest scope 的配置段基线，运行期间配置漂移则结果不作数；指定位置目标 / 缩范围选项的 green 不构成"覆盖完整套件"的证据，必须重跑完整套件
+- **Stale bytecode invalidation** — 工作区发生源码变化后主动作废相关 `__pycache__` 字节码（含 shell / git 等非工具写入路径），避免后续验证继续读取过期 `.pyc`
 - **LoopGuard** — 检测连续相同调用 / 相同失败 / 无进展，触发结构化恢复信号
 - **FixDriving** — 测试失败后达到读取阈值即强制进入修改阶段，结构性阻断继续只读
 - **CompletionState** — 跨轮累积完成判定；partial_green（子集全绿未达基线）不完成、不累计，强制运行完整套件
 - **Bounded recovery** — 强制修改期、灾难性回归、完成拦截、edit 失败恢复各自独立预算（`MAX_FORCE_EDIT_STEPS` / `MAX_REGRESSION_RECOVERIES` / `MAX_COMPLETION_BLOCKS` / `MAX_EDIT_FAILURE_RECOVERIES`），超预算即明确失败
 - **Test command timeout** — 测试命令走独立超时预算（`timeout.test`，默认 600s），不再套用普通 shell 的 30s；超时**既不构成通过证据也不构成失败证据**，连续超时有界失败
 - **Workspace Sandbox** — 路径穿越防护、文件大小限制、符号链接检测
-- **Hard stop** — `max_steps=300` 硬上限，杜绝无限循环
+- **PlanModeGuard** — Plan 未确认时按**工具权限**拒绝写工具与危险 shell / git 写命令（在工具层拦截，不依赖 prompt 约束）
+- **Hard stop** — `max_steps=300` 硬上限，达到上限即停止
 
 ---
 
@@ -222,6 +226,18 @@ ZMAI 的完成判定依赖**客观验证**而非工具调用成功：
 满足以上条件后返回 `complete`，Runtime 立即 `break`，不再调用 LLM / read / edit / pytest。
 
 判定是 **fail-closed** 的：拿不到结构化测试计数、测试曾失败后没有覆盖基线的全绿重测、改过代码却没有修改后的有效验证 —— 都不判完成。判据落在工作区真实状态（git 索引 / 文件指纹）与测试计数上，而不是"工具调用返回 success"。
+
+### 9.1 Runtime enforcement：LLM 提议，Runtime 判定
+
+这是 ZMAI 在 Agent Loop 之上的核心设计：**LLM 提出完成 / 停止，不等于任务已经完成。** 最终状态由 Runtime 根据实际工作区状态、测试结果、验证范围以及 guard / evidence 状态共同判定：
+
+- **完整测试 evidence** — 只有结构化计数覆盖完整基线套件的全绿才是完成证据；零计数运行（如 `--collect-only` / `--help`）与解析不出计数的输出都不构成证据
+- **workspace change / regression detection** — 判据落在工作区真实状态（git 索引 / 文件指纹）：测试通过后的任何业务修改立即作废该次 green；回归与 collection / import error 触发有界恢复流程
+- **acceptance guard** — 测试窗口内验收文件偏离时该 pytest 会话被中止且不产出计数；守卫被清除、没有新凭据的运行同样不作证据
+- **pytest scope guard** — 缩范围（点名排除 / 配置漂移 / 位置目标子集）得到的 green 不被接受为完整验证
+- **termination / completion constraints** — 完成是 Runtime 侧的硬终止：判定满足后不再调用 LLM / 工具；各恢复路径预算耗尽则明确失败，而不是继续重试或伪装成 timeout
+
+**诚实边界**：以上机制约束的是 ZMAI 自己能够观测与控制的那条验证路径（工具调用、测试进程、工作区状态、pytest 配置与凭据）。对被测进程之外的外部副作用、测试会话内部未被守卫观测到的瞬时状态变化，本项目不声称绝对覆盖。
 
 ---
 
@@ -279,10 +295,16 @@ ZMAI 配置按优先级解析：**file → env → CLI**。
 ```
 pytest
 
-1657 passed, 9 skipped
+# Ubuntu (Python 3.10 / 3.11 / 3.12)
+1737 passed, 16 skipped
+
+# Windows (Python 3.10 / 3.11 / 3.12)
+1749 passed, 4 skipped
 ```
 
-- 测试覆盖 auth、credential store、gateway、runtime、loop guard、termination、workspace security、SWE workflow（completion gate / test scope / timeout / trace graph）、CLI 等
+> 数字取自当前 main（`c4e2e5a`）的 CI run：6/6 matrix job 全部通过，0 failed。两个平台收集到的测试总数相同（1753），平台相关的 skip 数不同（Ubuntu 16 / Windows 4），因此 passed 数相差 12。
+
+- 测试覆盖 auth、credential store、gateway、runtime、loop guard、termination、workspace security、SWE workflow（completion gate / test scope / timeout / acceptance window guard / trace graph）、plan mode、CLI 等
 - **无需 API Key 即可运行**（mock backend）
 - CI 运行于 Ubuntu + Windows × Python 3.10/3.11/3.12
 
@@ -311,17 +333,22 @@ zmai/
 │   ├── gateway/          # 多后端网关（DeepSeek / Claude / Gemini / 插件）
 │   ├── runtime/          # Runtime 执行循环
 │   ├── swe/
-│   │   ├── agent.py      # SWE Agent 主逻辑（含 SWE Loop 与 trace 接线）
-│   │   ├── graph.py      # 控制流 trace（观察层，enforce=False）
-│   │   ├── completion.py # CompletionState 完成判定
-│   │   ├── loop_guard.py # LoopGuard 循环保护
-│   │   ├── failure.py    # FailureParser 失败解析
-│   │   ├── fix_planner.py# FixPlanner 修复规划
-│   │   ├── verifier.py   # Verifier 客观验证
-│   │   └── tools.py      # 工具（含 TestGuard / ReadCache）
+│   │   ├── agent.py            # SWE Agent 主逻辑（含 SWE Loop、scope / 验收守卫接线）
+│   │   ├── graph.py            # 控制流 trace（观察层，enforce=False）
+│   │   ├── completion.py       # CompletionState 完成判定
+│   │   ├── acceptance_guard.py # 测试窗口内验收文件守卫（pytest 插件）
+│   │   ├── loop_guard.py       # LoopGuard 循环保护
+│   │   ├── failure.py          # FailureParser 失败解析
+│   │   ├── fix_planner.py      # FixPlanner 修复规划
+│   │   ├── plan_agent.py       # Plan 模式专用 agent（只读分析）
+│   │   ├── plan_guard.py       # PlanModeGuard 工具权限守卫
+│   │   ├── scanner.py          # RepositoryScanner 项目源码发现
+│   │   ├── github.py           # GitHub API 客户端（纯 stdlib）
+│   │   ├── verifier.py         # Verifier 客观验证
+│   │   └── tools.py            # 工具（含 TestGuard / ReadCache）
 │   ├── workspace/        # Workspace Sandbox
 │   └── ...
-├── tests/                # 1650+ 测试
+├── tests/                # 1753 测试（CI 收集数）
 ├── examples/             # 使用示例
 └── docs/                 # 文档 / zmai-demo.mp4
 ```
