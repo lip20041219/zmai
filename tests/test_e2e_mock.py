@@ -18,6 +18,10 @@ from zmai.gateway.base import (
 from zmai.swe.agent import SWEAgent
 from zmai.tool import ToolRegistry
 
+#: 跨平台的"列出文件"命令：`dir /b` 是 cmd 内建，POSIX shell 下直接非 0 退出，
+#: 而下面这条用例要求工具调用**成功**（失败命令会生成失败 check 阻断完成）。
+_LIST_FILES = 'python -c "import os; print(os.listdir())"'
+
 
 class MockBackend(Backend):
     """模拟 Backend，预置回复序列模拟 LLM 对话。"""
@@ -106,7 +110,10 @@ class TestSWEAgentMockConversation:
                     # test_swe_autoverify_evidence：非测试命令的失败必须阻断
                     # 完成），于是该用例句变成"断言一条失败命令之后仍可完成"，
                     # 与守卫冲突。
-                    "tool": [{"name": "shell_exec", "params": {"command": "dir /b"}}],
+                    # 命令还要**跨平台**：`dir /b` 是 cmd 内建，Linux 上
+                    # `/bin/sh -c "dir /b"` 直接非 0 退出，用例会稳定卡在
+                    # "失败命令之后不得完成"。改用 python 列目录，两边都成立。
+                    "tool": [{"name": "shell_exec", "params": {"command": _LIST_FILES}}],
                 },
                 {
                     "content": "找到文件了，任务完成。",

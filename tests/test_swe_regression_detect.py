@@ -341,11 +341,18 @@ def test_git_status_is_not_a_modification(tmp_path):
     这是 RC-5 真正可达的分支 —— force_edit 关闭时 git 才会真正跑起来，
     也只有此时它才会去污染 ever_modified / force_edit / test_failed。
     """
+    def repo_project(p: Path) -> None:
+        # 本用例的前提是 git status **执行成功**（fail 计数只剩 pytest 那条）。
+        # git 的 cwd 是工程目录，工程不是仓库时它只会报 not a git repository：
+        # 在没有仓库的机器上"通过"只可能是碰巧身处某个外层仓库里，不能依赖。
+        _write_project(p)
+        _init_repo(p)
+
     script = [
         [_pytest()],        # 1 failed → test_failed=True（此时 force_edit 尚未置位）
         [_git_status()],    # 只读 git 真正执行成功
     ]
-    ctx, _ = _run(tmp_path, script, max_steps=2)
+    ctx, _ = _run(tmp_path, script, max_steps=2, project=repo_project)
 
     # 只有失败的 pytest 计为 fail —— 证明 git status 确实执行了、没有被拦截，
     # 否则本用例会因"git 被拦"而空洞地通过。

@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -104,6 +105,24 @@ def _invalidate_bytecode_cache(full: Path) -> None:
                 pyc.unlink()
             except OSError:
                 pass
+
+
+def purge_bytecode_caches(root: Path) -> None:
+    """整树作废工作区下的 __pycache__（不进入 .git）。
+
+    shell / git 的改动无法逐文件定位改了哪些 .py —— `_invalidate_bytecode_cache`
+    那套"只删被改文件自己的缓存"覆盖不到这条路径。只在**已确认工作区发生变化**
+    时调用，代价与修改次数成正比，而不是与工具调用次数成正比。
+
+    缓存删不掉（权限、并发占用）一律静默跳过：这是观测正确性的兜底，不是改动
+    流程的一部分，绝不能让它把一次已经发生的进展判成失败。
+    """
+    for dirpath, dirnames, _files in os.walk(root):
+        if "__pycache__" in dirnames:
+            dirnames.remove("__pycache__")
+            shutil.rmtree(Path(dirpath) / "__pycache__", ignore_errors=True)
+        if ".git" in dirnames:
+            dirnames.remove(".git")
 
 
 def _write_checked(full: Path, content: str, orig_text: str, label: str) -> tuple[bool, str]:

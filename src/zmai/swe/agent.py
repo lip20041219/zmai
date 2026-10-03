@@ -42,6 +42,7 @@ from zmai.swe.tools import (
     cli_scope_filter,
     cli_scope_names_exclusions,
     is_test_command,
+    purge_bytecode_caches,
     test_scope_targets,
 )
 from zmai.swe.verifier import (
@@ -1771,12 +1772,22 @@ class SWEAgent(Agent):
                         # `_rewritten` 为空 = 每个基线文件都**在**且内容 == run 起始状态
                         # （消失也算 changed，所以这里连"文件还没回来"都排除了）。
                         context.metadata.pop("test_files_modified", None)
-                    _ws_changed = _prev_fp is not None and _fp != _prev_fp
+                    _fp_changed = _prev_fp is not None and _fp != _prev_fp
+                    # ── 源码变了 → 旧的 .pyc 不再可信 ──────────────────
+                    # 与"这次算不算进展"无关，所以挂在指纹本身而不是 _ws_changed 上：
+                    # shell / git 的改动无法逐文件定位改了哪些 .py，
+                    # `_invalidate_bytecode_cache`（edit/write_file 路径）覆盖不到。
+                    # 同一整秒内的等长改写，CPython 的 .pyc 校验只比
+                    # (int(mtime), size) → 旧 .pyc 仍被判有效，下一轮 pytest 观测
+                    # 到的是**修改前**的代码；而 regression 判定 / 测试证据 / 完成
+                    # 门禁全部建立在这个观测上。指纹用 mtime_ns，看得见这次改动。
+                    if _fp_changed:
+                        purge_bytecode_caches(_root)
                     # ── CR-1/CR-3: 动验收文件不算"进展" ──────────────────
                     # 该次调用不得计入 had_modification / ever_modified，也不得
                     # 向 LoopGuard 提供 progress（_ws_changed 同源）。违规态下
                     # 整次调用都不算进展，即使同一命令里也改了源码 —— 违规主导。
-                    _ws_changed = _ws_changed and not (_gone or _rewritten)
+                    _ws_changed = _fp_changed and not (_gone or _rewritten)
                     context.metadata["__ws_fingerprint__"] = _fp
                 # ── 修改证据独立于工具 success ──
                 # 判据是"工作区**实际**有没有变"（工作区指纹），而不是"命令是否返回 0"。

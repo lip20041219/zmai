@@ -24,6 +24,7 @@ scope 证据链、同一份白名单，不新增第三套判据。解析不出�
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from tests.test_swe_acceptance_window_guard import _run
@@ -68,6 +69,13 @@ _ATTACK_COMMANDS = [
     'set "PYTEST_ADDOPTS=--ignore=test_extra.py" && python -m pytest -q',
     'set "PYTEST_ADDOPTS=--deselect=test_extra.py::test_broken" && python -m pytest -q',
 ]
+
+#: 反事实用例（第 7 节）要证明"关掉修复后攻击**仍然**成功"，所以必须用当前平台
+#: 真能设上环境变量的写法。cmd 的 `set "X=Y"` 在 POSIX sh 下只设置位置参数、
+#: 环境变量仍是空的 —— 攻击根本没发生，缩小范围的前提不成立，对照也就不成立。
+_ATTACK_ONE = ('set "PYTEST_ADDOPTS=-k value" && python -m pytest -q'
+               if sys.platform == "win32" else
+               'export PYTEST_ADDOPTS="-k value" && python -m pytest -q')
 
 
 def _assert_no_green(r) -> None:
@@ -167,7 +175,7 @@ class TestCounterfactualWithoutEnvAddoptsCheck:
     def test_attack_completes_when_env_parsing_disabled(
             self, tmp_path: Path, monkeypatch):
         monkeypatch.setattr("zmai.swe.tools.env_addopts_tokens", lambda command: [])
-        cmd = _ATTACK_COMMANDS[0]
+        cmd = _ATTACK_ONE
         r = _run(tmp_path, [[_shell(cmd)], TEXT], max_steps=3,
                  project=_write_reported_project)
 
