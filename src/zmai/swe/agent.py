@@ -445,14 +445,18 @@ def _pyproject_scope_section(raw: bytes) -> str | None:
     """pyproject.toml 里 `[tool.pytest.ini_options]` 表的规范化文本。
 
     用 tomllib（与 pytest 的读法一致）：`[tool.pytest]` + `ini_options = {...}`
-    这类等价写法也能认出来，行扫描会漏。py<3.11 没有 tomllib、或文件不是合法
-    TOML → 返回整份文本：判据退化为"整个文件的摘要"，仍确定、仍 fail-closed。
+    这类等价写法也能认出来，行扫描会漏。py<3.11 用 tomli（test extra 里已声明）；
+    解析器一个都没有、或文件不是合法 TOML → 返回整份文本：判据退化为"整个文件的
+    摘要"，仍确定、仍 fail-closed（裸装 py<3.11 且无 tomli 时就是这条路径）。
     """
     text = raw.decode("utf-8", "replace")
     try:
         import tomllib
     except ImportError:
-        return text
+        try:
+            import tomli as tomllib
+        except ImportError:
+            return text
     try:
         node: object = tomllib.loads(text)
     except Exception:
