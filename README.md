@@ -144,7 +144,9 @@ failure → diagnosis → repair plan → edit → verification
 
 ## 6. Demo
 
-<video src="docs/zmai-demo.mp4" controls width="100%"></video>
+![ZMAI Demo](docs/demo.gif)
+
+> 完整带讲解演示视频: [docs/zmai-demo.mp4](docs/zmai-demo.mp4)
 
 一行命令修复真实 Bug：
 
