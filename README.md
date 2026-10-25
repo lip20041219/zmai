@@ -11,6 +11,8 @@
 
 `pip install zmai` · **Zero third-party dependencies** · **1753 tests · CI green**
 
+**[▶ Watch ZMAI in action — promo video](docs/zmai-promo.mp4)**
+
 </div>
 
 ---
