@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 from zmai.swe.failure import format_failure, parse_test_failure
@@ -232,6 +233,90 @@ class TestRootCauseLocalization:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# AssertionError 根因定位区分（frame_is_test）
+# ═══════════════════════════════════════════════════════════════════
+
+
+_ASSERT_ONLY_TRACEBACK = """____ test_best_price_prefers_bulk ____
+
+    def test_best_price_prefers_bulk():
+        items = [{'qty': 10}]
+>       assert best_price(items, 'bulk') == 85.0
+E       assert 60.0 == 85.0
+E        +  where 60.0 = best_price([{'qty': 10}], 'bulk')
+
+tests/test_discounts.py:39: AssertionError
+"""
+
+_VALUE_ERROR_WITH_SOURCE_FRAME = """____ test_value_error ____
+
+    def test_value_error():
+>       result = compute('invalid')
+
+src/calc.py:15: in compute
+    raise ValueError('bad input')
+E   ValueError: bad input
+
+tests/test_calc.py:8: ValueError
+"""
+
+
+class TestAssertionErrorFrameIsTest:
+    """纯 AssertionError（traceback 只有测试帧）不得误报为已确认的业务根因位置。"""
+
+    def test_pure_assertion_error_marks_frame_as_test(self):
+        issue = parse_test_failure(_ASSERT_ONLY_TRACEBACK)
+        assert issue is not None
+        assert issue.frame_is_test is True
+        assert issue.file.endswith("test_discounts.py")
+        assert issue.line == 39
+
+    def test_format_failure_uses_assertion_location_label(self):
+        issue = parse_test_failure(_ASSERT_ONLY_TRACEBACK)
+        text = format_failure(issue)
+        assert "失败断言位置" in text
+        # 不应出现"根因位置:"作为定位标签（"根因位置尚未确定"是说明文字，不算标签）
+        assert "根因位置:" not in text
+        assert "根因位置尚未确定" in text
+        # source_snippet 标签：当有源码片段时，测试帧应标注"测试文件上下文"
+        if issue.source_snippet:
+            assert "测试文件上下文" in text
+            assert "源码上下文（>> 标记根因行）" not in text
+
+    def test_value_error_with_source_frame_not_marked_as_test(self):
+        issue = parse_test_failure(_VALUE_ERROR_WITH_SOURCE_FRAME)
+        assert issue is not None
+        assert issue.frame_is_test is False
+        assert issue.file.endswith("calc.py")
+        assert issue.line == 15
+
+    def test_format_failure_keeps_root_cause_label_for_source_frame(self):
+        issue = parse_test_failure(_VALUE_ERROR_WITH_SOURCE_FRAME)
+        text = format_failure(issue)
+        assert "根因位置" in text
+        assert "失败断言位置" not in text
+        assert "根因位置尚未确定" not in text
+
+    def test_fix_plan_for_assertion_error_guides_source_investigation(self):
+        issue = parse_test_failure(_ASSERT_ONLY_TRACEBACK)
+        plan = generate_fix_plan(issue)
+        assert not plan.is_empty
+        step2 = plan.steps[1]
+        assert "grep" in step2 or "搜索" in step2
+        assert "业务源码" in step2
+        # 不应只让模型反复读取测试文件
+        assert "test_discounts.py" not in step2
+
+    def test_fix_plan_for_source_frame_keeps_original_behavior(self):
+        issue = parse_test_failure(_VALUE_ERROR_WITH_SOURCE_FRAME)
+        plan = generate_fix_plan(issue)
+        assert not plan.is_empty
+        step2 = plan.steps[1]
+        assert "calc.py" in step2
+        assert "grep" not in step2
+
+
+# ═══════════════════════════════════════════════════════════════════
 # P1 — Fix Planner
 # ═══════════════════════════════════════════════════════════════════
 
@@ -258,6 +343,9 @@ class TestFixPlanner:
         assert not plan.is_empty
         # 未知断言 → 通用计划，仍包含 修改→验证 步骤
         assert any("edit" in s or "write_file" in s for s in plan.steps)
+        assert "仅在输出不完整时重跑" in plan.steps[0]
+        assert "现有测试" in plan.steps[1]
+        assert "确认失败与任务或改动有关" in plan.steps[2]
 
     def test_format_plan(self):
         issue = parse_test_failure("assert 404 == 200")
@@ -326,7 +414,7 @@ class TestRepairPlanEndToEnd:
                 self._i += 1
                 if self._i == 1:
                     tc = [ToolCall(id="1", name="shell_exec",
-                                   params={"command": "python -m pytest -q"})]
+                                   params={"command": f"{sys.executable} -m pytest -q"})]
                 else:
                     tc = None
                 return BackendResponse(content="", tool_calls=tc,
@@ -360,10 +448,13 @@ class TestRepairPlanEndToEnd:
         # P1 计划：包含 Fix Plan 步骤
         assert "Fix Plan" in joined, f"应含修复计划: {joined}"
         assert "edit" in joined or "write_file" in joined
-        # P0-1 接入：真实 pytest 失败 → 根因位置 + 源码上下文进入 Agent 上下文
-        assert "根因位置" in joined, f"应含根因位置: {joined[-1500:]}"
-        assert "源码上下文" in joined, f"应含源码片段: {joined[-1500:]}"
-        assert ">>" in joined, "源码片段应标出根因行"
+        # P0-1 接入：真实 pytest 失败 → 定位信息 + 源码/测试片段进入 Agent 上下文
+        # 纯 AssertionError（如 404）frame_is_test=True 时标签为"测试文件上下文"，
+        # 有业务源码帧时为"源码上下文"；两种均属正确行为。
+        assert "根因位置" in joined, f"应含根因位置信息: {joined[-1500:]}"
+        assert "测试文件上下文" in joined or "源码上下文" in joined, \
+            f"应含源码/测试片段: {joined[-1500:]}"
+        assert ">>" in joined, "片段应标出关键行"
 
 
 # ═══════════════════════════════════════════════════════════════════

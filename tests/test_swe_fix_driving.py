@@ -13,10 +13,13 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+# 复用既有的工具结果截获器（"哪次调用真的执行了 / 哪次被拒绝"）
+from tests.test_swe_edit_failure_recovery import _capture_tool_results
 from zmai.agent import AgentContext
 from zmai.gateway.base import (
     Backend,
@@ -26,7 +29,7 @@ from zmai.gateway.base import (
     BackendResponse,
     TokenUsage,
 )
-from zmai.swe.agent import SWEAgent
+from zmai.swe.agent import SWEAgent, _build_fix_state_directive
 from zmai.tool import ToolCall, ToolRegistry
 
 # ═══════════════════════════════════════════════════════════════════
@@ -133,7 +136,8 @@ class _ScriptedBackend(Backend):
         return {BackendCapability.TOOL_USE}
 
 
-async def _run_agent(project_dir: Path, backend: Backend, max_steps: int = 12) -> tuple[AgentContext, Any]:  # noqa: E501
+async def _run_agent(project_dir: Path, backend: Backend, max_steps: int = 12,
+                     initial_metadata: dict | None = None) -> tuple[AgentContext, Any]:  # noqa: E501
     agent = SWEAgent("fix_drive_test")
     registry = ToolRegistry()
     ctx = AgentContext(
@@ -146,7 +150,7 @@ async def _run_agent(project_dir: Path, backend: Backend, max_steps: int = 12) -
         backend=backend,
         tools=registry,
         config={"project_path": str(project_dir), "timeout": 30},
-        metadata={},
+        metadata=dict(initial_metadata or {}),
     )
     await agent.initialize(ctx)
 
@@ -171,16 +175,14 @@ class TestFlaskFixEndToEnd:
 
         # 脚本: pytest(失败) → 读app → 读test → edit加route → pytest(通过) → 结束
         script: list[list[ToolCall] | None] = [
-            [ToolCall(id="1", name="shell_exec",
-                      params={"command": "python -m pytest -q"})],
+            [_PYTEST],
             [ToolCall(id="2", name="read_file", params={"path": "app.py"})],
             [ToolCall(id="3", name="read_file", params={"path": "test_app.py"})],
             [ToolCall(id="4", name="edit",
                       params={"path": "app.py", "mode": "regex_replace",
                               "old_text": r"def index\(\):",
                               "new_text": "@app.route('/')\ndef index():"})],
-            [ToolCall(id="5", name="shell_exec",
-                      params={"command": "python -m pytest -q"})],
+            [_PYTEST],
             None,
         ]
         backend = _ScriptedBackend(script)
@@ -221,8 +223,7 @@ class TestFixDrivingEnforcement:
 
         # 脚本: pytest(失败) → 反复 read_file 不修改（读取不同文件，才有诊断信息量）
         script: list[list[ToolCall] | None] = [
-            [ToolCall(id="1", name="shell_exec",
-                      params={"command": "python -m pytest -q"})],
+            [_PYTEST],
         ]
         for i in range(6):  # 连续 6 个 step 只读，不修改
             name = ["app.py", "test_app.py", "helpers.py"][i % 3]
@@ -270,6 +271,356 @@ class TestFixDrivingEnforcement:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# 测试 2b: FixDriving 触发下限 —— 至少读过 1 个非测试源文件（C1）
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _write_extra_files(project: Path, names: list[str]) -> None:
+    """补写若干文件，让"读不同文件"能真实发生（同文件重复读被 ReadCache 拦下，不计入）。"""
+    for name in names:
+        (project / name).write_text("# unrelated module\n", encoding="utf-8")
+
+
+def _only_reads(names: list[str], repeat: int = 1) -> list[list[ToolCall] | None]:
+    """构造"只读不修"脚本：每步读一个不同文件。"""
+    return [[_read_file(n, f"r{i}")] for i, n in enumerate(names * repeat)]
+
+
+class TestFixDrivingSourceReadGate:
+    """触发条件是"读够次数 **且** 读过非测试源文件"，不再是纯计数。"""
+
+    def test_only_test_file_reads_do_not_trigger(self, tmp_path: Path):
+        """只读测试文件：读数攒满阈值也不得进入强制修改期。"""
+        project = tmp_path / "only_tests"
+        _write_flask_project(project)
+        _write_extra_files(project, ["test_extra_a.py", "test_extra_b.py"])
+
+        script = [[_PYTEST], *_only_reads(
+            ["test_app.py", "test_extra_a.py", "test_extra_b.py"], repeat=2), None]
+        ctx, _ = asyncio.run(_run_agent(project, _ScriptedBackend(script), max_steps=12))
+
+        # 阈值确实攒满了 —— 证明拦住它的是新下限，而不是读数不够
+        assert ctx.metadata["reads_after_fail"] >= 3
+        assert ctx.metadata["src_reads_after_fail"] == 0
+        # 断言权威状态而非注入文本：步数一多，上下文压缩会把 FixDriving 消息
+        # 压进 [历史摘要]，用文本断言既会假失败、也会在真触发时假通过。
+        assert ctx.metadata.get("force_edit") is not True
+
+    def test_source_reads_still_trigger(self, tmp_path: Path):
+        """读够非测试源文件 → 仍按原语义触发强制修改。"""
+        project = tmp_path / "src_reads"
+        _write_flask_project(project)
+        _write_extra_files(project, ["module_a.py", "module_b.py"])
+
+        script = [[_PYTEST], *_only_reads(
+            ["app.py", "module_a.py", "module_b.py"]), None]
+        ctx, _ = asyncio.run(_run_agent(project, _ScriptedBackend(script), max_steps=12))
+
+        assert ctx.metadata.get("force_edit") is True
+
+    def test_unrelated_source_reads_also_trigger(self, tmp_path: Path):
+        """当前策略：任意非测试文件都算"源文件"，不校验是否与失败相关。
+
+        这是刻意的取舍 —— 按 candidate_files 精确匹配需要新建路径归一化机制，
+        而该字段绝对/相对混杂且可为空（failure.py:_collect_candidate_files）。
+        此处固化这条已知上限：只读无关模块同样会触发。
+        """
+        project = tmp_path / "unrelated"
+        _write_flask_project(project)
+        _write_extra_files(project, ["unrelated_a.py", "unrelated_b.py"])
+
+        script = [[_PYTEST], *_only_reads(
+            ["helpers.py", "unrelated_a.py", "unrelated_b.py"]), None]
+        ctx, _ = asyncio.run(_run_agent(project, _ScriptedBackend(script), max_steps=12))
+
+        assert ctx.metadata.get("force_edit") is True
+
+    def test_persisted_state_without_source_read_does_not_trigger(self, tmp_path: Path):
+        """持久化恢复：读数已满但源文件读数为 0 → 仍不触发（新下限跨步生效）。"""
+        project = tmp_path / "persisted"
+        _write_flask_project(project)
+
+        # 模拟"上一阶段留下的状态"：读数已满、源文件读数为 0
+        script: list[list[ToolCall] | None] = [
+            [ToolCall(id="e", name="shell_exec", params={"command": "echo hi"})],
+            None,
+        ]
+        ctx, _ = asyncio.run(_run_agent(
+            project, _ScriptedBackend(script), max_steps=2,
+            initial_metadata={
+                "test_failed": True,
+                "repair_plan_injected": True,
+                "repair_phase": "plan",
+                "reads_after_fail": 3,
+                "src_reads_after_fail": 0,
+            },
+        ))
+
+        assert ctx.metadata["reads_after_fail"] >= 3
+        assert "[FixDriving]" not in _messages_text(ctx)
+
+    def test_counters_cleared_when_force_edit_fires(self, tmp_path: Path):
+        """触发即清零：下一轮修复周期不得继承上一轮的读数。"""
+        project = tmp_path / "cleared"
+        _write_flask_project(project)
+        _write_extra_files(project, ["module_a.py", "module_b.py"])
+
+        # 恰好 4 步：pytest(失败) → 读 3 个源文件 → 第 4 步末尾触发 FixDriving
+        script = [[_PYTEST], *_only_reads(["app.py", "module_a.py", "module_b.py"])]
+        ctx, _ = asyncio.run(_run_agent(project, _ScriptedBackend(script), max_steps=4))
+
+        assert ctx.metadata.get("force_edit") is True
+        assert ctx.metadata["reads_after_fail"] == 0
+        assert ctx.metadata["src_reads_after_fail"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 强制期入口的"零证据"修复：目标未知 → 一次 grep discovery 额度
+#
+# 缺陷（真实轨迹取证）：`edit_recovery_read_allowance` /
+# `edit_recovery_grep_allowance` 只在 `_handle_edit_failure` 里武装，即必须先有
+# 一次 edit/write_file **真的执行且失败**。对"被拦截后不再尝试 edit、继续发读取
+# 调用"的模型，这个前置永远不成立 —— 强制期内没有任何工具能产生新证据：
+#   * xarray-4248：全程 0 次 edit，28 次调用被拒，终态 timeout；
+#   * agent_24072 #16-#19：连从未读过的 src/reports.py 也被拒。
+# 修复：`_arm_force_edit_recovery` 在 force_edit 上升沿、且目标未知时发一次
+# grep 额度；不放开 read_file / git / 普通 shell_exec，不改变拦截与完成门禁。
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _allowance(ctx: AgentContext, key: str) -> int:
+    return int(ctx.metadata.get(key, 0) or 0)
+
+
+# 与 tests/test_swe_edit_recovery_unknown_target.py 同形的 discovery grep
+_GREP_SRC = ToolCall(id="g1", name="grep", params={"pattern": "def index"})
+_GREP_SRC_AGAIN = ToolCall(id="g2", name="grep", params={"pattern": "app"})
+# D2：门槛通过但**执行失败**的 grep（正则错误 / 缺必需参数），以及正常空结果
+_GREP_BAD_REGEX = ToolCall(id="g3", name="grep", params={"pattern": "("})
+_GREP_NO_PATTERN = ToolCall(id="g4", name="grep", params={})
+_GREP_NO_MATCH = ToolCall(id="g5", name="grep",
+                          params={"pattern": "zzz_no_such_symbol_zzz"})
+
+# D1：测试命令在导入期改写**既有源文件**（快照/生成物类测试的真实形态）→
+# 工作区真的变了，但测试仍然失败 → 命中"工作区变了但调用失败"的边界重置。
+TAMPER_CONFTEST = '''\
+import pathlib
+
+with pathlib.Path("app.py").open("a", encoding="utf-8") as fh:
+    fh.write("# tampered by conftest\\n")
+'''
+
+
+class TestForceEditEntryDiscoveryAllowance:
+    def test_entry_arms_one_grep_when_target_unknown(self, tmp_path: Path):
+        """进入强制期且尚无 edit 失败目标 → 必须发放一次 grep discovery 额度。"""
+        project = tmp_path / "entry_arms"
+        _write_flask_project(project)
+        _write_extra_files(project, ["module_a.py", "module_b.py"])
+
+        script = [[_PYTEST], *_only_reads(["app.py", "module_a.py", "module_b.py"])]
+        ctx, _ = asyncio.run(_run_agent(project, _ScriptedBackend(script), max_steps=4))
+
+        assert ctx.metadata.get("force_edit") is True, "前置条件：必须真的进入强制期"
+        assert str(ctx.metadata.get("edit_failure_target") or "") == "", \
+            "前置条件：本用例中尚未发生过 edit 失败"
+        assert _allowance(ctx, "edit_recovery_grep_allowance") == 1, \
+            "强制期入口必须发放一次 grep 目标发现额度"
+
+    def test_entry_keeps_read_allowance_at_zero(self, tmp_path: Path):
+        """入口额度只发 grep：定向 read 额度仍只在 edit 失败后发放。"""
+        project = tmp_path / "entry_no_read"
+        _write_flask_project(project)
+        _write_extra_files(project, ["module_a.py", "module_b.py"])
+
+        script = [[_PYTEST], *_only_reads(["app.py", "module_a.py", "module_b.py"])]
+        ctx, _ = asyncio.run(_run_agent(project, _ScriptedBackend(script), max_steps=4))
+
+        assert ctx.metadata.get("force_edit") is True
+        assert _allowance(ctx, "edit_recovery_read_allowance") == 0, \
+            "入口不得发放定向 read 额度（read 是定向的，入口还没有目标）"
+
+    def test_entry_does_not_arm_when_target_known(self, tmp_path: Path):
+        """已有 edit 失败目标 → 入口不得再发 grep 额度（保持既有不变式）。"""
+        project = tmp_path / "entry_known_target"
+        _write_flask_project(project)
+        _write_extra_files(project, ["module_a.py", "module_b.py"])
+
+        script = [[_PYTEST], *_only_reads(["app.py", "module_a.py", "module_b.py"])]
+        ctx, _ = asyncio.run(_run_agent(
+            project, _ScriptedBackend(script), max_steps=4,
+            initial_metadata={"edit_failure_target": "app.py"},
+        ))
+
+        assert ctx.metadata.get("force_edit") is True, "前置条件：必须真的进入强制期"
+        assert _allowance(ctx, "edit_recovery_grep_allowance") == 0, \
+            "已有合法 target 时不得再发 grep discovery 额度"
+
+    def test_grep_executes_once_then_rejected(self, tmp_path: Path, monkeypatch):
+        """首次 grep 真的执行并拿到源码证据；第二次被拒 —— 一次性额度，非开放权限。"""
+        project = tmp_path / "entry_grep_once"
+        _write_flask_project(project)
+        _write_extra_files(project, ["module_a.py", "module_b.py"])
+        results = _capture_tool_results(monkeypatch)
+
+        script = [[_PYTEST], *_only_reads(["app.py", "module_a.py", "module_b.py"]),
+                  [_GREP_SRC], [_GREP_SRC_AGAIN], None]
+        ctx, _ = asyncio.run(_run_agent(project, _ScriptedBackend(script), max_steps=8))
+
+        greps = [r for r in results if r["name"] == "grep"]
+        assert len(greps) == 2, f"应观察到两次 grep 调用: {len(greps)}"
+        first, second = greps
+        assert first["success"] is True and "[FixDriving]" not in first["text"], \
+            f"进入强制期后的第一次 grep 必须真的执行: {first['text'][:200]}"
+        assert "def index" in first["text"], \
+            f"grep 必须真的返回源码内容（而非仅放行）: {first['text'][:200]}"
+        assert second["success"] is False and "[FixDriving]" in second["text"], \
+            f"第二次 grep 必须被拒: {second['text'][:200]}"
+        assert _allowance(ctx, "edit_recovery_grep_allowance") == 0, "额度消耗即失效"
+
+    def test_read_file_does_not_consume_the_allowance(self, tmp_path: Path, monkeypatch):
+        """被拒的 read_file 不得消耗 grep 额度：额度只认它自己的工具。"""
+        project = tmp_path / "entry_read_no_consume"
+        _write_flask_project(project)
+        _write_extra_files(project, ["module_a.py", "module_b.py"])
+        results = _capture_tool_results(monkeypatch)
+
+        script = [[_PYTEST], *_only_reads(["app.py", "module_a.py", "module_b.py"]),
+                  [_read_file("app.py", "r9")], [_GREP_SRC], None]
+        ctx, _ = asyncio.run(_run_agent(project, _ScriptedBackend(script), max_steps=8))
+
+        reads = [r for r in results if r["name"] == "read_file"]
+        assert reads[-1]["success"] is False and "[FixDriving]" in reads[-1]["text"], \
+            f"强制期内 read_file 必须仍被拒: {reads[-1]['text'][:200]}"
+        greps = [r for r in results if r["name"] == "grep"]
+        assert greps and greps[0]["success"] is True and "def index" in greps[0]["text"], \
+            f"read_file 被拒不得消耗 grep 额度: {greps[0]['text'][:200] if greps else '无'}"
+        assert _allowance(ctx, "edit_recovery_grep_allowance") == 0
+
+    def test_after_grep_read_file_is_still_blocked(self, tmp_path: Path, monkeypatch):
+        """**已知未解决限制**（固化现状，不是期望行为）。
+
+        grep 只解决"该改哪个文件"，不解决"该改成什么"。额度用尽后 read_file 仍被
+        结构性拒绝，模型只能靠 grep 返回的行级摘要 + edit 失败后才发放的定向 read
+        继续取证。若本用例失败，说明读取限制被有意放开 —— 需同步更新
+        agent.py 的拦截语义与本文件的其他断言，而不是当作回归。
+        """
+        project = tmp_path / "entry_gap_after_grep"
+        _write_flask_project(project)
+        _write_extra_files(project, ["module_a.py", "module_b.py"])
+        results = _capture_tool_results(monkeypatch)
+
+        script = [[_PYTEST], *_only_reads(["app.py", "module_a.py", "module_b.py"]),
+                  [_GREP_SRC], [_read_file("app.py", "r9")], None]
+        asyncio.run(_run_agent(project, _ScriptedBackend(script), max_steps=8))
+
+        greps = [r for r in results if r["name"] == "grep"]
+        reads = [r for r in results if r["name"] == "read_file"]
+        assert greps and greps[0]["success"] is True, "grep 额度应已被消费"
+        assert reads[-1]["success"] is False and "[FixDriving]" in reads[-1]["text"], \
+            "grep 之后 read_file 仍被拒 —— 这是当前未解决的限制，不是回归"
+
+    # ── D1 回归：强制期内的边界重置不得清掉入口额度 ──
+
+    def test_allowance_survives_boundary_reset_inside_force_edit(
+            self, tmp_path: Path, monkeypatch):
+        """进入强制期 → 额度未消费 → 工作区变了但调用失败 → 仍必须保留取证机会。
+
+        "工作区变了但调用失败"这条边界（agent.py `_ws_changed and not result.success`）
+        会调用 `_reset_edit_failure_recovery`，但**不解除** force_edit。修复前那里
+        把 grep 额度一并清零，而上升沿不会再来 → 本周期唯一的取证机会永久丢失。
+        """
+        project = tmp_path / "d1_boundary_reset"
+        _write_flask_project(project)
+        _write_extra_files(project, ["module_a.py", "module_b.py"])
+        (project / "conftest.py").write_text(TAMPER_CONFTEST, encoding="utf-8")
+        results = _capture_tool_results(monkeypatch)
+
+        script = [[_PYTEST], *_only_reads(["app.py", "module_a.py", "module_b.py"]),
+                  [_PYTEST], [_GREP_SRC], None]
+        ctx, _ = asyncio.run(_run_agent(project, _ScriptedBackend(script), max_steps=8))
+
+        # ── 前置条件：必须真的命中那条边界（否则本用例不具区分力）──
+        assert "# tampered by conftest" in (project / "app.py").read_text(encoding="utf-8"), \
+            "前置条件：测试命令必须真的执行并改动了工作区"
+        shell = [r for r in results if r["name"] == "shell_exec"]
+        assert shell[-1]["success"] is False, "前置条件：第二次测试必须失败"
+
+        # ── 核心断言 ──
+        assert ctx.metadata.get("force_edit") is True, \
+            "工作区变动但调用失败 → 仍处于强制期（既有语义不得改变）"
+        # 判定句：边界重置若清掉了入口额度，这一步的 grep 会被 FixDriving 拒绝。
+        greps = [r for r in results if r["name"] == "grep"]
+        assert greps and greps[0]["success"] is True and "def index" in greps[0]["text"], \
+            f"强制期内仍必须保留一次取证机会: {greps[0]['text'][:200] if greps else '无'}"
+        assert _allowance(ctx, "edit_recovery_grep_allowance") == 0, \
+            "额度应被这次成功的 grep 正常消费掉（能被消费即证明它没被重置清除）"
+
+    # ── D2 回归：执行失败的 grep 不得永久吃掉唯一额度 ──
+
+    def test_failed_grep_returns_the_allowance(self, tmp_path: Path, monkeypatch):
+        """正则错误（ToolResult.err）→ 未取到任何证据 → 额度必须归还。"""
+        project = tmp_path / "d2_bad_regex"
+        _write_flask_project(project)
+        _write_extra_files(project, ["module_a.py", "module_b.py"])
+        results = _capture_tool_results(monkeypatch)
+
+        script = [[_PYTEST], *_only_reads(["app.py", "module_a.py", "module_b.py"]),
+                  [_GREP_BAD_REGEX, _GREP_SRC], [_GREP_SRC_AGAIN], None]
+        ctx, _ = asyncio.run(_run_agent(project, _ScriptedBackend(script), max_steps=8))
+
+        greps = [r for r in results if r["name"] == "grep"]
+        assert len(greps) == 3, f"应观察到三次 grep 调用: {len(greps)}"
+        assert greps[0]["success"] is False and "regex error" in greps[0]["text"], \
+            f"第一次必须因正则错误失败: {greps[0]['text'][:200]}"
+        assert greps[1]["success"] is True and "def index" in greps[1]["text"], \
+            f"额度归还后必须能再做一次有效 grep: {greps[1]['text'][:200]}"
+        assert greps[2]["success"] is False and "[FixDriving]" in greps[2]["text"], \
+            f"成功消费之后仍必须是一次性额度: {greps[2]['text'][:200]}"
+        assert _allowance(ctx, "edit_recovery_grep_allowance") == 0
+
+    def test_missing_pattern_grep_returns_the_allowance(self, tmp_path: Path, monkeypatch):
+        """缺必需参数（注册表校验失败）→ 同样不得消耗唯一额度。"""
+        project = tmp_path / "d2_no_pattern"
+        _write_flask_project(project)
+        _write_extra_files(project, ["module_a.py", "module_b.py"])
+        results = _capture_tool_results(monkeypatch)
+
+        script = [[_PYTEST], *_only_reads(["app.py", "module_a.py", "module_b.py"]),
+                  [_GREP_NO_PATTERN, _GREP_SRC], None]
+        asyncio.run(_run_agent(project, _ScriptedBackend(script), max_steps=8))
+
+        greps = [r for r in results if r["name"] == "grep"]
+        assert len(greps) == 2
+        assert greps[0]["success"] is False, f"缺参必须失败: {greps[0]['text'][:200]}"
+        assert greps[1]["success"] is True and "def index" in greps[1]["text"], \
+            f"额度归还后必须能再做一次有效 grep: {greps[1]['text'][:200]}"
+
+    def test_no_match_grep_still_consumes_the_allowance(self, tmp_path: Path, monkeypatch):
+        """边界：空结果是**正常证据**（ToolResult.ok），额度照常消费、不归还。
+
+        这条守住 D2 的归还条件不被放宽 —— 归还只针对"执行失败"，
+        否则一次性额度会退化成"可反复试探"。
+        """
+        project = tmp_path / "d2_no_match"
+        _write_flask_project(project)
+        _write_extra_files(project, ["module_a.py", "module_b.py"])
+        results = _capture_tool_results(monkeypatch)
+
+        script = [[_PYTEST], *_only_reads(["app.py", "module_a.py", "module_b.py"]),
+                  [_GREP_NO_MATCH], [_GREP_SRC], None]
+        ctx, _ = asyncio.run(_run_agent(project, _ScriptedBackend(script), max_steps=8))
+
+        greps = [r for r in results if r["name"] == "grep"]
+        assert len(greps) == 2
+        assert greps[0]["success"] is True and "no matches" in greps[0]["text"], \
+            f"空结果必须是成功返回: {greps[0]['text'][:200]}"
+        assert greps[1]["success"] is False and "[FixDriving]" in greps[1]["text"], \
+            f"空结果已消耗额度，第二次必须被拦: {greps[1]['text'][:200]}"
+        assert _allowance(ctx, "edit_recovery_grep_allowance") == 0
+
+
+# ═══════════════════════════════════════════════════════════════════
 # 测试 3: 修复计划注入 + 修复阶段状态机
 # ═══════════════════════════════════════════════════════════════════
 
@@ -294,15 +645,13 @@ class TestRepairPlanAndPhases:
 
         # 脚本: pytest(失败) → read → edit(修复) → pytest(通过) → 结束
         script: list[list[ToolCall] | None] = [
-            [ToolCall(id="1", name="shell_exec",
-                      params={"command": "python -m pytest -q"})],
+            [_PYTEST],
             [ToolCall(id="2", name="read_file", params={"path": "app.py"})],
             [ToolCall(id="3", name="edit",
                       params={"path": "app.py", "mode": "regex_replace",
                               "old_text": r"def index\(\):",
                               "new_text": "@app.route('/')\ndef index():"})],
-            [ToolCall(id="4", name="shell_exec",
-                      params={"command": "python -m pytest -q"})],
+            [_PYTEST],
             None,
         ]
         backend = _ScriptedBackend(script)
@@ -319,15 +668,13 @@ class TestRepairPlanAndPhases:
         _write_flask_project(project)
 
         script: list[list[ToolCall] | None] = [
-            [ToolCall(id="1", name="shell_exec",
-                      params={"command": "python -m pytest -q"})],
+            [_PYTEST],
             [ToolCall(id="2", name="read_file", params={"path": "app.py"})],
             [ToolCall(id="3", name="edit",
                       params={"path": "app.py", "mode": "regex_replace",
                               "old_text": r"def index\(\):",
                               "new_text": "@app.route('/')\ndef index():"})],
-            [ToolCall(id="4", name="shell_exec",
-                      params={"command": "python -m pytest -q"})],
+            [_PYTEST],
             None,
         ]
         backend = _ScriptedBackend(script)
@@ -348,8 +695,7 @@ class TestRepairPlanAndPhases:
         # 脚本: 失败 → read → edit(无效) → 失败 → read → edit(无效) → 失败 → 结束
         script: list[list[ToolCall] | None] = []
         for i in range(3):
-            script.append([ToolCall(id=f"t{i}a", name="shell_exec",
-                                    params={"command": "python -m pytest -q"})])
+            script.append([_PYTEST])
             script.append([ToolCall(id=f"t{i}b", name="read_file",
                                     params={"path": "app.py"})])
             script.append([ToolCall(id=f"t{i}c", name="edit",
@@ -370,15 +716,17 @@ class TestRepairPlanAndPhases:
 
 
 class _CaptureBackend(_ScriptedBackend):
-    """记录每次 backend 收到的 system_prompt，用于验证动态修复指令。"""
+    """记录每次 backend 收到的 system_prompt 和 max_tokens。"""
 
     def __init__(self, script: list[list[ToolCall] | None]):
         super().__init__(script)
         self.system_prompts: list[str] = []
+        self.max_tokens_list: list[int] = []
 
     def invoke(self, request: BackendRequest) -> BackendResponse:
         if request.system_prompt:
             self.system_prompts.append(request.system_prompt)
+        self.max_tokens_list.append(request.max_tokens)
         return super().invoke(request)
 
 
@@ -391,8 +739,7 @@ class TestFixStateDirective:
         # step1: pytest 失败 → 持久化 test_failed
         # step2: end_turn —— 此时构建 system prompt，应含"Current Repair State / MUST emit"
         script: list[list[ToolCall] | None] = [
-            [ToolCall(id="1", name="shell_exec",
-                      params={"command": "python -m pytest -q"})],
+            [_PYTEST],
             None,
         ]
         backend = _CaptureBackend(script)
@@ -436,8 +783,7 @@ class TestFixStateDirective:
         _write_flask_project(project)
 
         script: list[list[ToolCall] | None] = [
-            [ToolCall(id="1", name="shell_exec",
-                      params={"command": "python -m pytest -q"})],
+            [_PYTEST],
             _diagnostic_reads(),            # 攒满阈值 → 本步结束时 force_edit=True
             [_read_file("app.py")],         # force_edit 生效 → 被拒绝
             None,
@@ -464,6 +810,362 @@ class TestFixStateDirective:
                 f"强制期的 system prompt 必须声明读取已禁用:\n{prompt[-600:]}"
             assert "reads since the failure" not in prompt, \
                 "读取已被结构性拒绝，不得再向模型宣称还有读取预算"
+
+    def test_files_already_read_injected_after_failure_and_read(self, tmp_path: Path):
+        """pytest 失败后若已读取过文件，下一次 system prompt 必须含 'Files already read' 列表。
+
+        这是第二轮新增的提示，用于减少诊断阶段重复读取。本测试用 _CaptureBackend
+        截取真实发送给 backend.invoke() 的 system_prompt，验证提示确实进入请求对象。
+        """
+        project = tmp_path / "flask_readlist1"
+        _write_flask_project(project)
+
+        # step1: pytest 失败 → test_failed=True
+        # step2: read_file(app.py) → _read_files_seen={"app.py"}
+        # step3: end_turn → 此时构建的 system prompt 应含已读文件列表
+        script: list[list[ToolCall] | None] = [
+            [_PYTEST],
+            [_read_file("app.py")],
+            None,
+        ]
+        backend = _CaptureBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend, max_steps=3))
+
+        assert ctx.metadata.get("test_failed") is True, "pytest 应失败并设置 test_failed"
+        assert "app.py" in ctx.metadata.get("_read_files_seen", set()), \
+            "read_file 后 _read_files_seen 应包含 app.py"
+        assert len(backend.system_prompts) >= 3, "应至少发起 3 次 backend 调用"
+
+        # 第 3 次调用发生在 pytest 失败 + 读取之后，其 system prompt 应含已读文件列表
+        post_read = backend.system_prompts[2]
+        assert "Files already read this session" in post_read, \
+            "失败且已读取文件后，system prompt 应包含 'Files already read this session'"
+        assert "app.py" in post_read, \
+            "已读文件列表应包含实际读取过的文件名 app.py"
+
+    def test_files_already_read_omitted_when_no_reads_yet(self, tmp_path: Path):
+        """pytest 刚失败但尚未读取任何文件时，不应注入 'Files already read' 行。
+
+        _read_files_seen 为空时，注入空列表没有意义，反而占用 token。
+        验证生产代码正确处理空集合。
+        """
+        project = tmp_path / "flask_readlist2"
+        _write_flask_project(project)
+
+        # step1: pytest 失败 → test_failed=True, _read_files_seen={}
+        # step2: end_turn → 此时构建的 system prompt 应有修复指令但无已读文件列表
+        script: list[list[ToolCall] | None] = [
+            [_PYTEST],
+            None,
+        ]
+        backend = _CaptureBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend, max_steps=2))
+
+        assert ctx.metadata.get("test_failed") is True
+        assert ctx.metadata.get("_read_files_seen", set()) == set(), \
+            "未读取文件时 _read_files_seen 应为空集"
+        assert len(backend.system_prompts) >= 2
+
+        post_failure = backend.system_prompts[1]
+        assert "(dynamic, act on this now)" in post_failure, \
+            "失败后仍应有动态修复状态块"
+        assert "Files already read this session" not in post_failure, \
+            "_read_files_seen 为空时不应注入 'Files already read' 行"
+
+    def test_files_already_read_injected_in_force_edit_phase(self, tmp_path: Path):
+        """force_edit=True 且已读取过文件时，system prompt 必须含 'Files already read'。
+
+        根因（A/B 实验发现）：原提示放在 elif test_failed 分支内，force_edit=True
+        时走 if force_edit 分支，完全跳过该提示。修复后移到分支外，force_edit 和
+        test_failed 阶段都能注入。本测试用 _CaptureBackend 截取真实 BackendRequest.
+        system_prompt 验证。
+        """
+        project = tmp_path / "flask_readlist_fe1"
+        _write_flask_project(project)
+
+        # step1: pytest 失败 → test_failed=True
+        # step2: 3 次诊断读取 → 攒满阈值 → 本步结束时 force_edit=True,
+        #        _read_files_seen={app.py, test_app.py, helpers.py}
+        # step3: end_turn → force_edit 生效后的 system prompt 应含已读文件列表
+        script: list[list[ToolCall] | None] = [
+            [_PYTEST],
+            _diagnostic_reads(),
+            None,
+        ]
+        backend = _CaptureBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend, max_steps=3))
+
+        assert ctx.metadata.get("force_edit") is True, "本用例必须真的进入强制修改期"
+        assert len(ctx.metadata.get("_read_files_seen", set())) >= 3, \
+            "诊断读取后 _read_files_seen 应至少包含 3 个文件"
+        assert len(backend.system_prompts) >= 3
+
+        # 第 3 次调用在 force_edit 生效之后，其 system prompt 应含已读文件列表
+        force_edit_prompt = backend.system_prompts[2]
+        assert "Files already read this session" in force_edit_prompt, \
+            "force_edit 阶段的 system prompt 应包含 'Files already read this session'"
+        # 列表应包含实际读取过的文件名
+        assert "app.py" in force_edit_prompt, \
+            "已读文件列表应包含 app.py"
+        assert "DISABLED" in force_edit_prompt, \
+            "force_edit 阶段仍应声明读取已被禁用（与已读文件列表共存）"
+
+    def test_force_edit_directive_guides_edit_mode_preference(self, tmp_path: Path):
+        """force_edit 阶段的 system prompt 必须包含编辑模式选择指引。
+
+        根因（第十六阶段审查，agent_30148 vs agent_16668）：失败任务中模型在
+        force_edit 阶段选择 append 模式修改已有代码，导致在文件末尾追加不相关内容、
+        原始错误逻辑未被替换，测试恶化后陷入恢复困境。成功任务使用 replace_lines。
+        本测试验证指引确实进入 force_edit 阶段的真实 BackendRequest.system_prompt。
+        """
+        project = tmp_path / "flask_editmode1"
+        _write_flask_project(project)
+
+        # step1: pytest 失败 → test_failed=True
+        # step2: 3 次诊断读取 → 攒满阈值 → force_edit=True
+        # step3: end_turn → force_edit 生效后的 system prompt 应含编辑模式指引
+        script: list[list[ToolCall] | None] = [
+            [_PYTEST],
+            _diagnostic_reads(),
+            None,
+        ]
+        backend = _CaptureBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend, max_steps=3))
+
+        assert ctx.metadata.get("force_edit") is True, "本用例必须真的进入强制修改期"
+        assert len(backend.system_prompts) >= 3
+
+        force_edit_prompt = backend.system_prompts[2]
+        # 必须明确引导优先使用 replace_lines / regex_replace
+        assert "replace_lines" in force_edit_prompt, \
+            "force_edit 指引应提到 replace_lines 模式"
+        assert "regex_replace" in force_edit_prompt, \
+            "force_edit 指引应提到 regex_replace 模式"
+        # 必须说明 append 仅用于添加全新内容，不应用于修改已有逻辑
+        assert "append" in force_edit_prompt, \
+            "force_edit 指引应提到 append 模式的适用范围"
+        assert "never use it to modify existing logic" in force_edit_prompt, \
+            "force_edit 指引应明确禁止用 append 修改已有逻辑"
+        # 必须提醒编辑后核对目标代码
+        assert "verify the target code was actually changed" in force_edit_prompt, \
+            "force_edit 指引应提醒编辑后核对目标代码"
+
+    def test_edit_mode_guide_absent_in_idle_phase(self, tmp_path: Path):
+        """idle 阶段（未进入修复态）的 system prompt 不应包含编辑模式指引。
+
+        编辑模式指引仅在 force_edit 阶段有意义。idle 阶段 _build_fix_state_directive
+        提前返回空字符串，不应注入任何修复状态相关内容。
+        """
+        project = tmp_path / "flask_editmode_idle1"
+        _write_flask_project(project)
+
+        # 直接 end_turn，不触发 pytest 失败或 force_edit
+        script: list[list[ToolCall] | None] = [None]
+        backend = _CaptureBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend, max_steps=1))
+
+        assert ctx.metadata.get("force_edit", False) is False
+        assert ctx.metadata.get("test_failed", False) is False
+        assert backend.system_prompts, "应至少有一次 backend 调用"
+
+        idle_prompt = backend.system_prompts[0]
+        # 检查 force_edit 特有的编辑模式指引文本，而非工具定义中的模式名称
+        assert "never use it to modify existing logic" not in idle_prompt, \
+            "idle 阶段不应包含 force_edit 特有的编辑模式指引"
+        assert "verify the target code was actually changed" not in idle_prompt, \
+            "idle 阶段不应包含 force_edit 特有的编辑后核对指引"
+
+    def test_files_already_read_omitted_when_only_empty_paths(self, tmp_path: Path):
+        """_read_files_seen 只包含空路径时，不应生成 'Files already read' 行。
+
+        过滤空路径，避免输出 ", app.py"（开头多余逗号）或纯空条目。
+        用 initial_metadata 直接注入 test_failed=True 和 _read_files_seen={""}，
+        避免依赖沙箱 pytest。
+        """
+        project = tmp_path / "flask_readlist_empty1"
+        _write_flask_project(project)
+
+        script: list[list[ToolCall] | None] = [None]
+        backend = _CaptureBackend(script)
+        ctx, _action = asyncio.run(_run_agent(
+            project, backend, max_steps=1,
+            initial_metadata={
+                "test_failed": True,
+                "repair_phase": "diagnosing",
+                "_read_files_seen": {""},
+            },
+        ))
+
+        assert ctx.metadata.get("test_failed") is True
+        assert "" in ctx.metadata.get("_read_files_seen", set())
+        assert len(backend.system_prompts) >= 1
+
+        prompt = backend.system_prompts[0]
+        assert "(dynamic, act on this now)" in prompt, \
+            "test_failed 阶段仍应有动态修复状态块"
+        assert "Files already read this session" not in prompt, \
+            "_read_files_seen 只含空路径时不应注入 'Files already read' 行"
+
+
+class TestForceEditMaxTokens:
+    """force_edit 阶段必须提高 max_tokens 以覆盖思考模型的推理+工具调用。
+
+    真实故障（zmai_bug_demo v3）：FixDriving 触发后模型连续 3 次返回
+    stop_reason=length。API 响应显示 completion_tokens 全部是 reasoning_tokens
+    （思考 token），模型没有剩余 token 生成 edit/write_file 工具调用。
+    deepseek-v4-flash 默认开启思考模式，且无法通过参数关闭；tool_choice="required"
+    在思考模式下返回 HTTP 400。因此唯一可行方案是在 force_edit 阶段提高
+    max_tokens，给"思考 + 工具调用"留出足够预算。
+
+    注：用 initial_metadata 直接注入 force_edit=True，避免依赖沙箱 pytest
+    （沙箱 Python 无 pytest 模块，无法通过真实 pytest 失败触发 FixDriving）。
+    """
+
+    def test_max_tokens_increased_when_force_edit_active(self, tmp_path: Path):
+        """force_edit=True 时，BackendRequest.max_tokens 必须 >= 8192。"""
+        project = tmp_path / "flask_mt1"
+        _write_flask_project(project)
+
+        script: list[list[ToolCall] | None] = [None]
+        backend = _CaptureBackend(script)
+        ctx, _action = asyncio.run(_run_agent(
+            project, backend, max_steps=1,
+            initial_metadata={"force_edit": True, "test_failed": True},
+        ))
+
+        assert ctx.metadata["force_edit"] is True
+        assert len(backend.max_tokens_list) >= 1
+        assert backend.max_tokens_list[0] >= 8192, \
+            f"force_edit 阶段 max_tokens 应 >= 8192，实际: {backend.max_tokens_list[0]}"
+
+    def test_max_tokens_default_when_not_force_edit(self, tmp_path: Path):
+        """非 force_edit 阶段，max_tokens 保持默认值（不无故提高）。"""
+        project = tmp_path / "flask_mt2"
+        _write_flask_project(project)
+
+        script: list[list[ToolCall] | None] = [None]
+        backend = _CaptureBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend, max_steps=1))
+
+        assert ctx.metadata.get("force_edit", False) is False
+        for mt in backend.max_tokens_list:
+            assert mt <= 4096, \
+                f"非 force_edit 阶段不应提高 max_tokens，实际: {mt}"
+
+    def test_max_tokens_restored_after_force_edit_removed(self, tmp_path: Path):
+        """force_edit 解除后，后续请求的 max_tokens 应恢复默认值。"""
+        project = tmp_path / "flask_mt3"
+        _write_flask_project(project)
+
+        script: list[list[ToolCall] | None] = [
+            [ToolCall(id="1", name="edit",
+                      params={"path": "app.py", "mode": "regex_replace",
+                              "old_text": r"def index\(\):",
+                              "new_text": "@app.route('/')\ndef index():"})],
+            None,
+        ]
+        backend = _CaptureBackend(script)
+        ctx, _action = asyncio.run(_run_agent(
+            project, backend, max_steps=2,
+            initial_metadata={"force_edit": True, "test_failed": True},
+        ))
+
+        assert len(backend.max_tokens_list) >= 1
+        assert backend.max_tokens_list[0] >= 8192, "force_edit 阶段应提高 max_tokens"
+        if len(backend.max_tokens_list) > 1:
+            assert backend.max_tokens_list[1] <= 4096, \
+                "force_edit 解除后应恢复默认 max_tokens"
+
+
+class TestFixDirectiveReadCache:
+    """test_failed 阶段指令必须明确 [ReadCache] 的含义，减少无价值重复读取。
+
+    v5 实测：36 次 read_file，23 次重复读取，日志多次出现 [ReadCache] 命中。
+    ReadCache 机制已正确返回"内容未变化、请复用"的提示，且不计入
+    reads_after_fail，但模型仍主动发起命中缓存的读取。在 test_failed 阶段
+    指令中明确 [ReadCache] 含义，引导模型复用已有上下文。
+    """
+
+    def test_readcache_note_in_test_failed_directive(self, tmp_path: Path):
+        """test_failed=True 且未 force_edit 时，系统提示应包含 [ReadCache] 说明。"""
+        project = tmp_path / "flask_rc1"
+        _write_flask_project(project)
+
+        script: list[list[ToolCall] | None] = [None]
+        backend = _CaptureBackend(script)
+        ctx, _action = asyncio.run(_run_agent(
+            project, backend, max_steps=1,
+            initial_metadata={"test_failed": True, "repair_phase": "diagnose"},
+        ))
+
+        assert ctx.metadata.get("test_failed") is True
+        assert len(backend.system_prompts) >= 1
+        prompt = backend.system_prompts[0]
+        assert "[ReadCache]" in prompt, \
+            "test_failed 阶段指令应包含 [ReadCache] 说明"
+        assert "unchanged" in prompt.lower() or "未变化" in prompt, \
+            "应说明 [ReadCache] 表示文件未变化"
+
+    def test_no_readcache_note_when_not_test_failed(self, tmp_path: Path):
+        """test_failed=False 时，不应注入 [ReadCache] 说明（避免噪音）。"""
+        project = tmp_path / "flask_rc2"
+        _write_flask_project(project)
+
+        script: list[list[ToolCall] | None] = [None]
+        backend = _CaptureBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend, max_steps=1))
+
+        assert ctx.metadata.get("test_failed", False) is False
+        for prompt in backend.system_prompts:
+            assert "[ReadCache]" not in prompt, \
+                "非 test_failed 阶段不应注入 [ReadCache] 说明"
+
+
+class TestPytestStatsClassification:
+    """pytest_calls 只统计真实测试执行，不误计环境探测命令。
+
+    第九阶段修复：原逻辑用 "pytest" in cmd 判定，会把 where pytest、
+    pip install pytest、cat pytest.ini 等误计为测试执行。改用已有的
+    is_test_command() 后，只有段首为测试运行器的真实调用才被计数。
+    """
+
+    def test_where_pytest_not_counted_as_pytest_call(self, tmp_path: Path):
+        """where pytest 是环境探测，不应计入 pytest_calls。"""
+        project = tmp_path / "flask_pc1"
+        _write_flask_project(project)
+
+        script: list[list[ToolCall] | None] = [
+            [ToolCall(id="1", name="shell_exec",
+                      params={"command": "where pytest"})],
+            [ToolCall(id="2", name="shell_exec",
+                      params={"command": "python -m pytest -q"})],
+            None,
+        ]
+        backend = _ScriptedBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend, max_steps=3))
+
+        stats = ctx.metadata.get("swe_stats", {})
+        assert stats.get("pytest_calls", 0) == 1, \
+            f"where pytest 不应被计入，pytest_calls={stats.get('pytest_calls')}"
+
+    def test_real_pytest_command_counted(self, tmp_path: Path):
+        """python -m pytest 和完整路径解释器调用均应计入 pytest_calls。"""
+        project = tmp_path / "flask_pc2"
+        _write_flask_project(project)
+
+        script: list[list[ToolCall] | None] = [
+            [ToolCall(id="1", name="shell_exec",
+                      params={"command": "python -m pytest -q"})],
+            [ToolCall(id="2", name="shell_exec",
+                      params={"command": r"C:\venv\Scripts\python.exe -m pytest -q"})],
+            None,
+        ]
+        backend = _ScriptedBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend, max_steps=3))
+
+        stats = ctx.metadata.get("swe_stats", {})
+        assert stats.get("pytest_calls", 0) == 2, \
+            f"两次真实 pytest 调用均应计入，pytest_calls={stats.get('pytest_calls')}"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -510,15 +1212,13 @@ class TestNoFalseCompletionAfterEdit:
 
         # 脚本: pytest(失败) → read → edit → pytest(通过) → 完成
         script: list[list[ToolCall] | None] = [
-            [ToolCall(id="1", name="shell_exec",
-                      params={"command": "python -m pytest -q"})],
+            [_PYTEST],
             [ToolCall(id="2", name="read_file", params={"path": "app.py"})],
             [ToolCall(id="3", name="edit",
                       params={"path": "app.py", "mode": "regex_replace",
                               "old_text": r"def index\(\):",
                               "new_text": "@app.route('/')\ndef index():"})],
-            [ToolCall(id="4", name="shell_exec",
-                      params={"command": "python -m pytest -q"})],
+            [_PYTEST],
             None,
         ]
         backend = _ScriptedBackend(script)
@@ -552,16 +1252,16 @@ class TestFixDrivingStickyEscape:
         # step4 edit(唯一被允许的推进动作) → step5 pytest(全绿) → 完成
         script: list[list[ToolCall] | None] = [
             [ToolCall(id="1", name="shell_exec",
-                      params={"command": "python -m pytest -q"})],
+                      params={"command": f"{sys.executable} -m pytest -q"})],
             _diagnostic_reads(),
             [ToolCall(id="5", name="shell_exec",
-                      params={"command": "python -m pytest -q"})],
+                      params={"command": f"{sys.executable} -m pytest -q"})],
             [ToolCall(id="6", name="edit",
                       params={"path": "app.py", "mode": "regex_replace",
                               "old_text": r"def index\(\):",
                               "new_text": "@app.route('/')\ndef index():"})],
             [ToolCall(id="7", name="shell_exec",
-                      params={"command": "python -m pytest -q"})],
+                      params={"command": f"{sys.executable} -m pytest -q"})],
             None,
         ]
         backend = _ScriptedBackend(script)
@@ -585,7 +1285,6 @@ class TestFixDrivingStickyEscape:
 
         # 4) 真实 pytest 全绿
         import subprocess
-        import sys
         r = subprocess.run([sys.executable, "-m", "pytest", "-q"],
                            cwd=str(project), capture_output=True, text=True,
                            timeout=60, encoding="utf-8", errors="replace")
@@ -632,7 +1331,7 @@ def test_greeting_returns_200(client):
 '''
 
 _PYTEST = ToolCall(id="p", name="shell_exec",
-                   params={"command": "python -m pytest -q"})
+                   params={"command": f"{sys.executable} -m pytest -q"})
 
 # 只给 index 补路由（greet 仍然 404）→ 第二次重测必然产生**新的**失败
 _FIX_INDEX_ROUTE = ToolCall(
@@ -768,7 +1467,7 @@ class TestFailureAnalysisTruncation:
 
         script: list[list[ToolCall] | None] = [
             [ToolCall(id="p", name="shell_exec",
-                      params={"command": "python -m pytest -q -s"})],
+                      params={"command": f"{sys.executable} -m pytest -q -s"})],
             None,
         ]
         backend = _ScriptedBackend(script)
@@ -964,8 +1663,7 @@ class TestAutoVerifyEvidenceScope:
         script: list[list[ToolCall] | None] = [
             [_PYTEST],
             [_FIX_INDEX],
-            [ToolCall(id="p2", name="shell_exec",
-                      params={"command": "python -m pytest -q"})],
+            [_PYTEST],
             None,
         ]
         backend = _ScriptedBackend(script)
@@ -973,3 +1671,46 @@ class TestAutoVerifyEvidenceScope:
 
         assert action.type == "complete", \
             f"改后全绿应可完成, 实际 {action.type}: {action.error or action.output}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 常驻失败证据的生命周期（真实运行，非纯函数）
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestFailureEvidenceLifecycle:
+    def test_failing_run_records_evidence(self, tmp_path: Path):
+        """真实失败运行：结构化证据落进 metadata，并进入每步的常驻块。"""
+        project = tmp_path / "flask_evidence_fail"
+        _write_flask_project(project)
+
+        script: list[list[ToolCall] | None] = [[_PYTEST], None]
+        backend = _ScriptedBackend(script)
+        ctx, _action = asyncio.run(_run_agent(project, backend, max_steps=4))
+
+        issue = ctx.metadata.get("last_failure_issue")
+        assert issue is not None, "测试失败后应记录结构化失败证据"
+        assert issue.test_name, "证据必须含测试名"
+        assert issue.file, "证据必须含根因/断言位置"
+
+        assert "FAILURE EVIDENCE" in _build_fix_state_directive(ctx), \
+            "常驻证据块必须出现在后续每步的 system prompt 里"
+
+    def test_full_green_clears_evidence(self, tmp_path: Path):
+        """全绿后旧证据必须清除，避免围绕已修复的根因继续调查。"""
+        project = tmp_path / "flask_evidence_green"
+        _write_flask_project(project)
+
+        script: list[list[ToolCall] | None] = [
+            [_PYTEST],
+            [_FIX_INDEX],
+            [_PYTEST],
+            None,
+        ]
+        backend = _ScriptedBackend(script)
+        ctx, action = asyncio.run(_run_agent(project, backend, max_steps=8))
+
+        assert action.type == "complete", \
+            f"改后全绿应可完成, 实际 {action.type}: {action.error or action.output}"
+        assert ctx.metadata.get("test_success_count", 0) >= 1, "前提：确实走到全绿"
+        assert ctx.metadata.get("last_failure_issue") is None, "全绿后不得残留失败证据"

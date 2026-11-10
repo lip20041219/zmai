@@ -479,7 +479,7 @@ def run_auth(argv: list[str]) -> None:
     except CredentialError as e:
         print_error(str(e))
         sys.exit(1)
-    theme = Theme.dark()
+    theme = Theme.crt()
 
     if not argv:
         _run_auth_status()
@@ -568,7 +568,7 @@ def run_auth(argv: list[str]) -> None:
         from zmai.gateway.plugin import PluginRegistry
 
         reg = PluginRegistry()
-        theme = Theme.dark()
+        theme = Theme.crt()
         found = False
 
         for plugin in reg.list_plugins():

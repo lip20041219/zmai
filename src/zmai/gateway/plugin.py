@@ -358,6 +358,8 @@ class PluginRegistry(BackendRegistry):
             "max_tokens": plugin.default_max_tokens,
             "temperature": plugin.default_temperature,
         }
+        if plugin.name == "deepseek":
+            cfg.update(thinking={"type": "enabled"}, reasoning_effort="high")
 
         # 使用统一的 CredentialResolver 读取最终凭据
         from zmai.auth.resolver import CredentialResolver
@@ -369,6 +371,18 @@ class PluginRegistry(BackendRegistry):
             cfg["timeout"] = status.timeout or cfg["timeout"]
             cfg["max_tokens"] = status.max_tokens or cfg["max_tokens"]
             cfg["temperature"] = status.temperature or cfg["temperature"]
+
+        # An explicit Runtime model selection must reach the backend request.
+        # CredentialResolver cannot see Config(sources=[]).set(...) overrides.
+        if self._config is not None:
+            selected_model = self._config.get(f"backends.{plugin.name}.model")
+            if selected_model:
+                cfg["model"] = selected_model
+            if plugin.name == "deepseek":
+                for field in ("thinking", "reasoning_effort"):
+                    value = self._config.get(f"backends.deepseek.{field}")
+                    if value is not None:
+                        cfg[field] = value
 
         cfg["backend"] = plugin.name
 

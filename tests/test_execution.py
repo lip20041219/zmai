@@ -135,6 +135,22 @@ class TestExecutionLogBasic:
         data = json.loads(log_path.read_text(encoding="utf-8"))
         assert data["agent_id"] == "test_agent"
         assert data["step_count"] == 1
+        assert not log_path.with_name(log_path.name + ".tmp").exists()
+
+    def test_persist_replace_failure_preserves_previous_log(self, tmp_path: Path, monkeypatch):
+        log = _make_log()
+        path = tmp_path / "execution_log.json"
+        log.record_step(phase="init", action="start")
+        assert log.persist(path)
+        previous = path.read_bytes()
+        log.record_step(phase="tool_result", action="shell_exec")
+
+        def fail_replace(*args):
+            raise OSError("simulated interruption")
+
+        monkeypatch.setattr("zmai.execution.log.os.replace", fail_replace)
+        assert not log.persist(path)
+        assert path.read_bytes() == previous
 
     def test_persist_readonly_dir(self):
         """写入不可写路径不应异常。"""

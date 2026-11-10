@@ -26,6 +26,7 @@ shell 调用内部完成"改写验收文件 → 跑 pytest → 还原原内容"�
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -38,6 +39,10 @@ _MANIFEST_NAME = "manifest.json"
 
 #: 运行凭据：本会话确实加载过守卫的证明（与 guard 模块同目录）。
 _RECEIPT_NAME = "receipt"
+
+#: scope 配置快照：pytest 启动瞬间四份配置的原文（base64）。
+#: Runtime 事后用与 run 起始基线相同的算法重算身份，覆盖 A→B→A 的瞬时改配置。
+_SCOPE_SNAPSHOT_NAME = "scope_snapshot.json"
 
 
 def _manifest_path() -> str:
@@ -99,8 +104,34 @@ def _stamp_receipt() -> None:
         pass
 
 
+def _snapshot_scope() -> None:
+    """把 pytest 启动瞬间的 scope 配置原文写进守卫目录。
+
+    A→B→A（改配置 → 跑 pytest → 还原）的端状态与起始相同，Runtime 侧事后
+    比对看不到中间态。守卫在这里只负责取证（原样保存字节），不解析 TOML——
+    解析由 Runtime 用**同一个**解析器完成，避免被测解释器与 Agent 解释器的
+    能力差异造成误判。
+    """
+    try:
+        m = _load_manifest()
+        root = m.get("root") or "."
+        files: dict[str, str | None] = {}
+        for name in m.get("scope_files") or []:
+            try:
+                with open(os.path.join(root, name), "rb") as f:
+                    files[name] = base64.b64encode(f.read()).decode("ascii")
+            except OSError:
+                files[name] = None
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               _SCOPE_SNAPSHOT_NAME), "w", encoding="utf-8") as f:
+            json.dump({"files": files}, f)
+    except Exception:
+        pass
+
+
 def pytest_configure(config):  # noqa: ARG001  —— pytest 钩子签名
     """会话启动（任何测试被收集/导入之前）：验收文件必须 == run 起始内容。"""
+    _snapshot_scope()
     _stamp_receipt()
     try:
         deviated = _deviated()

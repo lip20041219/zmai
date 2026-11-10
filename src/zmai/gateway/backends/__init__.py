@@ -37,7 +37,7 @@ BACKEND_METADATA: dict[str, dict] = {
     },
     "deepseek": {
         "label": "DeepSeek",
-        "default_model": "deepseek-v4-flash",
+        "default_model": "deepseek-flash",
         "env_api_key": "DEEPSEEK_API_KEY",
         "env_model": "DEEPSEEK_MODEL",
         "module": "zmai.gateway.backends.deepseek",
@@ -74,7 +74,9 @@ BACKEND_DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "temperature": 0.7,
     },
     "deepseek": {
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-flash",
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "high",
         "base_url": "https://api.deepseek.com/v1",
         "timeout": 120,
         "max_tokens": 4096,

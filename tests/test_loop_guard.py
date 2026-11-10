@@ -243,14 +243,58 @@ class TestNoProgressDetection:
 
     def test_no_modifications_triggers_block(self):
         guard = LoopGuard(threshold=5)
-        # 使用不同读操作（避免命中 identical_calls 或 identical_failures）
-        files = ["main.py", "utils.py", "config.py", "test.py", "app.py"]
+        # 5 步无修改，且**确实在重复**（main.py 读了两次）：这是真正的空转。
+        files = ["main.py", "utils.py", "config.py", "test.py", "main.py"]
         for f in files:
             _ok_call(guard, "read_file", f)
             guard.record_no_modification()
         result = guard.check()
         assert result.blocked
         assert result.reason == "no_progress"
+
+    def test_first_pass_investigation_is_not_no_progress(self):
+        """首次通读一批**新**文件不得被判成 no_progress。
+
+        实测（benchmarks/results/swebench_lite）：7 个真实 run 中 6 个的首次
+        LoopGuard 触发时，全历史精确重复调用数为 0 —— pylint-5859 在第 7 次调用
+        （grep ×3 + git log + read_file ×3，全部是新目标）就被判 no_progress，
+        运行时随即注入"检测到重复的无进展动作 / 不要重复上述任何 read/shell"。
+        """
+        guard = LoopGuard(threshold=5)
+        files = ["main.py", "utils.py", "config.py", "test.py", "app.py"]
+        for f in files:
+            _ok_call(guard, "read_file", f)
+            guard.record_no_modification()
+        result = guard.check()
+        assert not result.blocked, (
+            "5 步读了 5 个互不相同的新文件，没有任何重复证据，不得判 no_progress"
+        )
+
+    def test_repeat_after_investigation_still_blocked(self):
+        """先读新文件、随后开始重复时，no_progress 仍必须触发。"""
+        guard = LoopGuard(threshold=5)
+        for f in ["main.py", "utils.py", "config.py"]:
+            _ok_call(guard, "read_file", f)
+            guard.record_no_modification()
+        assert not guard.check().blocked
+        for _ in range(2):  # 第 4、5 步开始重复 utils.py
+            _ok_call(guard, "read_file", "utils.py")
+            guard.record_no_modification()
+        result = guard.check()
+        assert result.blocked
+        assert result.reason == "no_progress"
+
+    def test_modification_resets_duplicate_evidence(self):
+        """改动过代码后，新一轮调查的重复证据从零开始计。"""
+        guard = LoopGuard(threshold=5)
+        for _ in range(3):
+            _ok_call(guard, "read_file", "main.py")
+            guard.record_no_modification()
+        _write_call(guard)  # 真实进展 → 本轮停滞的重复证据清零
+        for f in ["a.py", "b.py", "c.py", "d.py", "e.py"]:
+            _ok_call(guard, "read_file", f)
+            guard.record_no_modification()
+        assert not guard.check().blocked
 
     def test_write_breaks_no_progress(self):
         guard = LoopGuard(threshold=5)
@@ -706,3 +750,200 @@ class TestSWEAgentLoopGuardIntegration:
             assert not guard.is_stuck
 
         asyncio.run(run())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 测试: 创建临时文件不算修复进展
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _write_temp_call(guard: LoopGuard, path: str = "_dbg_plugin.py") -> None:
+    """模拟创建临时调试文件：write_file 成功但 ws_changed=False（仅新增文件）。"""
+    guard.record_tool_call(
+        name="write_file",
+        params={"path": path, "content": "debug code"},
+        success=True,
+        output="written",
+        error=None,
+        ws_changed=False,
+    )
+
+
+def _write_existing_call(guard: LoopGuard, path: str = "app.py") -> None:
+    """模拟修改已有源码文件：write_file 成功且 ws_changed=True。"""
+    guard.record_tool_call(
+        name="write_file",
+        params={"path": path, "content": "fixed code"},
+        success=True,
+        output="written",
+        error=None,
+        ws_changed=True,
+    )
+
+
+class TestTempFileNotProgress:
+    """创建临时调试插件等新文件不应被当成修复进展。
+
+    根因：write_file 成功曾无条件触发 _record_modification()，导致创建
+    _dbg_plugin.py 等临时文件也会重置 no_progress 计数、清除 force_edit。
+    修复：ws_changed=False 时覆盖工具名判断，不记录进展。
+    """
+
+    def test_temp_file_write_does_not_reset_no_progress(self):
+        """创建临时文件（ws_changed=False）不应重置 no_progress 计数。"""
+        guard = LoopGuard(threshold=5)
+        # 先累积 3 步无修改
+        for _ in range(3):
+            _ok_call(guard, "read_file", "app.py")
+            guard.record_no_modification()
+        # 创建临时文件：不应重置计数
+        _write_temp_call(guard)
+        guard.record_no_modification()  # 这一步仍算无修改
+        # 再累积 1 步达到阈值
+        _ok_call(guard, "read_file", "app.py")
+        guard.record_no_modification()
+        result = guard.check()
+        assert result.blocked
+        assert result.reason == "no_progress"
+
+    def test_existing_file_write_resets_no_progress(self):
+        """修改已有源码（ws_changed=True）应正常重置 no_progress 计数。"""
+        guard = LoopGuard(threshold=5)
+        for _ in range(4):
+            _ok_call(guard, "read_file", "app.py")
+            guard.record_no_modification()
+        # 修改已有文件：重置计数
+        _write_existing_call(guard)
+        # 不需要 record_no_modification
+        result = guard.check()
+        assert not result.blocked
+
+    def test_consecutive_temp_files_trigger_no_progress(self):
+        """连续创建临时文件应触发 no_progress 阻塞（不算进展）。"""
+        guard = LoopGuard(threshold=5)
+        for i in range(5):
+            _write_temp_call(guard, path=f"_dbg_plugin_{i}.py")
+            guard.record_no_modification()
+        result = guard.check()
+        assert result.blocked
+        assert result.reason == "no_progress"
+
+    def test_temp_file_then_real_edit_still_progress(self):
+        """先创建临时文件，再修改已有源码：真实修改应重置计数。"""
+        guard = LoopGuard(threshold=5)
+        for _ in range(3):
+            _write_temp_call(guard)
+            guard.record_no_modification()
+        # 真实修改：重置计数
+        _write_existing_call(guard)
+        # 再读 4 步也不会阻塞（因为计数已重置）
+        for _ in range(4):
+            _ok_call(guard, "read_file", "app.py")
+            guard.record_no_modification()
+        assert not guard.check().blocked
+
+    def test_edit_tool_with_ws_changed_false_not_progress(self):
+        """edit 成功但 ws_changed=False（理论上不应发生，但防御性测试）。"""
+        guard = LoopGuard(threshold=5)
+        for _ in range(4):
+            _ok_call(guard, "read_file", "app.py")
+            guard.record_no_modification()
+        # edit 成功但 ws_changed=False：不应重置
+        guard.record_tool_call(
+            name="edit",
+            params={"path": "app.py", "old": "x", "new": "y"},
+            success=True,
+            output="replaced",
+            error=None,
+            ws_changed=False,
+        )
+        guard.record_no_modification()
+        result = guard.check()
+        assert result.blocked
+        assert result.reason == "no_progress"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 测试: soft_reset 衰减式重置
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestSoftReset:
+    """LoopGuard 拦截后用 soft_reset 替代 reset，保留 no_progress 历史压力。
+
+    根因：每次拦截后 guard.reset() 无条件清零所有计数器，模型每 N 步
+    获得一次完整免费预算，形成"每 5 步拦一次"的固定点。
+    修复：soft_reset 清零瞬时模式计数器，但 no_progress 只减去 threshold-2，
+    使连续拦截的间隔逐步缩短。真实修改仍会完全清零。
+    """
+
+    def test_soft_reset_preserves_no_progress_pressure(self):
+        """soft_reset 后 no_progress 计数应保留部分历史，不全清零。"""
+        guard = LoopGuard(threshold=5)
+        # 累积到阈值（5）
+        for _ in range(5):
+            _ok_call(guard, "read_file", "a.py")
+            guard.record_no_modification()
+        assert guard.check().blocked
+        # soft_reset：no_progress 应保留 5 - (5-2) = 2
+        guard.soft_reset()
+        status = guard.get_status()
+        assert status["steps_without_change"] == 2
+        # 再累积 3 步（2+3=5）应再次阻塞，而不是需要 5 步
+        for _ in range(3):
+            _ok_call(guard, "read_file", "b.py")
+            guard.record_no_modification()
+        assert guard.check().blocked
+
+    def test_soft_reset_clears_transient_counters(self):
+        """soft_reset 应清零 identical_calls 和 identical_failures。"""
+        guard = LoopGuard(threshold=5)
+        # 累积 identical_calls
+        for _ in range(3):
+            _ok_call(guard, "read_file", "same.py")
+        # 累积 identical_failures
+        for _ in range(3):
+            _call(guard, "shell_exec", "cmd", success=False, error="fail")
+        guard.soft_reset()
+        status = guard.get_status()
+        assert status["consecutive_identical"] == 0
+        assert status["consecutive_failures"] == 0
+
+    def test_real_modification_clears_no_progress_after_soft_reset(self):
+        """soft_reset 后真实修改应完全清零 no_progress（不误拦截）。"""
+        guard = LoopGuard(threshold=5)
+        for _ in range(5):
+            _ok_call(guard, "read_file", "a.py")
+            guard.record_no_modification()
+        guard.soft_reset()  # 保留 2 步压力
+        # 真实修改：完全清零
+        _write_existing_call(guard)
+        status = guard.get_status()
+        assert status["steps_without_change"] == 0
+        # 再读 4 步也不会阻塞
+        for _ in range(4):
+            _ok_call(guard, "read_file", "b.py")
+            guard.record_no_modification()
+        assert not guard.check().blocked
+
+    def test_soft_reset_with_low_count_not_negative(self):
+        """no_progress 计数低于 threshold-2 时，soft_reset 后不应为负数。"""
+        guard = LoopGuard(threshold=5)
+        for _ in range(2):
+            _ok_call(guard, "read_file", "a.py")
+            guard.record_no_modification()
+        guard.soft_reset()
+        status = guard.get_status()
+        assert status["steps_without_change"] == 0  # 2 - 3 = max(0, -1) = 0
+
+    def test_reset_still_full_clear(self):
+        """原有 reset() 方法应保持完全清零行为（FixDriving 触发时使用）。"""
+        guard = LoopGuard(threshold=5)
+        for _ in range(5):
+            _ok_call(guard, "read_file", "a.py")
+            guard.record_no_modification()
+        guard.reset()
+        status = guard.get_status()
+        assert status["steps_without_change"] == 0
+        assert status["consecutive_identical"] == 0
+        assert status["consecutive_failures"] == 0

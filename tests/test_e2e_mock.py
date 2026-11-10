@@ -83,10 +83,11 @@ class TestSWEAgentMockConversation:
                 tools=registry,
             )
             await agent.initialize(ctx)
-            assert len(registry.list()) == 8
+            assert len(registry.list()) == 9
             names = [t.name for t in registry.list()]
             assert "shell_exec" in names
             assert "read_file" in names
+            assert "find_file" in names
             return agent, registry, ctx
 
         agent, registry, ctx = asyncio.run(run())
@@ -151,7 +152,7 @@ class TestSWEAgentMockConversation:
             ))
             names = {t.name for t in registry.list()}
             names = {t.name for t in registry.list()}
-            assert names == {"read_file", "write_file", "edit", "grep", "shell_exec", "git", "show_to_user", "open_in_browser"}  # noqa: E501
+            assert names == {"read_file", "write_file", "edit", "grep", "find_file", "shell_exec", "git", "show_to_user", "open_in_browser"}  # noqa: E501
 
             result = await agent.finalize(AgentContext(
                 agent_id="swe_test_3", task="test", tools=registry,

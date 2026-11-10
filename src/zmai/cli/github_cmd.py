@@ -17,7 +17,7 @@ from zmai.cli.formatters import Theme, print_error, print_info, print_success
 
 
 def _get_theme() -> Theme:
-    return Theme.dark()
+    return Theme.crt()
 
 
 # ═══════════════════════════════════════════════════════════════

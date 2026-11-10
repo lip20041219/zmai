@@ -11,7 +11,14 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+import time
 from typing import Any
+
+
+def remaining_wall_seconds(config: dict[str, Any]) -> float | None:
+    """Seconds left on the task's monotonic work deadline, if configured."""
+    deadline = config.get("_wall_deadline_monotonic")
+    return None if deadline is None else max(0.0, float(deadline) - time.monotonic())
 
 
 @dataclass(frozen=True)
@@ -25,9 +32,14 @@ class ToolContext:
         timeout: 执行超时（秒），默认 120。
         env: 环境变量字典。
         logger: 日志记录器。
-        read_visible: 上下文可见性探针（可选）。工具用它询问"我上次产出的那份内容
-            是否仍逐字位于模型可见的窗口"。未注入（None）时调用方必须按**不可见**
-            处理（fail-closed），不得据此认为内容仍然可见。
+        read_state: 上下文交付状态探针（可选）。工具用它询问"我上次产出的那份内容
+            现在是什么状态"。返回三种 string 之一：
+
+            "absent"    不在模型可见窗口中（含探针未注入、不可调用、抛错、
+                        key 为空 —— 一律 fail-closed，不得据此认为内容可见）；
+            "complete"  仍在窗口中，且**逐字完整**；
+            "truncated" 仍在窗口中，但注入时被截断，中段/尾部已省略 —— 模型手上
+                        不是完整内容，重复读取同一 read_key 也不会补齐。
     """
 
     agent_id: str
@@ -37,8 +49,8 @@ class ToolContext:
     timeout: int = 120
     env: dict[str, str] = field(default_factory=dict)
     logger: logging.Logger | None = None
-    # P1-1: 上下文可见性探针。默认 None —— 不注入时行为与改造前一致且 fail-closed。
-    read_visible: Callable[[Any], bool] | None = None
+    # P1-1/P1-2: 上下文交付状态探针。默认 None —— 不注入时行为与改造前一致且 fail-closed。
+    read_state: Callable[[Any], str] | None = None
 
 
 @dataclass
@@ -143,6 +155,16 @@ class Tool(ABC):
             工具执行结果。
         """
         ...
+
+    def timeout_for(self, context: ToolContext, params: dict[str, Any]) -> int | None:
+        """该次调用需要的专用超时预算（秒）；None = 沿用调用方（ToolContext）的预算。
+
+        `ToolRegistry.execute` 取 `max(context.timeout, self.timeout_for(...))` 作为
+        外层守护线程超时。子类**只在自身预算本就长于调用方超时**时才覆盖本方法 ——
+        例如 shell 的完整测试套件（`TEST_COMMAND_TIMEOUT`）。不覆盖 = 超时行为与
+        引入本方法前完全一致。
+        """
+        return None
 
     def validate(self, params: dict[str, Any]) -> bool:
         """校验参数是否符合 JSON Schema。

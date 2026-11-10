@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import asyncio
 
-from zmai.swe.agent import _BASE_SYSTEM_PROMPT, _build_system_prompt
+from zmai.swe.agent import (
+    _BASE_SYSTEM_PROMPT,
+    _build_platform_prompt,
+    _build_system_prompt,
+)
 
 # ═══════════════════════════════════════════════════════════════════
 # 测试: 系统提示包含 5 阶段工作流
@@ -70,6 +74,75 @@ class TestWorkflowInSystemPrompt:
         assert "Phase 1" in prompt
         assert "Phase 2" in prompt
         assert "Phase 5" in prompt
+
+    def test_prompt_prohibits_debug_plugins_for_reading_source(self):
+        """系统提示应明确禁止通过创建 pytest 插件/转储文件来读取源码。"""
+        assert "DO NOT create debug plugins" in _BASE_SYSTEM_PROMPT
+        assert "conftest.py" in _BASE_SYSTEM_PROMPT
+        assert "dump scripts" in _BASE_SYSTEM_PROMPT
+        # 应引导使用 read_file
+        assert "read_file" in _BASE_SYSTEM_PROMPT
+
+    def test_prompt_handles_testguard_rejection(self):
+        """系统提示应包含 TestGuard 拒绝后切换工具的规则。"""
+        assert "TestGuard" in _BASE_SYSTEM_PROMPT
+        assert "declared exclusion" in _BASE_SYSTEM_PROMPT
+        assert "do NOT retry" in _BASE_SYSTEM_PROMPT.lower() or "do not retry" in _BASE_SYSTEM_PROMPT.lower()
+
+    def test_prompt_requires_evidence_for_rerunning_tests(self):
+        """系统提示应要求重复测试有充分理由（代码修改/结果变化/新证据）。"""
+        assert "Do NOT re-run the same test command" in _BASE_SYSTEM_PROMPT
+        assert "modified code" in _BASE_SYSTEM_PROMPT
+        assert "new diagnostic evidence" in _BASE_SYSTEM_PROMPT
+
+    def test_prompt_analyze_failure_assertion_values(self):
+        """系统提示应要求测试失败后分析断言、实际值和预期值。"""
+        assert "assertion" in _BASE_SYSTEM_PROMPT.lower()
+        assert "actual value" in _BASE_SYSTEM_PROMPT.lower()
+        assert "expected value" in _BASE_SYSTEM_PROMPT.lower()
+
+    def test_prompt_mentions_pytest_tb_options(self):
+        """系统提示应提及 pytest 内置输出选项作为替代方案。"""
+        assert "--tb=short" in _BASE_SYSTEM_PROMPT
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 测试: Windows 平台命令兼容提示
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestWindowsPlatformPrompt:
+    """_build_platform_prompt() 在 Windows 下应包含正确的命令兼容说明。"""
+
+    def test_windows_prompt_includes_tail_alternative(self):
+        """Windows 平台提示应包含 tail 的替代说明。"""
+        prompt = _build_platform_prompt()
+        assert "tail" in prompt.lower()
+        # 应引导使用 read_file 或 pytest --tb=short
+        assert "read_file" in prompt or "--tb=short" in prompt
+
+    def test_windows_prompt_warns_against_tail_head(self):
+        """Windows 平台提示应明确警告不要使用 tail/head。"""
+        prompt = _build_platform_prompt()
+        assert "Do NOT use `tail`" in prompt or "do not use tail" in prompt.lower()
+        assert "head" in prompt.lower()
+
+    def test_windows_prompt_warns_about_pipe_exit_code(self):
+        """Windows 平台提示应警告管道会掩盖 pytest 的真实退出码。"""
+        prompt = _build_platform_prompt()
+        assert "exit code" in prompt.lower()
+        assert "more" in prompt.lower() or "findstr" in prompt.lower()
+        # 应建议裸跑 pytest
+        assert "python -m pytest" in prompt
+
+    def test_windows_prompt_still_has_existing_mappings(self):
+        """新增内容不应破坏已有的命令映射。"""
+        prompt = _build_platform_prompt()
+        assert "ls" in prompt
+        assert "dir" in prompt
+        assert "cat" in prompt
+        assert "grep" in prompt
+        assert "Current OS: Windows" in prompt
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -541,3 +614,194 @@ class TestEdgeCases:
         # default read_limit from config.get fallback
         default = 8
         assert default == 8
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 测试: 环境错误提示（_env_error_hint）
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestEnvErrorHint:
+    """pytest 缺失等环境错误应返回可操作建议，避免 Agent 盲目探测。"""
+
+    def test_no_module_pytest_returns_hint(self):
+        """"No module named pytest" 应触发环境建议。"""
+        from zmai.swe.tools import _env_error_hint
+        output = "C:\\python\\python.exe: No module named pytest\n"
+        hint = _env_error_hint(output)
+        assert "[env]" in hint
+        assert "pytest" in hint
+        assert "where pytest" in hint
+        assert ".venv" in hint
+
+    def test_normal_test_failure_no_hint(self):
+        """正常测试失败（AssertionError）不应触发环境建议。"""
+        from zmai.swe.tools import _env_error_hint
+        output = "AssertionError: assert 60.0 == 58.8\n3 failed, 66 passed"
+        hint = _env_error_hint(output)
+        assert hint == ""
+
+    def test_empty_output_no_hint(self):
+        """空输出不应触发环境建议。"""
+        from zmai.swe.tools import _env_error_hint
+        assert _env_error_hint("") == ""
+
+    def test_other_import_error_no_hint(self):
+        """其他模块缺失（非 pytest）不应触发 pytest 专用建议。"""
+        from zmai.swe.tools import _env_error_hint
+        output = "ModuleNotFoundError: No module named requests"
+        hint = _env_error_hint(output)
+        assert hint == ""
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 测试: 系统提示词包含环境错误处理规则
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestEnvErrorRuleInPrompt:
+    """规则 14：环境错误不是 Bug，应引导 Agent 找到正确解释器。"""
+
+    def test_rule_14_present(self):
+        """系统提示词应包含环境错误处理规则。"""
+        assert "ENVIRONMENT ERRORS ARE NOT BUGS" in _BASE_SYSTEM_PROMPT
+        assert "No module named pytest" in _BASE_SYSTEM_PROMPT
+        assert "where pytest" in _BASE_SYSTEM_PROMPT
+
+    def test_rule_14_no_auto_install(self):
+        """规则应明确禁止自动安装 pytest。"""
+        assert "Do NOT auto-install pytest" in _BASE_SYSTEM_PROMPT
+
+    def test_rule_14_no_repeat_failed_command(self):
+        """规则应明确禁止反复执行已知失败的命令。"""
+        assert "Do NOT repeatedly run" in _BASE_SYSTEM_PROMPT
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 测试: 退化响应判定（_degenerate_response_reason）
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestDegenerateResponseReason:
+    """截断响应和空响应的判定逻辑。"""
+
+    def test_truncated_length_no_tool_calls(self):
+        """stop_reason=length 且无 tool_calls 应判定为截断。"""
+        from zmai.swe.agent import _degenerate_response_reason
+        from zmai.gateway.base import BackendResponse, TokenUsage
+        resp = BackendResponse(
+            content="some long text that got cut off",
+            tool_calls=[],
+            stop_reason="length",
+            usage=TokenUsage(input_tokens=100, output_tokens=4096),
+        )
+        reason = _degenerate_response_reason(resp)
+        assert reason is not None
+        assert "truncated" in reason
+        assert "length" in reason
+
+    def test_truncated_max_tokens_no_tool_calls(self):
+        """stop_reason=max_tokens 且无 tool_calls 应判定为截断。"""
+        from zmai.swe.agent import _degenerate_response_reason
+        from zmai.gateway.base import BackendResponse, TokenUsage
+        resp = BackendResponse(
+            content="text",
+            tool_calls=[],
+            stop_reason="max_tokens",
+            usage=TokenUsage(input_tokens=100, output_tokens=4096),
+        )
+        reason = _degenerate_response_reason(resp)
+        assert reason is not None
+        assert "truncated" in reason
+
+    def test_truncated_with_tool_calls_is_normal(self):
+        """带 tool_calls 的截断响应不判定为退化（按设计重试确定性截断无意义）。"""
+        from zmai.swe.agent import _degenerate_response_reason
+        from zmai.gateway.base import BackendResponse, TokenUsage, ToolCall
+        resp = BackendResponse(
+            content="",
+            tool_calls=[ToolCall(id="t1", name="edit", params={"path": "a.py"})],
+            stop_reason="length",
+            usage=TokenUsage(input_tokens=100, output_tokens=4096),
+        )
+        assert _degenerate_response_reason(resp) is None
+
+    def test_empty_response_is_degenerate(self):
+        """content 和 tool_calls 同时为空应判定为空响应。"""
+        from zmai.swe.agent import _degenerate_response_reason
+        from zmai.gateway.base import BackendResponse, TokenUsage
+        resp = BackendResponse(
+            content="",
+            tool_calls=[],
+            stop_reason="stop",
+            usage=TokenUsage(input_tokens=100, output_tokens=0),
+        )
+        reason = _degenerate_response_reason(resp)
+        assert reason is not None
+        assert "empty" in reason
+
+    def test_normal_content_is_not_degenerate(self):
+        """有 content 的正常响应不判定为退化。"""
+        from zmai.swe.agent import _degenerate_response_reason
+        from zmai.gateway.base import BackendResponse, TokenUsage
+        resp = BackendResponse(
+            content="done",
+            tool_calls=[],
+            stop_reason="stop",
+            usage=TokenUsage(input_tokens=100, output_tokens=5),
+        )
+        assert _degenerate_response_reason(resp) is None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 测试: 最后一次有效测试命令注入
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestLastWorkingTestCmdInjection:
+    """FixDriving 阶段应注入最后一次有效 pytest 命令，避免忘记解释器路径。"""
+
+    def test_directive_includes_last_working_cmd(self):
+        """修复状态提示应包含 last_working_test_cmd。"""
+        from zmai.agent import AgentContext
+        from zmai.swe.agent import _build_fix_state_directive
+        ctx = AgentContext(
+            agent_id="test", task="fix", tools=None,
+            metadata={
+                "repair_phase": "fix",
+                "test_failed": True,
+                "reads_after_fail": 2,
+                "last_working_test_cmd": r"D:\anaconada\python.exe -m pytest -q",
+            },
+        )
+        directive = _build_fix_state_directive(ctx)
+        assert "Last working pytest command" in directive
+        assert r"D:\anaconada\python.exe -m pytest -q" in directive
+
+    def test_directive_no_cmd_when_not_set(self):
+        """未设置 last_working_test_cmd 时不应包含相关行。"""
+        from zmai.agent import AgentContext
+        from zmai.swe.agent import _build_fix_state_directive
+        ctx = AgentContext(
+            agent_id="test", task="fix", tools=None,
+            metadata={
+                "repair_phase": "fix",
+                "test_failed": True,
+                "reads_after_fail": 1,
+            },
+        )
+        directive = _build_fix_state_directive(ctx)
+        assert "Last working pytest command" not in directive
+
+    def test_directive_empty_when_idle(self):
+        """idle 阶段不注入修复状态提示。"""
+        from zmai.agent import AgentContext
+        from zmai.swe.agent import _build_fix_state_directive
+        ctx = AgentContext(
+            agent_id="test", task="fix", tools=None,
+            metadata={
+                "repair_phase": "idle",
+                "last_working_test_cmd": "python -m pytest -q",
+            },
+        )
+        assert _build_fix_state_directive(ctx) == ""

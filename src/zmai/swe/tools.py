@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -16,11 +17,13 @@ from pathlib import Path
 from typing import Any
 
 from zmai.swe.verifier import (
+    parse_pytest_failure_ids,
     parse_test_totals,
     validate_python_syntax,
     verify_test_output,
 )
 from zmai.tool import Tool, ToolContext, ToolResult
+from zmai.tool.base import remaining_wall_seconds
 
 logger = logging.getLogger("zmai.swe.tools")
 
@@ -33,23 +36,37 @@ _DEFAULT_MAX_WRITE_SIZE = 50 * 1024 * 1024
 def _emit_tool_result(tool_name: str, context: ToolContext,
                        params: dict[str, Any], result: ToolResult,
                        start_time: float) -> None:
-    """输出结构化工具执行日志到 stderr。doctor 模式下不输出。"""
+    """CRT 风格工具执行日志到 stderr：单行调用 + 单行结果。
+
+    不依赖 cli.formatters（避免 swe→cli 反向依赖），直接写 ANSI 蓝；
+    非 TTY 时自动退化为纯文本。doctor/_quiet 模式不输出。
+    """
     if context.config.get("_quiet"):
         return
     elapsed = time.time() - start_time
-    status = "SUCCESS" if result.success else "FAIL"
-    log_lines = [
-        f"[{tool_name}]",
-        f"  Target:   {params.get('path') or params.get('command') or params.get('args') or params.get('pattern', '')}",  # noqa: E501
-        f"  Workspace: {context.workspace_path}",
-        f"  Project:  {context.project_path or '(same as workspace)'}",
-        f"  Result:   {status} ({elapsed:.2f}s)",
+    target = params.get("path") or params.get("command") or params.get("args") or params.get("pattern", "")  # noqa: E501
+    target = str(target).replace("\r", " ").replace("\n", " ")[:90]
+
+    tty = sys.stderr.isatty()
+    if tty:
+        BLUE, ICE, DIM, RESET = "\033[94m", "\033[96m", "\033[2m", "\033[0m"
+        FAIL = "\033[97;44m"
+    else:
+        BLUE = ICE = DIM = FAIL = RESET = ""
+
+    tag = " ok " if result.success else "FAIL"
+    tag_color = ICE if result.success else FAIL
+    lines = [
+        f"{BLUE}  >{RESET} {ICE}{tool_name}{RESET} {DIM}{target}{RESET}",
+        f"    {tag_color}{tag}{RESET} {DIM}{elapsed:.2f}s{RESET}",
     ]
     if result.error:
-        log_lines.append(f"  Reason:   {result.error}")
+        reason = str(result.error).replace("\r", " ").replace("\n", " ")[:140]
+        lines.append(f"    {DIM}{reason}{RESET}")
     if result.output and len(result.output) < 200:
-        log_lines.append(f"  Output:   {result.output[:200]}")
-    sys.stderr.write("\n".join(log_lines) + "\n")
+        out = str(result.output).replace("\r", " ").replace("\n", " ")[:140]
+        lines.append(f"    {DIM}{out}{RESET}")
+    sys.stderr.write("\n".join(lines) + "\n")
     sys.stderr.flush()
 
 
@@ -368,20 +385,24 @@ def _range_read_key(content_hash: str, start: int, end: int) -> str:
     return hashlib.sha256(f"{content_hash}:{start}:{end}".encode()).hexdigest()
 
 
-def _read_visible(context: ToolContext, read_key: object) -> bool:
-    """上下文可见性探针（P1-1）。
+def _read_delivery(context: ToolContext, read_key: object) -> str:
+    """上下文交付状态探针（P1-1 / P1-2）。
 
-    询问"这份 read 结果是否仍逐字位于模型可见窗口"。**fail-closed**：探针缺失、
-    不可调用、key 为空、或探针本身抛错，一律返回 False —— 判"不可见"只是多注入
-    一次正文；判"可见"会让模型被要求复用一份它已经看不到的内容（就是 P1-1）。
+    询问"这份 read 结果现在在模型可见窗口里是什么状态"：``"complete"`` 逐字完整、
+    ``"truncated"`` 在窗口里但当时被截断、``"absent"`` 不在窗口里。
+
+    **fail-closed**：探针缺失、不可调用、key 为空、返回非法值、或探针本身抛错，
+    一律按 ``"absent"`` 处理 —— 判"不可见"只是多注入一次正文；判"可见"会让模型
+    被要求复用一份它已经看不到（或看不全）的内容（P1-1 / P1-2）。
     """
-    probe = getattr(context, "read_visible", None)
+    probe = getattr(context, "read_state", None)
     if not callable(probe) or not read_key:
-        return False
+        return "absent"
     try:
-        return bool(probe(read_key))
+        state = probe(read_key)
     except Exception:
-        return False
+        return "absent"
+    return state if state in ("complete", "truncated") else "absent"
 
 
 class ReadFileTool(Tool):
@@ -451,19 +472,35 @@ class ReadFileTool(Tool):
                                     params.get("end_line", _line_count))
                     if _cached_hash else None
                 )
-            # ── P1-1: 轻量命中需要**两个**维度同时成立 ──
+            # ── P1-1/P1-2: 轻量命中需要**两个**维度同时成立 ──
             #   ① 文件没变（sha256 一致）—— 已有判据，不动；
-            #   ② 这份内容仍在模型可见窗口 —— 新增判据。
+            #   ② 这份内容仍以**完整形态**位于模型可见窗口 —— 新增判据。
             # 二者混为一谈就是 P1-1：compact 会把早先的 read 结果滚出 recent
             # window 压成摘要，此时只回一句"请复用之前的读取结果"，模型手上已经
-            # 没有原文。判据缺失/抛错一律按不可见处理（见 _read_visible），走下面
+            # 没有原文。判据缺失/抛错一律按不可见处理（见 _read_delivery），走下面
             # 的正常渲染路径，把带行号的正文重新交回。
-            if _cache_hit and _read_visible(context, _read_key):
-                result = ToolResult.ok(
-                    output=(
+            #
+            # P1-2：仅仅"还在窗口里"同样不够。注入时按预算截断过的结果，模型手上
+            # 只是**一部分**，此时回一句"请复用之前的读取结果，不要重复读取"就是
+            # 在宣称它有一份完整内容 —— 实测真实轨迹 39 次 ReadCache 命中中 18 次
+            # 的上一次交付是被截断的。截断态必须换成"改读更窄范围"的指引：重复读
+            # 同一个 read_key 只会再次拿到同一份被截断的文本。
+            _delivery = _read_delivery(context, _read_key) if _cache_hit else "absent"
+            if _delivery != "absent":
+                if _delivery == "truncated":
+                    output = (
+                        f"[ReadCache] {path} 内容未变化，但**上一次交付的正文被截断**"
+                        f"（中段/尾部已省略），你手上不是完整内容。\n"
+                        f"重复读取同一范围不会补齐被省略的部分 —— 请改用更窄的 "
+                        f"start_line/end_line 读取缺失的行区间。"
+                    )
+                else:
+                    output = (
                         f"[ReadCache] {path} 已在当前修复上下文读取过，内容未变化。\n"
                         f"请复用之前的读取结果，不要重复读取 —— 直接基于已读内容分析并修改代码。"
-                    ),
+                    )
+                result = ToolResult.ok(
+                    output=output,
                     metadata={"cached": True, "line_count": _line_count,
                               "size": _size, "read_key": _read_key},
                 )
@@ -609,6 +646,29 @@ class WriteFileTool(Tool):
             except Exception:
                 pass
 
+        # ── 备份原始内容（用于 destructive regression 后的恢复）──
+        # EditTool 有 original_content 备份，但 WriteFileTool 此前没有。
+        # 当 write_file 整体重写导致项目无法 import 时，[Recovery] 消息要求 Agent
+        # "写回修改前的正确内容"，但 Agent 没有原始内容可参考，只能重新生成（常再次出错）。
+        # 这里将原始内容备份到 context.config（与 Agent 共享的字典），供 [Recovery] 注入。
+        #
+        # 关键：只在备份不存在时创建，不覆盖。
+        # 如果 Agent 多次 write_file 同一文件（如第一次破坏、第二次恢复失败），
+        # 备份必须保留最初的有效内容，而不是被中间的破坏内容覆盖。
+        # C1/C2 真实失败中，Agent 多次重新生成都无法恢复正确函数，部分原因就是
+        # 没有可靠的原始内容参考。
+        if orig_text:
+            try:
+                backups = context.config.setdefault("_file_backups", {})
+                if path not in backups:
+                    backups[path] = orig_text
+                # 只保留最近 10 个文件的备份，避免内存无限增长
+                if len(backups) > 10:
+                    oldest = next(iter(backups))
+                    backups.pop(oldest, None)
+            except Exception:
+                pass
+
         # ── diff 安全检查（写盘前，无需写文件）──
         # 空 diff / 截断必须先于任何写操作拦截：这两种情况下文件根本不该被写，
         # 也绝不能计入"真实代码修改"（had_modification / ever_modified）。
@@ -627,6 +687,24 @@ class WriteFileTool(Tool):
             _emit_tool_result(self.name, context, params, result, _st)
             return result
 
+        # ── 内容大幅缩减警告（Python 文件）──
+        # 当覆盖已有 Python 文件且新内容行数不足原文件 50% 时，警告可能丢失
+        # 函数/类。不阻止写入（大幅重构是合理操作），但给 Agent 明确反馈。
+        _content_truncation_warning = ""
+        if (full.suffix.lower() == ".py" and orig_text and content
+                and len(content.splitlines()) < len(orig_text.splitlines()) * 0.5):
+            _orig_lines = len(orig_text.splitlines())
+            _new_lines = len(content.splitlines())
+            # 提取原文件中的顶层函数/类名，便于 Agent 核对是否丢失
+            _orig_defs = re.findall(r'^(?:def|class)\s+(\w+)', orig_text, re.MULTILINE)
+            _defs_list = ", ".join(_orig_defs[:10]) if _orig_defs else "（未检测到顶层定义）"
+            _content_truncation_warning = (
+                f"[CONTENT_SHRINK_WARNING] 写入内容从 {_orig_lines} 行缩减到 {_new_lines} 行 "
+                f"（不足原文件 50%）。\n"
+                f"原文件顶层定义: {_defs_list}\n"
+                f"action_required: 确认这是有意的大幅重构；若不是，请重新写入包含所有函数/类的完整版本。"
+            )
+
         errors = []
 
         # ── Attempt 1: Path.write_text() ──
@@ -638,7 +716,8 @@ class WriteFileTool(Tool):
                 result = ToolResult.err(verr)
                 _emit_tool_result(self.name, context, params, result, _st)
                 return result
-            result = ToolResult.ok(output=f"written {path} ({len(content)} chars)")
+            result = ToolResult.ok(output=f"written {path} ({len(content)} chars)"
+                                  + (f"\n\n{_content_truncation_warning}" if _content_truncation_warning else ""))
             _emit_tool_result(self.name, context, params, result, _st)
             return result
         except Exception as e:
@@ -654,7 +733,8 @@ class WriteFileTool(Tool):
                 result = ToolResult.err(verr)
                 _emit_tool_result(self.name, context, params, result, _st)
                 return result
-            result = ToolResult.ok(output=f"written (open) {path} ({len(content)} chars)")
+            result = ToolResult.ok(output=f"written (open) {path} ({len(content)} chars)"
+                                  + (f"\n\n{_content_truncation_warning}" if _content_truncation_warning else ""))
             _emit_tool_result(self.name, context, params, result, _st)
             return result
         except Exception as e3:
@@ -685,20 +765,64 @@ def _normalize_new_lines(new_text: str) -> list[str]:
     return new_items
 
 
+# 编辑后回显：最多渲染的行数（修改区域 + 上下文），避免大改产生过长输出
+_MAX_ECHO_LINES = 20
+
+
+def _render_edit_echo(lines: list[str], echo_start: int, echo_end: int, path: str) -> str:
+    """渲染修改区域的带行号源码回显，格式与 ReadFileTool 一致（NNNN|line）。
+
+    使用绝对行号（从 1 开始），便于模型直接核对修改是否落在预期位置。
+    echo_start/echo_end 为 1-based 闭区间，超出范围时自动截断。
+    """
+    echo_start = max(1, echo_start)
+    echo_end = min(len(lines), echo_end)
+    if echo_start > echo_end:
+        return ""
+    selected = lines[echo_start - 1:echo_end]
+    numbered = "".join(f"{echo_start + i:>4}|{line}" for i, line in enumerate(selected))
+    return f"\n--- {path} (lines {echo_start}-{echo_end}) ---\n{numbered}"
+
+
 class EditTool(Tool):
     name = "edit"
-    description = "Line-level editing: replace_lines, regex_replace, insert, append."
+    description = (
+        "Line-level code editing with four modes. "
+        "replace_lines: replace a range of lines by line number (start_line to end_line); "
+        "use when you know the exact lines to change. "
+        "regex_replace: search and replace using a Python regular expression in old_text; "
+        "old_text is a REGEX PATTERN, not a literal string — escape special chars like ( ) [ ] . * + ? ^ $ | with backslash; "
+        "use only when you genuinely need pattern matching. "
+        "insert: insert new lines at start_line without replacing existing lines. "
+        "append: add content to the END of the file only; use for brand-new functions or blocks, "
+        "never for modifying existing logic. "
+        "For precise replacement of known text, prefer replace_lines with exact line numbers."
+    )
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string"},
-            "mode": {"type": "string", "enum": ["replace_lines", "regex_replace", "insert", "append"]},  # noqa: E501
-            "start_line": {"type": "integer"},
-            "end_line": {"type": "integer"},
-            "old_text": {"type": "string"},
-            "new_text": {"type": "string"},
-            "count": {"type": "integer"},
-            "ignore_case": {"type": "boolean"},
+            "path": {"type": "string", "description": "File path relative to project root."},
+            "mode": {
+                "type": "string",
+                "enum": ["replace_lines", "regex_replace", "insert", "append"],
+                "description": (
+                    "Editing mode. replace_lines=by line range, regex_replace=by regex pattern "
+                    "(old_text is regex, escape special chars), insert=at line, append=to file end."
+                ),
+            },
+            "start_line": {"type": "integer", "description": "Starting line number (1-based) for replace_lines or insert."},
+            "end_line": {"type": "integer", "description": "Ending line number (inclusive) for replace_lines."},
+            "old_text": {
+                "type": "string",
+                "description": (
+                    "Regular expression pattern for regex_replace mode. "
+                    "This is NOT a literal string — regex special characters ( ) [ ] . * + ? ^ $ | must be escaped. "
+                    "Required for regex_replace."
+                ),
+            },
+            "new_text": {"type": "string", "description": "Replacement or inserted content."},
+            "count": {"type": "integer", "description": "For regex_replace: max replacements (0 = all matches)."},
+            "ignore_case": {"type": "boolean", "description": "For regex_replace: case-insensitive matching."},
         },
         "required": ["path", "mode", "new_text"],
     }
@@ -788,7 +912,11 @@ class EditTool(Tool):
                     result = ToolResult.err(msg)
                     _emit_tool_result(self.name, context, params, result, _st)
                     return result
-                result = ToolResult.ok(output=f"replaced {path}:{start}-{end}")
+                mod_end = start + len(new_items) - 1
+                echo_start = max(1, start - 3)
+                echo_end = min(len(lines), mod_end + 3, echo_start + _MAX_ECHO_LINES - 1)
+                echo = _render_edit_echo(lines, echo_start, echo_end, path)
+                result = ToolResult.ok(output=f"replaced {path}:{start}-{end}\n{echo}")
                 _emit_tool_result(self.name, context, params, result, _st)
                 return result
 
@@ -811,7 +939,20 @@ class EditTool(Tool):
                     result = ToolResult.err(msg)
                     _emit_tool_result(self.name, context, params, result, _st)
                     return result
-                result = ToolResult.ok(output=f"replaced {n} matches in {path}")
+                # 定位第一处修改行，用于回显窗口（多处匹配时只展示第一处，控制输出规模）
+                new_lines = new_content.splitlines(keepends=True)
+                old_lines = orig_text.splitlines(keepends=True)
+                first_diff = 1
+                for i in range(min(len(old_lines), len(new_lines))):
+                    if old_lines[i] != new_lines[i]:
+                        first_diff = i + 1
+                        break
+                else:
+                    first_diff = min(len(old_lines), len(new_lines)) + 1
+                echo_start = max(1, first_diff - 3)
+                echo_end = min(len(new_lines), first_diff + 10, echo_start + _MAX_ECHO_LINES - 1)
+                echo = _render_edit_echo(new_lines, echo_start, echo_end, path)
+                result = ToolResult.ok(output=f"replaced {n} matches in {path}\n{echo}")
                 _emit_tool_result(self.name, context, params, result, _st)
                 return result
 
@@ -825,7 +966,11 @@ class EditTool(Tool):
                     result = ToolResult.err(msg)
                     _emit_tool_result(self.name, context, params, result, _st)
                     return result
-                result = ToolResult.ok(output=f"inserted at {path}:{ln}")
+                mod_end = ln + len(ins) - 1
+                echo_start = max(1, ln - 3)
+                echo_end = min(len(lines), mod_end + 3, echo_start + _MAX_ECHO_LINES - 1)
+                echo = _render_edit_echo(lines, echo_start, echo_end, path)
+                result = ToolResult.ok(output=f"inserted at {path}:{ln}\n{echo}")
                 _emit_tool_result(self.name, context, params, result, _st)
                 return result
 
@@ -844,7 +989,8 @@ class GrepTool(Tool):
         "type": "object",
         "properties": {
             "pattern": {"type": "string"},
-            "glob": {"type": "string"},
+            "glob": {"type": "string", "description":
+                     "File glob; '*.py' searches recursively, 'pkg/*.py' limits the path."},
             "ignore_case": {"type": "boolean"},
         },
         "required": ["pattern"],
@@ -875,6 +1021,8 @@ class GrepTool(Tool):
 
         # 如果 LLM 传入了 glob 模式，用它缩小搜索范围
         glob_pattern = params.get("glob") or "**/*"
+        if "/" not in glob_pattern.replace("\\", "/"):
+            glob_pattern = f"**/{glob_pattern}"
         for f in sorted(root.glob(glob_pattern)):
             if not f.is_file():
                 continue
@@ -898,6 +1046,93 @@ class GrepTool(Tool):
             if len(results) > 100:
                 summary += f"\n... +{len(results)-100} more"
             result = ToolResult.ok(output=summary, metadata={"matches": total})
+        _emit_tool_result(self.name, context, params, result, _st)
+        return result
+
+
+class FindFileTool(Tool):
+    """Find files by name pattern (SWE-agent find_file equivalent).
+
+    Faster than grep for file discovery: matches against filenames only,
+    not file contents. Returns up to 50 matches to keep context concise.
+    """
+    name = "find_file"
+    description = (
+        "Find files by name pattern. Matches against filenames (not contents). "
+        "Use this when you know the file name but not its path, or want to "
+        "discover all files matching a pattern (e.g. '*order*', 'test_*.py'). "
+        "Returns up to 50 matches. For content search use grep instead."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "Glob pattern for filenames, e.g. '*order*', 'test_*.py', '*.py'",
+            },
+            "path": {
+                "type": "string",
+                "description": "Subdirectory to search in (default: project root)",
+            },
+        },
+        "required": ["pattern"],
+    }
+
+    _MAX_RESULTS = 50
+    _IGNORE_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
+                    ".tox", "build", "dist", ".egg-info", ".mypy_cache",
+                    ".pytest_cache", "workspace", ".zmai"}
+
+    def execute(self, context: ToolContext, params: dict[str, Any]) -> ToolResult:
+        _st = time.time()
+        pattern = params.get("pattern", "")
+        if not pattern:
+            result = ToolResult.err("pattern required")
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
+
+        root = Path(context.project_path or context.workspace_path)
+        search_dir = root
+        sub = params.get("path")
+        if sub:
+            candidate = (root / sub).resolve()
+            try:
+                candidate.relative_to(root.resolve())
+                search_dir = candidate
+            except ValueError:
+                result = ToolResult.err(f"path {sub} outside project root")
+                _emit_tool_result(self.name, context, params, result, _st)
+                return result
+
+        if not search_dir.exists():
+            result = ToolResult.err(f"directory not found: {search_dir}")
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
+
+        import fnmatch
+        matches = []
+        for dirpath, dirnames, filenames in os.walk(search_dir):
+            dirnames[:] = [d for d in dirnames if d not in self._IGNORE_DIRS]
+            for fname in filenames:
+                if fnmatch.fnmatch(fname, pattern):
+                    full = Path(dirpath) / fname
+                    try:
+                        rel = full.relative_to(root).as_posix()
+                    except ValueError:
+                        rel = str(full)
+                    matches.append(rel)
+                    if len(matches) >= self._MAX_RESULTS:
+                        break
+            if len(matches) >= self._MAX_RESULTS:
+                break
+
+        if not matches:
+            result = ToolResult.ok(output=f"no files matching: {pattern}")
+        else:
+            summary = f"found {len(matches)} file(s):\n" + "\n".join(matches)
+            if len(matches) >= self._MAX_RESULTS:
+                summary += f"\n... (truncated at {self._MAX_RESULTS}, use more specific pattern)"
+            result = ToolResult.ok(output=summary, metadata={"matches": len(matches)})
         _emit_tool_result(self.name, context, params, result, _st)
         return result
 
@@ -970,6 +1205,19 @@ def _cap_shell_output(output: str, command: str, limit: int = 10000,
 # 的退出码替换成自己的 0（cmd.exe 与 POSIX sh 都只取管道最后一段的退出码）。
 # 输出本来就是被管道捕获的，去掉后内容不变，退出码恢复为真实命令的。
 _PAGER_STAGE_RE = re.compile(r"(?:\s*\|\s*(?:more(?:\.com)?|less|cat)\s*)+$", re.IGNORECASE)
+
+#: 输出裁剪型管道段（`| head -N` / `| tail -N`）。与 pager 段一样把退出码换成自己的
+#: 0，但**不**是透传：`head` 会把 pytest 末尾的汇总行（"1 failed, 5 passed in …"）
+#: 连同退出码一起切掉。两者同时消失后 `_resolve_test_exit_code` 无从校正（它只能靠
+#: 汇总行把 0 改判为失败），整轮测试被记成 `ToolResult.ok(success=True)`。
+#: 实测 eval_pylint-dev__pylint-5859：`python -m pytest tests/checkers/unittest_misc.py
+#: -x -q 2>&1 | head -60` 的输出恰好 60 行、无汇总行、退出码为 head 的 0 —— 整场唯一
+#: 一次真实测试失败被记成 success=True，`test_failed`/FixDriving 从未激活，模型随后
+#: 25 次 read_file、0 次 edit，直到截断失败。同批次的 requests-3362 用 `| tail -30`
+#: （汇总行存活）时 FixDriving 正常激活，是同一机制的对照。
+#: 只在测试命令上剥离：非测试命令的 head/tail 是模型有意的输出裁剪，行为不变。
+_HEAD_TAIL_STAGE_RE = re.compile(
+    r"(?:\s*\|\s*(?:head|tail)(?:\s+-{1,2}\d+)?\s*)+$", re.IGNORECASE)
 
 # 宽松的 runner 子串匹配 —— 与 agent.py 的读取计数检测（`"pytest" in cmd`）同义。
 # 仅用于**失败方向**的退出码校正（_resolve_test_exit_code，只会 0→1，fail-closed），
@@ -1105,27 +1353,37 @@ def env_addopts_tokens(command: str) -> list[str]:
 
 
 def test_scope_targets(command: str) -> list[str] | None:
-    """命令**实际执行**的测试调用所带的测试目标（非选项参数）。
+    """命令**实际执行**的全部测试调用所带的测试目标（非选项参数）。
 
     None  → 命令里没有测试运行器；
-    []    → 跑的是完整套件（未指定任何目标）；
+    []    → 跑的是完整套件（所有 runner 都未指定任何目标）；
     非空  → 只跑了指定目标（子集）。
 
-    判定口径是"真正被执行的那条命令"：先剥 shell 重定向、再按管道/`&&` 切段，
-    因此 `pytest -q 2>&1 | tail -50` 看到的是 `pytest -q`（完整套件），
-    而不是"测了名为 `2>&1` 和 `tail` 的东西"。`-k foo` 这类选择器仍算目标，
-    因为它确实无法证明覆盖完整套件。
+    判定口径是"真正被执行的那些命令"：先剥 shell 重定向、再按管道/`&&`/`||`/
+    `;` 切段，**逐段**检查 runner，而不是只看第一段。`pytest -q || pytest
+    test_b.py` 里两段都执行了，范围必须是两段的并集（子集）；只看第一段会把
+    后面那段子集的输出/计数当成本次运行的完整范围证据。
+
+    `-k foo` 这类选择器仍算目标，因为它确实无法证明覆盖完整套件。
 
     CR-6：PYTEST_ADDOPTS 里的**位置目标**同样是"只跑了子集"
     （`set "PYTEST_ADDOPTS=test_app.py" && pytest -q`），一并计入。
     """
+    env_targets = [t for t in _strip_benign_plugin_options(env_addopts_tokens(command))
+                   if not t.startswith("-") and t not in _RUNNER_SUBCOMMANDS]
+    found = False
+    targets: list[str] = []
     for tokens in _shell_segments(command, strip_redirects=True):
         at = _runner_head(tokens)
         if at is None:
             continue
-        return [t for t in [*tokens[at:], *env_addopts_tokens(command)]
-                if not t.startswith("-") and t not in _RUNNER_SUBCOMMANDS]
-    return None
+        found = True
+        targets.extend(t for t in _strip_benign_plugin_options(tokens[at:])
+                       if not t.startswith("-") and t not in _RUNNER_SUBCOMMANDS)
+    if not found:
+        return None
+    targets.extend(env_targets)
+    return targets
 
 
 #: 明确**不改变收集范围**的 pytest 选项 —— 白名单，而不是黑名单。
@@ -1149,6 +1407,27 @@ _FULL_SCOPE_SAFE_OPTIONS = frozenset({
 #: 贴值形态的 `-k` / `-m` / `-o` / `-p` 一律不在白名单内 —— 它们本来就缩范围。
 _FULL_SCOPE_SAFE_ATTACHED = ("-r",)
 
+#: 只关闭与证据无关插件、不改变收集范围的 `-p` 取值。
+#: `-p no:cacheprovider` 只关缓存插件，是常见且无害的验证写法。
+_BENIGN_PLUGIN_OPTIONS = frozenset({"no:cacheprovider"})
+
+
+def _strip_benign_plugin_options(tokens: list[str]) -> list[str]:
+    """去掉无害的 `-p no:cacheprovider`（分离与贴值两种写法）。"""
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "-p" and i + 1 < len(tokens) and tokens[i + 1] in _BENIGN_PLUGIN_OPTIONS:
+            i += 2
+            continue
+        if token.startswith("-p") and token[2:] in _BENIGN_PLUGIN_OPTIONS:
+            i += 1
+            continue
+        out.append(token)
+        i += 1
+    return out
+
 
 def cli_scope_filter(command: str) -> list[str]:
     """命令行里会改变 pytest 收集范围的选项（含无法确认安全的未知选项）。
@@ -1160,17 +1439,20 @@ def cli_scope_filter(command: str) -> list[str]:
         -m MARKEXPR / --lf / --sw / --confcutdir / --rootdir / --override-ini（-o）/ -c
 
     判据是白名单（见 `_FULL_SCOPE_SAFE_OPTIONS`）：不在其中的选项一律算"可能改变收集
-    范围"。`--deselect X` 这类**分离取值**形态即使按位置目标也已不算完整范围，这里
-    仍把选项本身标出来 —— 调用方要能区分"命令行显式过滤过"与"只是跑了子集"：前者
-    连"本 run 自己的全绿证据"都不成立（是模型自己的命令说它跳过了测试）。
+    范围"。逐段检查**所有** runner：`pytest -q || pytest --ignore=x` 的后一段同样
+    缩小了范围，不能因为第一段干净就放行。`--deselect X` 这类**分离取值**形态即使按
+    位置目标也已不算完整范围，这里仍把选项本身标出来 —— 调用方要能区分"命令行显式
+    过滤过"与"只是跑了子集"：前者连"本 run 自己的全绿证据"都不成立（是模型自己的
+    命令说它跳过了测试）。
     """
+    env_tokens = env_addopts_tokens(command)
+    out: list[str] = []
     for tokens in _shell_segments(command, strip_redirects=True):
         at = _runner_head(tokens)
         if at is None:
             continue
-        out: list[str] = []
         # CR-6：PYTEST_ADDOPTS 里的选项与命令行选项同权 —— 归一化后进同一白名单。
-        for t in [*env_addopts_tokens(command), *tokens[at:]]:
+        for t in _strip_benign_plugin_options([*env_tokens, *tokens[at:]]):
             if not t.startswith("-"):
                 continue
             name = t.split("=", 1)[0]
@@ -1179,8 +1461,64 @@ def cli_scope_filter(command: str) -> list[str]:
             if len(name) > 2 and name[:2] in _FULL_SCOPE_SAFE_ATTACHED:
                 continue
             out.append(t)
-        return out
-    return []
+    return list(dict.fromkeys(out))
+
+
+#: 会改变后续命令工作目录的 shell 内建命令。测试范围以项目根为基准：
+#: `cd sub && pytest -q` 的"完整范围"只是 sub 目录的范围，不是项目完整套件。
+_DIR_CHANGE_COMMANDS = frozenset({"cd", "pushd", "chdir"})
+
+
+def test_scope_changes_root(command: str) -> bool:
+    """命令是否切换过工作目录（静态判定，任一 `cd`/`pushd`/`chdir` 段即视为切换）。
+
+    保守方向：`pytest -q && cd ..` 这种"切换发生在测试之后"也会被拒。代价是模型
+    需要重跑一次裸套件；换来的是子目录运行不会被锁成完整套件基线。
+    """
+    for tokens in _shell_segments(command, strip_redirects=True):
+        if tokens and _exe_name(tokens[0]) in _DIR_CHANGE_COMMANDS:
+            return True
+    return False
+
+
+#: 能把命令体藏进**另一个执行上下文**的包装器（`bash -c` / `cmd /c` /
+#: `powershell -Command` / 前置 `env bash -c` …）。
+_SHELL_WRAPPER_EXES = frozenset({"bash", "sh", "zsh", "dash", "ksh",
+                                 "cmd", "powershell", "pwsh"})
+#: PowerShell 的目录切换 cmdlet（`cd` 是它的别名，已由 `_DIR_CHANGE_COMMANDS`
+#: 覆盖；这里补上显式写法）。
+_POWERSHELL_DIR_CHANGE = frozenset({"set-location"})
+
+
+def test_scope_has_opaque_wrapper(command: str) -> bool:
+    """命令是否把执行体藏进无法静态证明的包装器 / 分组 / 目录切换。
+
+    `_shell_segments` 按 `&&` / `;` / `|` 切段，但这些分隔符在引号或括号内部时
+    不代表顶层分段：
+
+        bash -c "cd tests && python -m pytest -q --tb=short"
+        (cd tests && python -m pytest -q --tb=short)
+        powershell -Command "Set-Location tests; python -m pytest -q --tb=short"
+
+    第二段会被读成"在项目根执行的裸 runner"，实际却在子目录里跑子集 ——
+    1 passed 被当成完整套件证据。包装体内部的 `cd` / `Set-Location` 不在
+    `test_scope_changes_root` 的视野里，这里不尝试展开，直接判"上下文不可证明"。
+
+    ponytail: 只认已知的包装器族 + 括号分组；未知包装器（自定义脚本等）仍可能
+    漏判，升级路径是维护 `_SHELL_WRAPPER_EXES`，而不是写通用 shell 解析器。
+    """
+    for tokens in _shell_segments(command, strip_redirects=True):
+        if not tokens:
+            continue
+        if _exe_name(tokens[0]) in _POWERSHELL_DIR_CHANGE:
+            return True
+        if tokens[0].startswith("(") or tokens[-1].endswith(")"):
+            return True
+        for i, token in enumerate(tokens[:-1]):
+            if (_exe_name(token) in _SHELL_WRAPPER_EXES
+                    and tokens[i + 1].startswith(("-", "/"))):
+                return True
+    return False
 
 
 #: 命令行里**点名**"跳过谁 / 换哪份收集配置"的选项（N-1 第二档判据）。
@@ -1249,6 +1587,131 @@ def _test_summary_prefix(output: str) -> str:
 TEST_COMMAND_TIMEOUT = 600
 
 
+def _run_shell_command(cmd: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    """Run a shell in its own process group so a timeout also stops pytest children."""
+    timeout = kwargs.pop("timeout")
+    stdin_input = kwargs.pop("input", None)
+    process = subprocess.Popen(
+        cmd, **kwargs, stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=os.name != "nt",
+        creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
+    )
+    try:
+        stdout, stderr = process.communicate(input=stdin_input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                           capture_output=True, timeout=5)
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process.communicate(timeout=5)
+        raise
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+
+
+def _env_error_hint(output: str) -> str:
+    """检测常见环境错误并返回可操作的建议（附加到错误消息末尾）。
+
+    目的：减少 Agent 在环境问题上的盲目探测步数。当 pytest 缺失时，
+    直接告诉 Agent 用什么命令找到可用的解释器，而不是让它反复尝试
+    `python -m pytest`（已知失败）。
+    """
+    if "No module named pytest" in output:
+        return (
+            "\n[env] 当前 Python 解释器没有安装 pytest。不要反复执行 `python -m pytest`。\n"
+            "解决方法（按优先级）：\n"
+            "  1. 运行 `where pytest` 找到已安装 pytest 的解释器，用其完整路径执行，"
+            "例如 `C:\\path\\to\\venv\\Scripts\\python.exe -m pytest -q`\n"
+            "  2. 如果项目有 .venv/ 目录，使用 `.venv\\Scripts\\python -m pytest -q`\n"
+            "  3. 不要自动安装 pytest 或修改用户环境。"
+        )
+    return ""
+
+
+def _extract_failure_details(output: str) -> str:
+    """从 pytest 失败输出中提取结构化的失败详情（SWE-agent 反馈丰富原则）。
+
+    提取每个失败测试的：测试名、失败文件:行号、断言类型、期望值 vs 实际值。
+    让 Agent 快速定位问题，而不是在完整 traceback 中搜索。
+    """
+    if not output:
+        return ""
+    lines = output.splitlines()
+    failures = []
+    current_test = None
+    current_loc = None
+
+    for i, line in enumerate(lines):
+        # 匹配 FAILED 行：FAILED tests/test_x.py::test_name - AssertionError
+        m = re.match(r"FAILED\s+(\S+?)(?:\s*-\s*(.+))?$", line)
+        if m:
+            current_test = m.group(1)
+            current_loc = ""
+            # 尝试从后续行找到 assert 详情
+            for j in range(i + 1, min(i + 15, len(lines))):
+                fl = lines[j]
+                am = re.match(r">?\s*(assert|raise|return)\s+(.+)", fl)
+                if am:
+                    current_loc = f"  statement: {am.group(2)[:120]}"
+                    break
+                # 匹配 E   AssertionError: ...
+                em = re.match(r"E\s+(\w+Error|Exception):?\s*(.*)", fl)
+                if em:
+                    current_loc = f"  error: {em.group(1)}: {em.group(2)[:120]}"
+                    break
+            failures.append(f"- {current_test}\n{current_loc}")
+            continue
+
+        # 匹配 short test summary 中的 FAILED
+        m2 = re.match(r"FAILED\s+(\S+)", line)
+        if m2 and not any(f.startswith(f"- {m2.group(1)}") for f in failures):
+            failures.append(f"- {m2.group(1)}")
+
+    if not failures:
+        return ""
+    header = f"[failure details] {len(failures)} failing test(s):\n"
+    return header + "\n".join(failures[:10]) + ("\n... (more failures truncated)" if len(failures) > 10 else "")
+
+
+def _collapse_test_output(output: str, exit_code: int, cmd: str) -> tuple[str, bool]:
+    """测试输出折叠：与上一次结果相同时返回摘要，避免上下文膨胀。
+
+    Returns (output_to_use, was_collapsed).
+    """
+    if not _TEST_CMD_RE.search(cmd):
+        return output, False
+    totals = parse_test_totals(output)
+    summary_line = (
+        f"{totals['passed']} passed, {totals['failed']} failed, {totals['errors']} errors"
+    )
+    # 失败数和测试名相同不代表失败内容相同；更换 head/tail 查看细节时
+    # 也不能继续返回上一次的摘要。只折叠同命令、同正文的重复结果。
+    failed_names = re.findall(r"FAILED\s+(\S+)", output)
+    stable_output = re.sub(r"\bin \d+(?:\.\d+)?s\b", "in <time>", output)
+    hash_content = cmd + "|" + summary_line + "|" + stable_output
+    cur_hash = hashlib.sha256(hash_content.encode()).hexdigest()
+
+    shell_self = getattr(_collapse_test_output, "_shell", None)
+    if shell_self and shell_self._last_test_hash == cur_hash and exit_code == shell_self._last_test_exit:
+        collapsed = (
+            f"[test output collapsed — same result as previous run]\n"
+            f"{summary_line}\n"
+            f"Failing: {', '.join(failed_names[:5]) if failed_names else '(none)'}\n"
+            f"Use read_file to inspect code, or change code before re-running."
+        )
+        return collapsed, True
+    # 更新缓存
+    if shell_self:
+        shell_self._last_test_hash = cur_hash
+        shell_self._last_test_summary = summary_line
+        shell_self._last_test_exit = exit_code
+    return output, False
+
+
 class ShellTool(Tool):
     name = "shell_exec"
     description = (
@@ -1265,6 +1728,46 @@ class ShellTool(Tool):
         "required": ["command"],
     }
 
+    # 测试输出折叠缓存：记录上一次测试命令的输出哈希和摘要。
+    # 当 Agent 重复运行相同测试且结果未变化时，返回折叠摘要而非完整输出，
+    # 避免 R7 中 23 次 pytest 输出全部进入上下文导致膨胀。
+    _last_test_hash: str | None = None
+    _last_test_summary: str = ""
+    _last_test_exit: int = 0
+
+    def timeout_for(self, context: ToolContext, params: dict[str, Any]) -> int | None:
+        """该次调用**实际使用**的超时预算（秒）；普通命令返回 None（沿用 ToolContext）。
+
+        优先级与 `execute` 完全一致，规则只此一份实现：
+          1) 模型显式 `params["timeout"]`（正整数）优先；
+          2) 测试命令走 `config["timeout.test"]`，默认 `TEST_COMMAND_TIMEOUT`；
+          3) 其余命令使用调用方预算（`ToolContext.timeout`，默认 30s）。
+        最后受可选 timeout.max 和任务单调时钟截止时间约束。
+        非法显式值（非正整数）视为未提供。
+
+        返回的是**有效预算**而非"默认预算"，因此 `ToolRegistry.execute` 取
+        `max(context.timeout, 本值)` 后必然 ≥ 内层预算 —— 显式 900s 不会被外层
+        按默认 600s 提前掐断。
+        """
+        params = params or {}
+        explicit = params.get("timeout")
+        requested = None
+        if explicit is not None:
+            try:
+                value = int(explicit)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                requested = value
+        if requested is None:
+            requested = (int(context.config.get("timeout.test", TEST_COMMAND_TIMEOUT))
+                         if is_test_command(str(params.get("command", "")))
+                         else int(context.timeout or 30))
+        configured_max = context.config.get("timeout.max")
+        allowed = min(requested, int(configured_max)) if configured_max is not None else requested
+        remaining = remaining_wall_seconds(context.config)
+        return allowed if remaining is None else min(allowed, max(0.0, remaining - 3.0))
+
     def execute(self, context: ToolContext, params: dict[str, Any]) -> ToolResult:
         _st = time.time()
         cmd = params.get("command", "")
@@ -1276,12 +1779,32 @@ class ShellTool(Tool):
         # 去掉末尾纯分页段：`pytest ... | more` 的退出码会变成 `more` 的 0，
         # 使失败被报成 SUCCESS。去掉后内容不变、退出码恢复为真实命令的。
         cmd = _strip_trailing_pager(cmd)
+        # 测试命令另外摘掉末尾的输出裁剪段（`| head -60` / `| tail -30`）：它们
+        # 替换退出码，且 head 会连汇总行一起切掉，使"失败"在证据层变成 success
+        # （见 _HEAD_TAIL_STAGE_RE）。非测试命令不动，输出裁剪照旧生效。
+        if _TEST_CMD_RE.search(cmd):
+            cmd = _HEAD_TAIL_STAGE_RE.sub("", cmd).rstrip()
         # 测试文件只读保护：拦截 shell 对测试文件的删除/移动/重命名（绕过写工具）
         if _shell_attempts_test_mutation(cmd):
             result = ToolResult.err(
                 "[TestGuard] 拒绝通过 shell 删除/移动/重命名测试文件："
                 "测试文件是只读验收标准，禁止删除、移走或跳过测试。"
                 "请修改业务代码让测试通过。"
+            )
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
+        # 声明排除参数执行前阻断：-p/--ignore/--deselect 等参数会让测试结果
+        # 完全作废（既非通过也非失败证据）。必须在执行前拒绝，不能执行后才报告，
+        # 否则命令已产生副作用（加载插件、转储源码），且工具返回 success=True
+        # 会让模型认为违规命令成功执行。
+        if is_test_command(cmd) and cli_scope_names_exclusions(cmd):
+            _bad_opts = [t for t in cli_scope_filter(cmd)
+                         if t.split("=", 1)[0].startswith(_CLI_DECLARED_EXCLUSIONS)]
+            result = ToolResult.err(
+                f"[TestGuard] 测试命令包含声明排除参数（{' '.join(_bad_opts)}），"
+                "这些参数会排除测试或替换收集配置，使测试结果既非通过也非失败证据。\n"
+                "请移除这些参数后重新运行。不要通过 -p 加载插件或 --ignore 跳过测试"
+                "来获取诊断信息——使用 read_file 工具直接读取源码。"
             )
             _emit_tool_result(self.name, context, params, result, _st)
             return result
@@ -1292,10 +1815,13 @@ class ShellTool(Tool):
             return result
         # 测试命令走独立超时预算：完整套件不是"30s 没跑完就等于失败"的普通命令。
         # 模型显式传的 timeout 优先；普通 shell 命令行为完全不变。
-        timeout = params.get("timeout")
-        if timeout is None:
-            timeout = (context.config.get("timeout.test", TEST_COMMAND_TIMEOUT)
-                       if is_test_command(cmd) else (context.timeout or 30))
+        timeout = self.timeout_for(context, params)
+        if timeout <= 0:
+            context.config["_wall_budget_exhausted"] = True
+            result = ToolResult.err("task wall budget exhausted before shell_exec",
+                                    metadata={"exit_code": 124, "timeout_kind": "task_budget"})
+            _emit_tool_result(self.name, context, params, result, _st)
+            return result
         stdin_input = params.get("input")
         try:
             cwd = str(context.project_path or context.workspace_path)
@@ -1306,10 +1832,10 @@ class ShellTool(Tool):
             # 不注入，普通 shell 行为完全不变。
             env = ({**os.environ, **context.env}
                    if context.env and is_test_command(cmd) else None)
-            r = subprocess.run(cmd, shell=True, cwd=cwd,
-                               input=stdin_input, env=env,
-                               capture_output=True, text=True, timeout=timeout,
-                               encoding="utf-8", errors="replace")
+            r = _run_shell_command(cmd, shell=True, cwd=cwd,
+                                   input=stdin_input, env=env,
+                                   text=True, timeout=timeout,
+                                   encoding="utf-8", errors="replace")
             output = r.stdout or ""
             if r.stderr:
                 output += f"\n[stderr]\n{r.stderr}"
@@ -1330,21 +1856,34 @@ class ShellTool(Tool):
                     )
                     exit_code = corrected
                 summary = _test_summary_prefix(output)
+                failure_ids = parse_pytest_failure_ids(output)
+                # ── 测试输出折叠 + 失败详情提取 ──
+                _collapse_test_output._shell = self
+                output, _collapsed = _collapse_test_output(output, exit_code, cmd)
+                if exit_code != 0 and not _collapsed:
+                    failure_details = _extract_failure_details(output)
+                    if failure_details:
+                        summary = summary + failure_details + "\n"
+            result_meta = {"exit_code": exit_code}
+            if _TEST_CMD_RE.search(cmd):
+                result_meta["pytest_failed_ids"] = failure_ids
             if exit_code != 0:
+                _env_hint = _env_error_hint(output)
                 result = ToolResult.err(
                     error=f"{summary}{verdict_note}exit {exit_code}: "
-                          f"{_cap_shell_output(output, cmd, 5000)}",
-                    metadata={"exit_code": exit_code})
+                          f"{_cap_shell_output(output, cmd, 5000)}"
+                          f"{_env_hint}",
+                    metadata=result_meta)
             else:
                 result = ToolResult.ok(
                     output=summary + _cap_shell_output(output, cmd, 10000),
-                    metadata={"exit_code": exit_code})
+                    metadata=result_meta)
         except subprocess.TimeoutExpired:
             # 超时 = 这次命令没有产出任何测试结果，既不是通过证据也不是失败证据。
             # 退出码记 124（timeout(1) 惯例），避免下游把缺失的 exit_code 默认读成 0
             # ——那会让一次超时看起来像一次"exit 0 的干净运行"。
             result = ToolResult.err(f"timeout ({timeout}s)",
-                                    metadata={"exit_code": 124})
+                                    metadata={"exit_code": 124, "timeout_kind": "tool"})
         except Exception as e:
             result = ToolResult.err(f"failed: {e}")
         _emit_tool_result(self.name, context, params, result, _st)

@@ -16,7 +16,7 @@
   不受影响；不同范围必然得到不同 key —— 不会误报缓存命中。
 
 不改动：cache_key（文件维度，仍为 mtime+size+内容 hash 二次确认）、LRU 上限、
-``_read_visible`` 判据、``ContextManager.compact()``、completion gate。
+``_read_delivery`` 判据、``ContextManager.compact()``、completion gate。
 """
 
 from __future__ import annotations
@@ -46,10 +46,10 @@ def _project(tmp_path: Path, name: str = "app.py") -> str:
     return src
 
 
-def _ctx(root: Path, read_visible=None) -> ToolContext:
+def _ctx(root: Path, read_state=None) -> ToolContext:
     return ToolContext(agent_id="p1_2_range", workspace_path=root,
                        project_path=root, timeout=10,
-                       read_visible=read_visible)
+                       read_state=read_state)
 
 
 def _cm() -> ContextManager:
@@ -80,13 +80,13 @@ class TestOtherRangeIsNotCachedHit:
         _project(tmp_path)
         cm = _cm()
         tool = ReadFileTool()
-        ctx = _ctx(tmp_path, cm.is_read_visible)
+        ctx = _ctx(tmp_path, cm.read_state)
 
         r1 = _read(tool, ctx, start_line=1, end_line=5)
         assert "LINE_5\n" in r1.output and "LINE_100" not in r1.output, \
             "前置条件：首次只交付 1-5 行"
         _register(cm, r1)
-        assert cm.is_read_visible(r1.metadata["read_key"]) is True, \
+        assert cm.read_state(r1.metadata["read_key"]) == "complete", \
             "前置条件：1-5 行确实在可见窗口内"
 
         r2 = _read(tool, ctx, start_line=100, end_line=105)
@@ -108,12 +108,12 @@ class TestWholeFileAfterRangeIsNotCachedHit:
         src = _project(tmp_path)
         cm = _cm()
         tool = ReadFileTool()
-        ctx = _ctx(tmp_path, cm.is_read_visible)
+        ctx = _ctx(tmp_path, cm.read_state)
 
         r1 = _read(tool, ctx, start_line=100, end_line=105)
         assert "LINE_1\n" not in r1.output, "前置条件：首次不含第 1 行"
         _register(cm, r1)
-        assert cm.is_read_visible(r1.metadata["read_key"]) is True
+        assert cm.read_state(r1.metadata["read_key"]) == "complete"
 
         r2 = _read(tool, ctx)
         assert "LINE_1\n" in r2.output, \
@@ -136,7 +136,7 @@ class TestSameRangeStaysLightweight:
         _project(tmp_path)
         cm = _cm()
         tool = ReadFileTool()
-        ctx = _ctx(tmp_path, cm.is_read_visible)
+        ctx = _ctx(tmp_path, cm.read_state)
 
         r1 = _read(tool, ctx, start_line=1, end_line=5)
         key = r1.metadata["read_key"]
@@ -163,12 +163,12 @@ class TestEvictedRangeIsReinjected:
                              "context.recent_window": 1,
                              "context.tool_result_window": 1})
         tool = ReadFileTool()
-        ctx = _ctx(tmp_path, cm.is_read_visible)
+        ctx = _ctx(tmp_path, cm.read_state)
 
         r1 = _read(tool, ctx, start_line=1, end_line=5)
         key = r1.metadata["read_key"]
         _register(cm, r1)
-        assert cm.is_read_visible(key) is True, "前置条件：刚注入时应可见"
+        assert cm.read_state(key) == "complete", "前置条件：刚注入时应可见"
 
         # 用无关结果 + 足量后续消息挤出窗口，并真正触发压缩
         cm.add_tool_result("shell_exec", True, "unrelated " + "y" * 80)
@@ -177,7 +177,7 @@ class TestEvictedRangeIsReinjected:
         cm.compact()
 
         assert cm.compact_count >= 1, "前置条件：必须真的发生过上下文压缩"
-        assert cm.is_read_visible(key) is False, \
+        assert cm.read_state(key) == "absent", \
             "前置条件：首次交付的 1-5 行必须已被淘汰出可见窗口"
 
         # 文件内容 hash 没变，但正文已不可见 → 必须重新交付，不得回 [ReadCache]

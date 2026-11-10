@@ -70,10 +70,17 @@ def _project(root: Path) -> None:
 
 
 def _pytest(root: Path) -> str:
-    """独立 Python 子进程执行真实 pytest（与 Agent 的 shell_exec 同一路径）。"""
+    """独立 Python 子进程执行真实 pytest（与 Agent 的 shell_exec 同一路径）。
+
+    子进程必须真的写 .pyc，否则本用例的前置条件不成立。外层进程可能设置了
+    `PYTHONDONTWRITEBYTECODE`（全量套件里其它测试模块会设置），
+    `PYTHONPYCACHEPREFIX` 则会把缓存重定向出 `root/__pycache__`；两者都剔除。
+    """
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX")}
     r = subprocess.run([sys.executable, "-m", "pytest", "-q"], cwd=str(root),
                        capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", timeout=120)
+                       errors="replace", timeout=120, env=env)
     return (r.stdout or "") + (r.stderr or "")
 
 

@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import re
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from zmai.config import Config
@@ -17,11 +22,58 @@ from zmai.runtime.lifecycle import LifecycleManager
 from zmai.runtime.scheduler import Scheduler
 from zmai.runtime.state import StateManager
 from zmai.tool import ToolRegistry
+from zmai.tool.base import remaining_wall_seconds
 from zmai.workspace import Workspace
 
 logger = logging.getLogger("zmai.runtime")
 
+
+def _redact_error(error: BaseException) -> str:
+    message = str(error)
+    for name, value in os.environ.items():
+        if any(part in name.upper() for part in ("KEY", "TOKEN", "SECRET", "PASSWORD")) and len(value) >= 8:
+            message = message.replace(value, "[REDACTED]")
+    return re.sub(r"(?i)(?:sk-[A-Za-z0-9_-]{12,}|(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+)",
+                  "[REDACTED]", message)
+
 ProgressCB = Callable[[str, str], None] | None
+
+
+def _persist_trajectory(ws_path: Path | None, agent_id: str, step: int,
+                        ctx: Any) -> None:
+    """把最近一次模型请求快照写入 workspace/.state/trajectory.json。
+
+    记录的是 SWEAgent.step() 里模型适配器实际收到的那份输入（system_prompt
+    独立字段 + messages），不是 metadata["messages"] 的那个子集。
+
+    先写同目录 .tmp 再 os.replace：进程在写入中途被硬杀时，磁盘上要么是
+    完整的旧快照，要么是完整的新快照，不会留下半截 JSON。写入失败只告警，
+    不影响 Agent 执行。
+    """
+    try:
+        snap = ctx.metadata.get("__last_request__")
+        if ws_path is None or not snap:
+            return
+        state_dir = Path(ws_path) / ".state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        target = state_dir / "trajectory.json"
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "step": step,
+                    "agent_id": agent_id,
+                    "system_prompt": snap["system_prompt"],
+                    "messages": snap["messages"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(tmp, target)
+    except Exception as exc:
+        logger.warning("轨迹持久化失败 (忽略): %s", exc)
 
 
 @dataclass
@@ -225,15 +277,35 @@ class Runtime:
                 metadata={"messages": [], "on_progress": on_progress},
                 memory=self._memory,
             )
+            if "wall_seconds_limit" in run_config:
+                work_seconds = max(0.0, float(run_config["wall_seconds_limit"])
+                                   - float(run_config.get("wall_exit_reserve_seconds", 0)))
+                run_config["_wall_deadline_monotonic"] = time.monotonic() + work_seconds
             # ── ExecutionLog 初始化 ────────────────────────────
             _log = ExecutionLog(agent_id=agent_id, task=task)
             ctx.metadata["__log__"] = _log
             _log.record_step(phase="init", action="agent_initialize")
 
-            await agent.initialize(ctx)
+            phase = "initialize"
+            try:
+                await agent.initialize(ctx)
+                phase = "memory_restore"
+                restored = self._memory.restore(agent_id)
+            except Exception as exc:
+                error_msg = _redact_error(exc)
+                _log.record_step(phase="error", action=phase, success=False,
+                                 error=error_msg, metadata={"error_type": type(exc).__name__})
+                try:
+                    _log.persist(str(ws_path / ".state" / "execution_log.json"))
+                except Exception:
+                    pass
+                self._lifecycle.fail(agent_id)
+                self._state.update(agent_id, status="failed", error=error_msg)
+                return {"status": "failed", "agent_id": agent_id, "steps": 0,
+                        "phase": phase, "error_type": type(exc).__name__,
+                        "error": error_msg}
 
             # 从 Long-term Memory 恢复到 Working Memory
-            restored = self._memory.restore(agent_id)
             if restored > 0 and on_progress:
                 on_progress("info", f"restored {restored} memory entries")
 
@@ -242,17 +314,36 @@ class Runtime:
             action: AgentAction | None = None
             try:
                 while step_count < ctx.max_steps:
+                    if (run_config.get("_wall_budget_exhausted") or
+                            ((remaining := remaining_wall_seconds(run_config)) is not None
+                             and remaining <= 0)):
+                        ctx.metadata["timed_out"] = True
+                        ctx.metadata["wall_budget_exhausted"] = True
+                        break
                     action = await agent.step(ctx)
                     output = action.output or output
                     step_count += 1
                     self._state.update(agent_id, step_count=step_count)
-                    if action.type in ("complete", "fail"):
+                    # 每个已完成步骤后立即落盘，下次模型调用前磁盘上已有上一步快照
+                    _persist_trajectory(ws_path, agent_id, step_count, ctx)
+                    # 外部容器时限会直接杀进程，不能只在 finalize 时保存工具日志。
+                    _log.persist(str(ws_path / ".state" / "execution_log.json"))
+                    if (run_config.get("_wall_budget_exhausted") or
+                            ((remaining := remaining_wall_seconds(run_config)) is not None
+                             and remaining <= 0)):
+                        ctx.metadata["timed_out"] = True
+                        ctx.metadata["wall_budget_exhausted"] = True
+                        break
+                    if action.type in ("complete", "candidate", "fail"):
                         if action.type == "fail":
                             ctx.metadata["step_failed"] = action.error or True
                         break
 
-                # max_steps 耗尽 → 标记超时（仅当 step 未返回 complete/fail）
-                if action is not None and action.type not in ("complete", "fail"):
+                # max_steps 耗尽（含 max_steps <= 0：一步都没跑）→ 标记超时。
+                # action is None 表示循环从未执行过 step；若只按"action 不是
+                # complete/fail"判断，finalize 的兜底分支会把零步执行判成
+                # COMPLETED —— 那不是任何验证的结果。
+                if action is None or action.type not in ("complete", "candidate", "fail"):
                     ctx.metadata["timed_out"] = True
 
                 # ── 始终调用 finalize() 判定最终状态 ────────────
@@ -263,7 +354,7 @@ class Runtime:
                 try:
                     if ws_path:
                         _log.record_step(phase="finalize", action="agent_finalize",
-                                         success=True,
+                                         success=result_obj.status == AgentState.COMPLETED,
                                          metadata={
                                              "status": result_obj.status.value,
                                              "swe_stats": result_obj.metadata.get("swe_stats", {}),
@@ -285,12 +376,19 @@ class Runtime:
                         "steps": step_count,
                         "metadata": result_obj.metadata,
                     }
+                elif result_obj.status == AgentState.CANDIDATE:
+                    self._lifecycle.candidate(agent_id)
+                    self._state.update(agent_id, status="candidate")
+                    return {"status": "candidate", "agent_id": agent_id,
+                            "output": output or result_obj.output,
+                            "steps": step_count, "metadata": result_obj.metadata}
                 elif result_obj.status == AgentState.TIMEOUT:
                     self._lifecycle.timeout(agent_id)
                     self._state.update(agent_id, status="timeout")
                     return {
                         "status": "timeout", "agent_id": agent_id,
-                        "error": f"达到最大执行步数 ({ctx.max_steps})，任务未完成",
+                        "error": ("任务墙钟预算耗尽" if ctx.metadata.get("wall_budget_exhausted")
+                                  else f"达到最大执行步数 ({ctx.max_steps})，任务未完成"),
                         "steps": step_count,
                         "metadata": result_obj.metadata,
                     }

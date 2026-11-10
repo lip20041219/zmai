@@ -119,14 +119,20 @@ def _run(tmp_path: Path, script, max_steps: int = 6, *, dirty: bool = False):
 
 # ── A：只读 git 不得成为 no-change 逃逸口 ────────────────────────
 def test_readonly_git_does_not_reset_no_change_counter(tmp_path):
-    """连续只读 git 命令下，_steps_without_change 必须累积并最终触发 guard。"""
+    """连续只读 git 命令下，_steps_without_change 必须累积并最终触发 guard。
+
+    no_progress 的现行规则还要求停滞证据（重复签名等，见 LoopGuard.check()）：
+    一组各不相同的只读命令属于正常调查，不应被误判为"重复空转"。因此脚本在
+    若干不同的只读 git 之后重复其中几条 —— 既验证计数器没有被 git 重置，
+    也验证出现重复后 guard 确实触发。
+    """
     script = [
         [_git("status --porcelain")],
         [_git("diff")],
         [_git("log --oneline -1")],
-        [_git("status")],
-        [_git("diff --stat")],
-        [_git("log -1")],
+        [_git("status --porcelain")],   # 重复签名 → 提供停滞证据
+        [_git("diff")],
+        [_git("log --oneline -1")],
     ]
     ctx, guard, blocks = _run(tmp_path, script)
 

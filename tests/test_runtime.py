@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from collections.abc import Iterator
 from typing import Any
 
 import pytest
 
 from tests.mocks import ConnectionErrorBackend, InfiniteLoopBackend
-from zmai.agent import AgentContext, AgentState
+from zmai.agent import AgentAction, AgentContext, AgentResult, AgentState
 from zmai.config.config import Config
 from zmai.gateway.base import (
     Backend,
@@ -161,6 +163,72 @@ class TestRuntimeRun:
         result = asyncio.run(run())
         assert isinstance(result, dict)
 
+    def test_initialize_exception_is_failed_and_redacted(self, tmp_path, monkeypatch):
+        from zmai.swe.agent import SWEAgent
+
+        secret = "sk-" + "x" * 24
+        monkeypatch.setenv("DEEPSEEK_API_KEY", secret)
+        cfg = Config(sources=[])
+        cfg.set("workspace.root", str(tmp_path))
+        rt = Runtime(config=cfg)
+        rt._gateway.register("mock", MockBackend, default=True)
+        backend = rt._gateway.get("mock")
+        calls = []
+
+        async def broken_initialize(self, context):
+            raise RuntimeError(f"setup failed with token={secret}")
+
+        async def unexpected_step(self, context):
+            calls.append("step")
+            raise AssertionError("step must not run")
+
+        monkeypatch.setattr(SWEAgent, "initialize", broken_initialize)
+        monkeypatch.setattr(SWEAgent, "step", unexpected_step)
+        result = asyncio.run(rt.run(agent_id="init_failure", task="repair", backend="mock"))
+        assert result["status"] == "failed"
+        assert result["phase"] == "initialize"
+        assert result["error_type"] == "RuntimeError"
+        assert result["steps"] == 0
+        assert secret not in result["error"]
+        assert backend.invoke_count == 0
+        assert calls == []
+        log = (tmp_path / "init_failure" / ".state" / "execution_log.json").read_text()
+        assert "agent_initialize" in log and "setup failed" in log
+        assert secret not in log
+
+    def test_memory_restore_exception_is_failed_before_model(self, tmp_path, monkeypatch):
+        from zmai.swe.agent import SWEAgent
+
+        cfg = Config(sources=[])
+        cfg.set("workspace.root", str(tmp_path))
+        rt = Runtime(config=cfg)
+        rt._gateway.register("mock", MockBackend, default=True)
+        backend = rt._gateway.get("mock")
+        calls = []
+
+        async def initialized(self, context):
+            calls.append("initialize")
+
+        async def unexpected_step(self, context):
+            calls.append("step")
+            raise AssertionError("step must not run")
+
+        def broken_restore(agent_id):
+            raise OSError("read-only memory directory")
+
+        monkeypatch.setattr(SWEAgent, "initialize", initialized)
+        monkeypatch.setattr(SWEAgent, "step", unexpected_step)
+        monkeypatch.setattr(rt._memory, "restore", broken_restore)
+        result = asyncio.run(rt.run(agent_id="restore_failure", task="repair", backend="mock"))
+        assert result["status"] == "failed"
+        assert result["phase"] == "memory_restore"
+        assert result["error_type"] == "OSError"
+        assert result["steps"] == 0
+        assert backend.invoke_count == 0
+        assert calls == ["initialize"]
+        log = (tmp_path / "restore_failure" / ".state" / "execution_log.json").read_text()
+        assert "memory_restore" in log and "read-only memory directory" in log
+
     def test_run_has_status(self, runtime_with_mock: Runtime):
         rt = runtime_with_mock
 
@@ -215,6 +283,23 @@ class TestRuntimeRun:
         result = asyncio.run(run())
         assert "steps" in result
         assert result["steps"] >= 1
+
+    def test_zero_max_iterations_is_not_completed(self):
+        """max_iterations=0：一步未执行 → 不得 COMPLETED（无任何验证证据）。"""
+        cfg = Config(sources=[])
+        cfg.set("runtime.max_iterations", 0)
+        rt = Runtime(config=cfg)
+        rt._gateway.register("mock", MockBackend, default=True)
+
+        async def run():
+            return await rt.run(agent_id="zero_steps", task="say hello",
+                                backend="mock")
+
+        result = asyncio.run(run())
+        assert result["steps"] == 0
+        assert result["status"] != "completed", (
+            f"零步执行不得 COMPLETED: {result}"
+        )
 
     def test_run_with_on_progress(self, runtime_with_mock: Runtime):
         rt = runtime_with_mock
@@ -656,4 +741,213 @@ class TestSWEAgentFinalize:
             f"step_failed 时不得 COMPLETED，实际 {result.status}"
         )
         assert result.status != AgentState.COMPLETED
+
+
+# ═══════════════════════════════════════════════════════════════
+# 逐步持久化的对话轨迹（workspace/.state/trajectory.json）
+# ═══════════════════════════════════════════════════════════════
+
+
+def test_execution_log_persisted_before_next_step(tmp_path, monkeypatch):
+    """A later interrupted step must not erase completed tool evidence."""
+    from zmai.swe.agent import SWEAgent
+
+    async def initialize(self, context):
+        pass
+
+    async def step(self, context):
+        log_path = tmp_path / "log_probe" / ".state" / "execution_log.json"
+        if not context.metadata.get("first_step_done"):
+            context.metadata["first_step_done"] = True
+            context.metadata["__log__"].record_step(
+                phase="tool_result", action="shell_exec", tool_name="shell_exec",
+                success=True, tool_output="1 passed")
+            return AgentAction.cont()
+        saved = json.loads(log_path.read_text(encoding="utf-8"))
+        assert any(s["phase"] == "tool_result" and s["tool_output"] == "1 passed"
+                   for s in saved["steps"])
+        return AgentAction.fail("simulated interruption")
+
+    async def finalize(self, context):
+        return AgentResult(agent_id=self.agent_id, status=AgentState.FAILED)
+
+    monkeypatch.setattr(SWEAgent, "initialize", initialize)
+    monkeypatch.setattr(SWEAgent, "step", step)
+    monkeypatch.setattr(SWEAgent, "finalize", finalize)
+    cfg = Config(sources=[])
+    cfg.set("workspace.root", str(tmp_path))
+    cfg.set("runtime.max_iterations", 2)
+    runtime = Runtime(config=cfg)
+    runtime._gateway.register("mock", MockBackend, default=True)
+    result = asyncio.run(runtime.run(agent_id="log_probe", task="probe", backend="mock"))
+    assert result["status"] == "failed"
+
+
+def test_wall_budget_exhaustion_cannot_complete(tmp_path, monkeypatch):
+    from zmai.swe.agent import SWEAgent
+
+    calls = {"steps": 0}
+
+    async def initialize(self, context):
+        pass
+
+    async def step(self, context):
+        calls["steps"] += 1
+        await asyncio.sleep(0.6)
+        return AgentAction.complete("too late")
+
+    monkeypatch.setattr(SWEAgent, "initialize", initialize)
+    monkeypatch.setattr(SWEAgent, "step", step)
+    cfg = Config(sources=[])
+    cfg.set("workspace.root", str(tmp_path))
+    cfg.set("runtime.max_iterations", 3)
+    runtime = Runtime(config=cfg)
+    runtime._gateway.register("mock", MockBackend, default=True)
+    result = asyncio.run(runtime.run(
+        agent_id="wall_probe", task="probe", backend="mock",
+        config={"wall_seconds_limit": 0.5, "wall_exit_reserve_seconds": 0}))
+
+    assert calls["steps"] == 1
+    assert result["status"] == "timeout"
+    assert result["error"] == "任务墙钟预算耗尽"
+    log = tmp_path / "wall_probe" / ".state" / "execution_log.json"
+    assert log.is_file() and json.loads(log.read_text(encoding="utf-8"))["steps"]
+
+
+class _OkTool(Tool):
+    """总是成功的工具 —— 让第 1 步的工具调用把 Agent 推进到第 2 步。"""
+    name = "ok_tool"
+    description = "总是成功"
+    parameters = {"type": "object", "properties": {}}
+
+    def execute(self, context: ToolContext, params: dict) -> ToolResult:
+        return ToolResult.ok("ok")
+
+
+class TrajectoryProbeBackend(Backend):
+    """第 1 步返回工具调用、第 2 步返回文本。
+
+    每次 invoke 开始时探测轨迹文件，并原样记录本次实际收到的请求内容，
+    用于验证"落盘的就是模型真正收到的那份输入"以及"第 2 次调用开始时
+    第 1 步已落盘"。
+    """
+    name = "traj_probe"
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self.invoke_count = 0
+        self.trajectory_path = None  # 由测试注入
+        self.seen: list[list[dict[str, Any]]] = []
+        self.seen_system: list[str] = []
+        self.observed: list[dict[str, Any] | None] = []
+
+    def invoke(self, request: BackendRequest) -> BackendResponse:
+        self.invoke_count += 1
+        self.seen.append([dict(m) for m in request.messages])
+        self.seen_system.append(request.system_prompt or "")
+        p = self.trajectory_path
+        self.observed.append(
+            json.loads(p.read_text(encoding="utf-8")) if p and p.is_file() else None
+        )
+        if self.invoke_count == 1:
+            return BackendResponse(
+                content="",
+                tool_calls=[ToolCall(id="c1", name="ok_tool", params={})],
+                usage=TokenUsage(input_tokens=10, output_tokens=5),
+                stop_reason="tool_use",
+                metadata={"model": "probe"},
+            )
+        return BackendResponse(
+            content="done",
+            usage=TokenUsage(input_tokens=10, output_tokens=5),
+            stop_reason="end_turn",
+            metadata={"model": "probe"},
+        )
+
+    def stream(self, request: BackendRequest) -> Iterator[BackendEvent]:
+        raise NotImplementedError
+
+    @property
+    def capabilities(self) -> set[BackendCapability]:
+        return {BackendCapability.TOOL_USE}
+
+
+class TestTrajectoryPersistence:
+    """每个已完成步骤后立即落盘一份模型实际请求快照。"""
+
+    AGENT = "traj_agent"
+    STEPS = 2
+
+    def _run(self, ws_root) -> tuple[TrajectoryProbeBackend, dict[str, Any], Any]:
+        cfg = Config(sources=[])
+        cfg.set("workspace.root", str(ws_root))
+        rt = Runtime(config=cfg)
+        rt._gateway.register("traj_probe", TrajectoryProbeBackend, default=True)
+        rt._tools.register(_OkTool())
+        be = rt._gateway.get("traj_probe")
+        traj = ws_root / self.AGENT / ".state" / "trajectory.json"
+        be.trajectory_path = traj
+
+        async def run():
+            return await rt.run(agent_id=self.AGENT, task="do something",
+                                backend="traj_probe")
+
+        return be, asyncio.run(run()), traj
+
+    @pytest.fixture
+    def probed(self, tmp_path):
+        be, result, traj = self._run(tmp_path)
+        assert be.invoke_count >= self.STEPS, "需要至少 2 步才能验证逐步落盘"
+        return be, result, traj
+
+    def test_visible_mid_run(self, probed):
+        """第 2 次模型调用开始时，第 1 步的轨迹已经在磁盘上。"""
+        be, _, _ = probed
+        first_seen_by_second_call = be.observed[1]
+        assert first_seen_by_second_call is not None, (
+            "第 2 次 backend 调用开始时磁盘上还没有轨迹文件"
+        )
+        assert first_seen_by_second_call["step"] == 1
+
+
+    def test_content_matches_real_request(self, probed):
+        """落盘的 messages / system_prompt 与模型实际收到的完全一致。"""
+        be, _, _ = probed
+        first_seen_by_second_call = be.observed[1]
+        assert first_seen_by_second_call["messages"] == be.seen[0]
+        assert first_seen_by_second_call["system_prompt"] == be.seen_system[0]
+        assert first_seen_by_second_call["system_prompt"], (
+            "system_prompt 是请求的一部分，不得为空占位"
+        )
+
+    def test_step_number_is_latest_completed(self, probed):
+        """多步执行后，文件里是最新完成的步骤。"""
+        _, _, traj = probed
+        final = json.loads(traj.read_text(encoding="utf-8"))
+        assert final["step"] == self.STEPS
+        assert final["agent_id"] == self.AGENT
+        assert final["messages"]
+
+    def test_atomic_write_leaves_parseable_file(self, probed):
+        """正常写入流程不产生截断文件，也不留 .tmp 残留。"""
+        _, _, traj = probed
+        assert json.loads(traj.read_text(encoding="utf-8"))["step"] == self.STEPS
+        assert not traj.with_name(traj.name + ".tmp").exists()
+
+    def test_write_failure_does_not_fail_agent(self, tmp_path, caplog):
+        """轨迹写入失败时 Agent 主流程行为不变。"""
+        # 把目标路径占成一个目录 → tmp 写入成功但 os.replace 必然失败
+        blocker = tmp_path / "blocked" / self.AGENT / ".state" / "trajectory.json"
+        blocker.mkdir(parents=True)
+
+        with caplog.at_level(logging.WARNING, logger="zmai.runtime"):
+            _, blocked_result, _ = self._run(tmp_path / "blocked")
+        _, control_result, _ = self._run(tmp_path / "control")
+
+        assert blocked_result["status"] == control_result["status"], (
+            "写入失败不得改变 Agent 的执行结果"
+        )
+        assert blocker.is_dir(), "失败路径不应留下半截 JSON"
+        assert any("轨迹持久化失败" in r.message for r in caplog.records), (
+            "写入失败必须留下警告日志"
+        )
 

@@ -174,10 +174,17 @@ def test_shell_source_change_is_a_modification(tmp_path):
 
 # ── Test 2：shell 只读 → 不产生 modification ────────────────────
 def test_shell_read_only_is_not_a_modification(tmp_path):
-    """只读 shell 与 pytest（会生成 __pycache__ / .pytest_cache）都不得算修改。"""
+    """只读 shell、pytest 与字节码编译（只产生缓存文件）都不得算修改。
+
+    pytest 是否写 __pycache__ 取决于解释器/环境开关（PYTHONDONTWRITEBYTECODE
+    等），不能假定它一定生成；compileall 只写缓存、不改源码，用它显式保证
+    忽略规则确实被验证。
+    """
+    # 同一个 step 内执行：初始项目全绿，step 结束即 complete，后续 step 不会执行。
     script = [
-        [_pytest()],          # 跑测试：产生 __pycache__ 与 .pytest_cache
-        [_read_only_shell()],  # 纯读文件
+        [_pytest(),                       # 跑测试：产生 .pytest_cache
+         _sh("python -m compileall -q ."),  # 只写 __pycache__，不改源码
+         _read_only_shell()],             # 纯读文件
         None,
     ]
     ctx, _ = _run(tmp_path, script)
@@ -185,10 +192,11 @@ def test_shell_read_only_is_not_a_modification(tmp_path):
     assert ctx.metadata.get("ever_modified") is not True, (
         "只读命令与测试运行不得被误判为代码修改"
     )
-    # 确认缓存目录确实产生了 —— 否则本用例没有真正验证忽略规则
-    cache_dirs = [p.name for p in tmp_path.rglob("*") if p.is_dir()]
-    assert any(d == "__pycache__" for d in cache_dirs), (
-        f"pytest 应当生成 __pycache__ 以验证忽略规则生效: {cache_dirs}"
+    # 确认 pytest 真的执行过，且缓存目录确实产生了 —— 否则忽略规则未被验证
+    assert "1 passed" in _messages_text(ctx), "用例前提：pytest 必须真的执行过"
+    cache_dirs = {p.name for p in tmp_path.rglob("*") if p.is_dir()}
+    assert "__pycache__" in cache_dirs, (
+        f"必须真的产生字节码缓存以验证忽略规则生效: {cache_dirs}"
     )
 
 

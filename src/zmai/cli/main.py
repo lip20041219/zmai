@@ -33,7 +33,18 @@ from zmai.cli.context import build_context
 from zmai.cli.detector import _find_root as find_project_root
 from zmai.cli.eval_cmd import run_benchmark as _run_benchmark
 from zmai.cli.eval_cmd import run_eval as _run_eval
-from zmai.cli.formatters import Theme, print_error, print_info, print_json, print_success
+from zmai.cli.formatters import (
+    Theme,
+    format_event,
+    print_error,
+    print_info,
+    print_json,
+    print_success,
+    render_banner,
+    render_keys,
+    render_panel,
+    render_summary,
+)
 from zmai.cli.github_cmd import run_github as _run_github
 from zmai.cli.plugin_cmd import run_plugin as _run_plugin
 from zmai.config import Config
@@ -158,6 +169,7 @@ def _print_help() -> None:
     print("  zmai plugin <list|install|remove>  Manage plugin backends")
     print("  zmai issue <url>                 Fetch and fix a GitHub issue")
     print("  zmai pr <title>                  Create a pull request")
+    print("  zmai tui                    Full-screen CRT TUI (needs: pip install \"zmai[tui]\")")
     print("\nIn REPL mode:")
     print("  exit / quit / Ctrl+D        Exit REPL")
     print("  Ctrl+C                      Pause current task")
@@ -184,45 +196,68 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _get_theme(args: argparse.Namespace, config: Config) -> Theme:
-    if getattr(args, "no_color", False):
+    if getattr(args, "no_color", False) or os.environ.get("NO_COLOR"):
         return Theme.plain()
-    tn = config.get("cli.theme", "dark")
+    tn = str(config.get("cli.theme", "crt")).lower()
     if tn == "light":
         return Theme.light()
     if tn == "plain":
         return Theme.plain()
-    return Theme.dark()
+    # 默认（含旧配置 "dark"）使用蓝色 CRT 主题
+    return Theme.crt()
+
+
+def _budget(config: Config) -> int | None:
+    try:
+        return int(config.get("runtime.max_iterations", 300))
+    except (TypeError, ValueError):
+        return None
+
+
+def _progress_printer(theme: Theme):
+    """实时日志回调：工具调用/结果按时间戳 + 标签输出，非 TTY 时不着色。"""
+    ui = theme if sys.stderr.isatty() else Theme.plain()
+
+    def on_progress(typ: str, msg: str) -> None:
+        try:
+            if typ == "tool":
+                kind = "tool"
+            elif typ == "result":
+                kind = "ok" if msg.startswith("OK:") else "fail"
+            else:
+                kind = "info"
+            sys.stderr.write(format_event(kind, msg, ui) + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    return on_progress
 
 
 # ── 任务执行 ──────────────────────────────────────────────
 
 def _repl_run(task: str, runtime: Runtime, agent_id: str, theme: Theme,
-               project_path: str = "") -> dict[str, Any]:
+               project_path: str = "", config: Config | None = None) -> dict[str, Any]:
     """REPL 模式下的任务执行。返回结果，不 exit。"""
     _save_session(task)
-
-    def on_progress(typ: str, msg: str) -> None:
-        try:
-            if typ == "tool":
-                sys.stderr.write(f"\n  > {msg}")
-            elif typ == "result":
-                ok = msg.startswith("OK:")
-                sys.stderr.write(f"\n    {'ok' if ok else 'fail'}")
-            sys.stderr.flush()
-        except Exception:
-            pass
+    ui = theme if sys.stderr.isatty() else Theme.plain()
+    sys.stderr.write(format_event("info", f"task: {task}", ui) + "\n")
+    started = time.monotonic()
 
     try:
         result = asyncio.run(runtime.run(
             agent_id=agent_id,
             task=task,
             backend=None,
-            on_progress=on_progress,
+            on_progress=_progress_printer(theme),
             config={"project_path": project_path},
         ))
     except KeyboardInterrupt:
         print("\n  ⏸ task paused")
         return {"status": "cancelled"}
+
+    elapsed = time.monotonic() - started
+    budget = _budget(config) if config else None
 
     st = result.get("status", "?")
     output = result.get("output", "")
@@ -239,6 +274,8 @@ def _repl_run(task: str, runtime: Runtime, agent_id: str, theme: Theme,
         # Offer interactive fix for API Key related errors
         if err and ("API_KEY" in err or "auth update" in err or "not configured" in err):
             _offer_auth_fix(theme)
+    print()
+    print(render_summary(result, theme, elapsed=elapsed, budget=budget))
     return result
 
 
@@ -249,7 +286,7 @@ def _run_plan_only(task_args: list[str]) -> None:
         sys.exit(1)
 
     task = " ".join(task_args)
-    theme = Theme.dark()
+    theme = Theme.crt()
 
     # 初始化 Runtime 以获取 Backend
     terminal_cwd = os.getcwd()
@@ -330,19 +367,9 @@ def _oneshot_run(task: str, runtime: Runtime, config: Config, args: argparse.Nam
     """单次执行模式。执行完成后 exit。"""
     theme = _get_theme(args, config)
     _save_session(task)
+    started = time.monotonic()
 
-    def on_progress(typ: str, msg: str) -> None:
-        if getattr(args, "json", False):
-            return
-        try:
-            if typ == "tool":
-                sys.stderr.write(f"\n  > {msg}")
-            elif typ == "result":
-                ok = msg.startswith("OK:")
-                sys.stderr.write(f"\n    {'ok' if ok else 'fail'}")
-            sys.stderr.flush()
-        except Exception:
-            pass
+    on_progress = _progress_printer(theme) if not getattr(args, "json", False) else None
 
     project_path = config.get("project_path", "")
     try:
@@ -360,6 +387,7 @@ def _oneshot_run(task: str, runtime: Runtime, config: Config, args: argparse.Nam
         print("\n  cancelled")
         sys.exit(130)
 
+    elapsed = time.monotonic() - started
     if getattr(args, "json", False):
         print_json(result)
     else:
@@ -380,6 +408,8 @@ def _oneshot_run(task: str, runtime: Runtime, config: Config, args: argparse.Nam
                     _offer_auth_fix(theme)
             if output and not err:
                 sys.stderr.write(f"\n{output}\n")
+        print()
+        print(render_summary(result, theme, elapsed=elapsed, budget=_budget(config)))
     sys.exit(0 if result.get("status") == "completed" else 3)
 
 
@@ -413,6 +443,7 @@ def _cmd_interactive(runtime: Runtime, config: Config, args: argparse.Namespace)
     session_task = _load_latest_session()
     if session_task:
         print_info(f"last task: {session_task[:60]}", theme)
+    print(render_keys(theme))
 
     aid = ""  # Recent task ID for /status
 
@@ -421,22 +452,25 @@ def _cmd_interactive(runtime: Runtime, config: Config, args: argparse.Namespace)
         c = cmd.lower()
         if c == "/help":
             print()
-            print("  ─── commands ─────────────────────")
-            print("  /help            show this help")
-            print("  /status          show session status")
-            print("  exit / quit / ^D exit REPL")
-            print("  ─────────────────────────────────\n")
+            print(render_panel("COMMANDS", [
+                ("/help       show this help", "text"),
+                ("/status     show session status", "text"),
+                ("exit/quit   leave REPL (^D)", "text"),
+                ("^C          cancel running task", "text"),
+            ], theme))
             return True
         if c == "/status":
-            print()
-            print(f"  agent:   {aid}")
+            rows: list[tuple[str, str]] = [(f"AGENT: {aid or 'N/A'}", "text")]
             try:
                 info = runtime.get_info()
-                print(f"  uptime:  {info.uptime_seconds:.0f}s")
-                print(f"  agents:  {info.running_agents} running / {info.total_agents} total")
+                rows.append((f"UPTIME: {info.uptime_seconds:.0f}s", "text"))
+                rows.append((f"AGENTS: {info.running_agents} running / {info.total_agents} total", "text"))  # noqa: E501
             except Exception:
                 pass
+            rows.append((f"MODEL: {runtime.default_backend or 'N/A'}", "text"))
+            rows.append((f"BUDGET: {_budget(config)} steps", "text"))
             print()
+            print(render_panel("SESSION STATUS", rows, theme))
             return True
         return False
 
@@ -462,7 +496,7 @@ def _cmd_interactive(runtime: Runtime, config: Config, args: argparse.Namespace)
             # Execute task — unique agent_id each time to avoid lifecycle reuse conflicts
             _task_counter += 1
             aid = f"repl_{os.getpid()}_{_task_counter}"
-            _repl_run(task, runtime, aid, theme, project_path)
+            _repl_run(task, runtime, aid, theme, project_path, config)
 
     except KeyboardInterrupt:
         print("\n  bye")
@@ -476,7 +510,7 @@ def _run_doctor(json_output: bool = False) -> None:
     """Check installation integrity + subsystem status."""
     from zmai.cli.doctor import Doctor
 
-    doctor = Doctor(theme=Theme.dark(), json_output=json_output)
+    doctor = Doctor(theme=Theme.crt(), json_output=json_output)
     results = doctor.run()
     if not all(r.status for r in results):
         sys.exit(1)
@@ -517,6 +551,9 @@ def main(argv: list[str] | None = None) -> None:
         if cmd == "eval":
             _run_eval(rest)
             return
+        if cmd == "tui":
+            from zmai.cli.tui import run as _run_tui
+            sys.exit(_run_tui(rest))
 
     parser = _build_parser()
 
@@ -568,18 +605,33 @@ def main(argv: list[str] | None = None) -> None:
         if cleaned > 0:
             sys.stderr.write(f"  (cleaned {cleaned} old workspaces)\n")
 
-        # 启动信息
-        if not getattr(args, "json", False) and sys.stderr.isatty():
-            if project_ctx:
-                sys.stderr.write(f"\033[2mzmai  {project_ctx.summary()}  [{runtime._gateway.default_name or ''}]\033[0m\n")  # noqa: E501
-            else:
-                sys.stderr.write("\033[2mzmai  (chat mode)\033[0m\n")
-            _print_auth_debug(runtime._gateway)
-
         # 确定任务
         task = args.prompt if hasattr(args, "prompt") and args.prompt else None
         if not task and hasattr(args, "task") and args.task:
             task = " ".join(args.task)
+
+        # 启动面板（仅在真实终端上显示）
+        if not getattr(args, "json", False) and sys.stderr.isatty():
+            budget = (args.max_steps if getattr(args, "max_steps", None) is not None
+                      else _budget(config))
+            if getattr(args, "plan", False):
+                mode = "PLAN"
+            elif task is None and sys.stdin.isatty():
+                mode = "REPL"
+            else:
+                mode = "AUTONOMOUS"
+            sys.stderr.write(render_banner(
+                _get_theme(args, config),
+                version=zmai_version,
+                mode=mode,
+                status="READY",
+                session=f"{os.getpid():04d}",
+                task=task or "",
+                backend=runtime.default_backend,
+                budget=budget,
+                project=project_ctx.summary() if project_ctx else "(chat mode)",
+            ) + "\n")
+            _print_auth_debug(runtime._gateway)
 
         if task:
             _oneshot_run(task, runtime, config, args)

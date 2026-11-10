@@ -42,6 +42,37 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 logger = logging.getLogger("smoke")
 
 RESULT_DIR = Path(__file__).resolve().parent
+# --result-dir 覆盖（验收要求「本次实验使用独立输出目录，不覆盖历史结果」）。
+# 在 main() 里按 args 设置；inst_dir_for() 在调用时读取，因此 run_instance 内部
+# 8 处 finalize 与 inst_dir 计算无需逐处传参。
+OUT_DIR: Path | None = None
+
+
+def inst_dir_for(instance_id: str) -> Path:
+    return (OUT_DIR or RESULT_DIR) / instance_id
+
+
+# ── Agent 任务输入字段白名单 ─────────────────────────────────
+# **只**允许 problem_statement 进入提示词。hints_text 常含维护者对根因的讨论
+# （实测 pylint-5859 的 hints_text 直接写出「转成正则 → ? 是正则特殊字符 →
+# 用 \?\?\? 」＝完整根因与修复方向）；gold patch / test_patch / FAIL_TO_PASS /
+# 验收元数据一律不得进入提示词。
+#
+# 构造走白名单取值（getattr 白名单字段），而不是"先 format_task 再删敏感段"——
+# 后者一旦上游新增字段就会静默漏出。
+AGENT_TASK_WHITELIST = ("problem_statement",)
+
+
+def agent_task_text(instance, *, include_hints: bool = False) -> str:
+    """按白名单构造 Agent 任务输入。
+
+    include_hints 仅供**对照实验**（量化 hints 对成功率的影响）；验收运行一律 False。
+    除白名单字段（以及显式打开的 include_hints）外，不读取实例的任何其他属性。
+    """
+    text = "".join(str(getattr(instance, f, "") or "") for f in AGENT_TASK_WHITELIST)
+    if include_hints:
+        text += f"\n\nHints:\n{instance.hints_text}"
+    return text
 
 # 独立判定使用的 Python：隔离 venv（pytest 8.4，兼容 monkeypatch.notset 等旧 API）
 EVAL_PYTHON = str(Path(__file__).resolve().parent / "_evalenv" / "Scripts" / "python.exe")
@@ -196,7 +227,7 @@ def run_instance(instance, repo_dir: Path, args) -> dict:
         "failure_reason": "",
         "failure_category": "",
     }
-    inst_dir = RESULT_DIR / instance.instance_id
+    inst_dir = inst_dir_for(instance.instance_id)
     inst_dir.mkdir(parents=True, exist_ok=True)
     start = time.time()
 
@@ -240,6 +271,16 @@ def run_instance(instance, repo_dir: Path, args) -> dict:
             result["ftp_before_counts"] = parse_pytest_counts(out_before)
             (inst_dir / "test_before.log").write_text(out_before, encoding="utf-8")
 
+        # ── 2b. 基线模式：到此为止，不启动 agent（验收 §5「运行前先确认问题真实存在」）──
+        if getattr(args, "baseline_only", False):
+            result["status"] = "baseline_only"
+            _cnt = result.get("ftp_before_counts") or {}
+            result["baseline_reproduced"] = (
+                result.get("ftp_before") == "FAIL(符合预期)"
+                and (_cnt.get("failed", 0) + _cnt.get("errors", 0)) > 0
+            )
+            return finalize(result, start, name="baseline.json")
+
         # ── 3. 应用 test_patch 到 agent 工作仓库 ──────────────
         # 让 agent 能看到 FAIL_TO_PASS 测试失败，否则 base_commit 上
         # 根本没有这些测试，agent 永远看不到失败信号。
@@ -269,7 +310,8 @@ def run_instance(instance, repo_dir: Path, args) -> dict:
         rt = Runtime(config=config)
         rdict = asyncio.run(rt.run(
             agent_id=agent_id,
-            task=instance.format_task(),
+            task=agent_task_text(instance,
+                                 include_hints=not getattr(args, "no_hints", False)),
             backend=args.backend,
             config={
                 "project_path": str(repo_dir),
@@ -297,7 +339,7 @@ def run_instance(instance, repo_dir: Path, args) -> dict:
         # Agent workspace 指标
         # ExecutionLog 由 Runtime 写入 workspace.root/<agent_id>/.state/，
         # workspace.root 默认 ./workspace（相对运行 CWD），即 RESULT_DIR/workspace。
-        ws = RESULT_DIR / "workspace" / agent_id
+        ws = (OUT_DIR or RESULT_DIR) / "workspace" / agent_id
         metrics = collect_agent_metrics(agent_id, ws)
         result["tool_calls"] = metrics.get("tool_calls")
         result["test_runs"] = metrics.get("test_runs")
@@ -446,10 +488,11 @@ def _test_patch_files(instance) -> list[str]:
     return files
 
 
-def finalize(result: dict, start: float) -> dict:
+def finalize(result: dict, start: float, name: str = "result.json") -> dict:
     result["duration_seconds"] = round(time.time() - start, 2)
-    inst_dir = RESULT_DIR / result["instance_id"]
-    (inst_dir / "result.json").write_text(
+    inst_dir = inst_dir_for(result["instance_id"])
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    (inst_dir / name).write_text(
         json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8",
     )
     return result
@@ -464,7 +507,18 @@ def main() -> None:
     ap.add_argument("--backend", default="deepseek", help="backend 名称")
     ap.add_argument("--max-steps", type=int, default=60)
     ap.add_argument("--repo-dir", default=None, help="repo 缓存目录（跨任务复用）")
+    ap.add_argument("--baseline-only", action="store_true",
+                    help="只验证基线（base_commit + test_patch 跑 FTP），不启动 agent，"
+                         "结果写 baseline.json（不覆盖既有 result.json）")
+    ap.add_argument("--result-dir", default=None,
+                    help="独立输出目录（默认 <results>/<instance>/）。用于避免覆盖历史结果")
+    ap.add_argument("--no-hints", action="store_true",
+                    help="任务提示词只用 problem_statement，**剥离 hints_text**。"
+                         "SWE-bench 的 hints_text 常含维护者对根因的讨论，属任务输入级答案泄漏")
     args = ap.parse_args()
+
+    global OUT_DIR
+    OUT_DIR = Path(args.result_dir).resolve() if args.result_dir else None
 
     from zmai.eval.swebench import load_instances
     instances = load_instances(split="lite")
@@ -482,6 +536,8 @@ def main() -> None:
 
     result = run_instance(instance, repo_dir, args)
     print(json.dumps(result, indent=2, ensure_ascii=False))
+    if getattr(args, "baseline_only", False):
+        sys.exit(0 if result.get("baseline_reproduced") else 1)
     sys.exit(0 if result.get("success") else 1)
 
 

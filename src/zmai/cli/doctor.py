@@ -37,7 +37,7 @@ class Doctor:
         theme: Theme | None = None,
         json_output: bool = False,
     ) -> None:
-        self.theme = theme or Theme.dark()
+        self.theme = theme or Theme.crt()
         self.json_output = json_output
         self.results: list[CheckResult] = []
         self._project_root: Path | None = None

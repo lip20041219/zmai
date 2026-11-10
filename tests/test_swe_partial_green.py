@@ -484,3 +484,31 @@ def test_subset_green_then_full_suite_green_completes(tmp_path):
     comp: CompletionState = ctx.metadata["completion"]
     assert comp.should_complete() is True
     assert comp.tests_complete is True
+
+
+def test_partial_green_keeps_failure_state(tmp_path):
+    """子集全绿（partial_green）不得解除失败态与失败后读数。
+
+    原缺陷：`if passed` 分支**无条件**执行 test_failed=False /
+    reads_after_fail=0 / src_reads_after_fail=0。子集通过时失败的测试根本没跑，
+    失败态却被一并清空 —— 于是 read → 子集 pytest → read 可以无限交替逃逸
+    FixDriving（读数永远攒不满 fix.read_limit，force_edit 永不激活），直到烧完
+    max_steps。真实轨迹 pylint-5859：26 步 / 37 次工具调用 / 0 次修改，
+    loop_guard 触发 5 次仍未转化为有效编辑，116k tokens 全部作废。
+
+    与 N-2 同源：同一个 passed 在上方已按 _scope_complete 门控 success_count，
+    "完成证据"不允许来自子集，失败态的解除同样不允许。
+    """
+    script = [
+        [_bare()],      # 完整 9 → 7 passed, 2 failed → baseline=9, test_failed=True
+        [_subset7()],   # 子集 7 passed → partial_green（失败的 2 个根本没跑）
+        None,
+    ]
+    ctx, actions = asyncio.run(_run(tmp_path, script, project=_write_scope9_project))
+
+    assert actions[-1] != "complete", f"子集全绿不应 complete: {actions}"
+    assert ctx.metadata.get("test_failed") is True, (
+        "子集全绿不是'失败已修复'的证据，不得解除 test_failed"
+    )
+    assert ctx.metadata.get("test_scope_incomplete") is True
+    assert ctx.metadata.get("required_next_action") == "run_full_test_suite"

@@ -53,11 +53,36 @@ def _default_steps(issue: FailureIssue) -> list[str]:
     # 优先候选业务文件（如 static/js/main.js），其次出错文件（可能是测试文件本身）
     src = (issue.candidate_files[0] if issue.candidate_files else issue.file) \
         or "相关源文件"
+    if issue.frame_is_test:
+        # 纯 AssertionError：traceback 只有测试帧，根因在业务源码中尚未定位。
+        # 如果已有候选业务文件，直接指向它；否则引导模型自己搜索。
+        if issue.candidate_files:
+            candidate = issue.candidate_files[0]
+            # 提取简短的相对路径，避免太长的绝对路径
+            short_candidate = candidate.replace("\\", "/")
+            if "/" in short_candidate:
+                short_candidate = short_candidate.split("/")[-1]
+            return [
+                "1. 利用刚得到的失败摘要；仅在输出不完整时重跑刚失败的测试命令",
+                f"2. 读取 `{candidate}` 与相关现有测试，核对接口、边界条件及断言差异",
+                "3. 确认失败与任务或改动有关后，用 `edit` 或 `write_file` 做最小修改",
+                "4. 重新运行刚失败的测试命令验证修复，再扩大回归范围",
+                "5. 若仍失败，回到第 2 步继续",
+            ]
+        else:
+            return [
+                "1. 利用刚得到的失败摘要；仅在输出不完整时重跑刚失败的测试命令",
+                "2. 根据测试中的函数调用和断言差异（expected vs actual），"
+                "用 grep 搜索定义，读取业务源码与现有测试，定位根因和兼容行为",
+                "3. 确认失败与任务或改动有关后，用 `edit` 或 `write_file` 做最小修改",
+                "4. 重新运行刚失败的测试命令验证修复，再扩大回归范围",
+                "5. 若仍失败，回到第 2 步继续",
+            ]
     return [
-        "1. 重跑 `python -m pytest` 复现失败，读取失败摘要",
-        f"2. 读取 {src} 与失败测试，定位根因",
-        "3. 用 `edit` 或 `write_file` 做出最小、有针对性的修改",
-        "4. 重新运行 `python -m pytest` 验证修复",
+        "1. 利用刚得到的失败摘要；仅在输出不完整时重跑刚失败的测试命令",
+        f"2. 读取 {src} 与相关现有测试，核对根因及原有行为",
+        "3. 确认失败与任务或改动有关后，用 `edit` 或 `write_file` 做最小修改",
+        "4. 重新运行刚失败的测试命令验证修复，再扩大回归范围",
         "5. 若仍失败，回到第 2 步继续",
     ]
 

@@ -512,6 +512,64 @@ class TestDeepSeekBackend:
         with pytest.raises(BackendError, match="KEY_INVALID|401|API Key"):
             backend.invoke(req)
 
+    def test_request_max_tokens_overrides_backend_default(self):
+        """BackendRequest.max_tokens 必须覆盖后端默认的 self._max_tokens。
+
+        此前 DeepSeekBackend 硬编码使用 self._max_tokens，忽略 request.max_tokens，
+        导致 agent 无法在 force_edit 等阶段动态调整输出上限。
+        """
+        from unittest.mock import patch, MagicMock
+        from zmai.gateway.base import BackendRequest
+
+        backend = DeepSeekBackend(config={"api_key": "test-key", "max_tokens": 4096})
+        assert backend._max_tokens == 4096
+
+        req = BackendRequest(messages=[{"role": "user", "content": "hi"}], max_tokens=8192)
+        captured_body = {}
+
+        def fake_urlopen(req_obj, timeout=120):
+            captured_body.update(json.loads(req_obj.data.decode()))
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps({
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+            }).encode()
+            mock_resp.__enter__ = lambda s: s
+            mock_resp.__exit__ = lambda *a: False
+            return mock_resp
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            backend.invoke(req)
+
+        assert captured_body.get("max_tokens") == 8192, \
+            f"应使用 request.max_tokens=8192，实际 body: {captured_body.get('max_tokens')}"
+
+    def test_fallback_to_backend_default_when_request_max_tokens_zero(self):
+        """request.max_tokens 为 0/None 时，应回退到后端默认值。"""
+        from unittest.mock import patch, MagicMock
+        from zmai.gateway.base import BackendRequest
+
+        backend = DeepSeekBackend(config={"api_key": "test-key", "max_tokens": 4096})
+        req = BackendRequest(messages=[{"role": "user", "content": "hi"}], max_tokens=0)
+        captured_body = {}
+
+        def fake_urlopen(req_obj, timeout=120):
+            captured_body.update(json.loads(req_obj.data.decode()))
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps({
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+            }).encode()
+            mock_resp.__enter__ = lambda s: s
+            mock_resp.__exit__ = lambda *a: False
+            return mock_resp
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            backend.invoke(req)
+
+        assert captured_body.get("max_tokens") == 4096, \
+            "request.max_tokens=0 时应回退到后端默认 4096"
+
 
 # ═══════════════════════════════════════════════════════════════
 # 测试: ClaudeBackend 重试
@@ -776,6 +834,74 @@ class TestBackendInvalidResponse:
 # ── PluginRegistry 默认 Backend 选择 ──────────────────────────
 
 class TestPluginRegistryDefaultSelection:
+    def test_explicit_runtime_model_reaches_deepseek_request(self, monkeypatch):
+        from zmai.config import Config
+        from zmai.gateway.plugin import PluginRegistry
+
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-" + "0" * 32)
+        monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-flash")
+        config = Config(sources=[])
+        config.set("backends.deepseek.model", "deepseek-reasoner")
+        backend = PluginRegistry(config=config).get("deepseek")
+        assert backend.model == "deepseek-reasoner"
+
+        body = json.dumps({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }).encode()
+        with patch("zmai.gateway.backends.deepseek.urllib.request.urlopen") as urlopen:
+            response = urlopen.return_value.__enter__.return_value
+            response.read.return_value = body
+            backend.invoke(BackendRequest(messages=[{"role": "user", "content": "hi"}]))
+        assert json.loads(urlopen.call_args[0][0].data)["model"] == "deepseek-reasoner"
+
+    def test_http_request_and_response_model_mismatch_is_visible(self, monkeypatch):
+        from zmai.config import Config
+        from zmai.gateway.plugin import PluginRegistry
+
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-" + "0" * 32)
+        config = Config(sources=[])
+        config.set("backends.deepseek.model", "deepseek-reasoner")
+        backend = PluginRegistry(config=config).get("deepseek")
+        body = json.dumps({
+            "model": "deepseek-flash",
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+        }).encode()
+        with patch("zmai.gateway.backends.deepseek.urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = body
+            response = backend.invoke(BackendRequest(messages=[
+                {"role": "user", "content": "probe"}]))
+        request_body = json.loads(urlopen.call_args[0][0].data)
+        assert config.get("backends.deepseek.model") == "deepseek-reasoner"
+        assert request_body["model"] == "deepseek-reasoner"
+        assert response.metadata["configured_model"] == "deepseek-reasoner"
+        assert response.metadata["requested_model"] == "deepseek-reasoner"
+        assert response.metadata["reported_model"] == "deepseek-flash"
+        assert response.metadata["model_identity_mismatch"] is True
+        assert "api_key" not in response.metadata
+        assert "authorization" not in response.metadata
+
+    def test_http_timeout_uses_remaining_wall_budget(self, monkeypatch):
+        import time
+        from zmai.config import Config
+        from zmai.gateway.plugin import PluginRegistry
+
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-" + "0" * 32)
+        config = Config(sources=[])
+        config.set("backends.deepseek.model", "deepseek-reasoner")
+        backend = PluginRegistry(config=config).get("deepseek")
+        body = json.dumps({
+            "model": "deepseek-reasoner",
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+        }).encode()
+        with patch("zmai.gateway.backends.deepseek.urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = body
+            backend.invoke(BackendRequest(messages=[{"role": "user", "content": "probe"}],
+                                          metadata={"_wall_deadline_monotonic":
+                                                    time.monotonic() + 5}))
+        assert 0 < urlopen.call_args.kwargs["timeout"] <= 4
+
     def test_default_stays_deepseek_when_anthropic_key_present(self, monkeypatch):
         """存在 ANTHROPIC_API_KEY 时，若 AuthStore 指定 deepseek，
         默认 backend 仍为 deepseek，绝不因 Anthropic 凭据切换为 claude。"""

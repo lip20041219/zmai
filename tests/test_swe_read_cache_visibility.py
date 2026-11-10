@@ -13,7 +13,7 @@
 
 修复（两个维度分开判定）：
   ① 文件维度：sha256 一致            → `_cache_hit`（既有判据，未改动）
-  ② 上下文维度：内容仍在可见窗口      → `ctx.read_visible(read_key)`
+  ② 上下文维度：内容仍在可见窗口      → `ctx.read_state(read_key)`
 
       ① 且 ②           → 轻量 [ReadCache] 提示，不重复注入正文（保住 token 优势）
       ① 但非 ②         → 走正常渲染路径，重新交回源码 + 行号（cached 仍为 True）
@@ -36,10 +36,10 @@ from zmai.tool import ToolContext
 SRC = "def f():\n    return 1\n\n\ndef g():\n    return 2\n"
 
 
-def _ctx(root: Path, read_visible=None) -> ToolContext:
+def _ctx(root: Path, read_state=None) -> ToolContext:
     return ToolContext(agent_id="p1_1_cache", workspace_path=root,
                        project_path=root, timeout=10,
-                       read_visible=read_visible)
+                       read_state=read_state)
 
 
 def _body(src: str = SRC) -> str:
@@ -75,7 +75,7 @@ class TestStillVisibleKeepsLightweightHit:
         _project(tmp_path)
         cm = self._cm()
         tool = ReadFileTool()
-        ctx = _ctx(tmp_path, cm.is_read_visible)
+        ctx = _ctx(tmp_path, cm.read_state)
 
         r1 = tool.execute(ctx, {"path": "app.py"})
         assert r1.success, r1.error
@@ -84,7 +84,7 @@ class TestStillVisibleKeepsLightweightHit:
         assert read_key, "首次读取必须携带 read_key"
 
         _register(cm, r1)
-        assert cm.is_read_visible(read_key) is True, \
+        assert cm.read_state(read_key) == "complete", \
             "前置条件：注入后该内容应在可见窗口内"
 
         r2 = tool.execute(ctx, {"path": "app.py"})
@@ -104,7 +104,7 @@ class TestStillVisibleKeepsLightweightHit:
         _project(tmp_path)
         cm = self._cm()
         tool = ReadFileTool()
-        ctx = _ctx(tmp_path, cm.is_read_visible)
+        ctx = _ctx(tmp_path, cm.read_state)
 
         r1 = tool.execute(ctx, {"path": "app.py"})
         _register(cm, r1)
@@ -129,13 +129,13 @@ class TestEvictedContentIsReinjected:
         _project(tmp_path)
         cm = self._tiny_cm()
         tool = ReadFileTool()
-        ctx = _ctx(tmp_path, cm.is_read_visible)
+        ctx = _ctx(tmp_path, cm.read_state)
 
         # 第 1 次读取 → 注入上下文
         r1 = tool.execute(ctx, {"path": "app.py"})
         read_key = r1.metadata["read_key"]
         _register(cm, r1)
-        assert cm.is_read_visible(read_key) is True, \
+        assert cm.read_state(read_key) == "complete", \
             "前置条件：刚注入时应可见"
 
         # 用无关结果 + 足量后续消息把它挤出窗口，并真正触发压缩
@@ -146,7 +146,7 @@ class TestEvictedContentIsReinjected:
 
         # 前置条件：淘汰确实发生，且用**生产判据**确认已不可见
         assert cm.compact_count >= 1, "前置条件：必须真的发生过上下文压缩"
-        assert cm.is_read_visible(read_key) is False, \
+        assert cm.read_state(read_key) == "absent", \
             "前置条件：首次读取的原文必须已被淘汰出可见窗口"
 
         # 修复点：文件没变，但内容已不可见 → 必须重新交回正文 + 行号
@@ -162,15 +162,18 @@ class TestEvictedContentIsReinjected:
     def test_eviction_check_uses_message_window_not_tool_entries(self, tmp_path: Path):
         """可见性判据只认模型可见的消息窗口，不认 tool-result 平行结构。
 
-        tool_result_window 远大于 recent_window 时，entry 仍在但消息早已滑出 ——
+        tool_result_window 远大于消息窗口时，entry 仍在但注入消息早已被挤掉 ——
         此时必须判"不可见"，否则会退回 P1-1。
+
+        淘汰由 **max_chars 预算**驱动（recent_window 是压缩时的保留条数下限，
+        不再兼任条数上限：上限取 max_chars，见 manager.__init__）。
         """
         _project(tmp_path)
-        cm = ContextManager({"context.max_chars": 10 ** 7,
+        cm = ContextManager({"context.max_chars": 200,
                              "context.recent_window": 1,
                              "context.tool_result_window": 50})
         tool = ReadFileTool()
-        ctx = _ctx(tmp_path, cm.is_read_visible)
+        ctx = _ctx(tmp_path, cm.read_state)
 
         r1 = tool.execute(ctx, {"path": "app.py"})
         read_key = r1.metadata["read_key"]
@@ -178,10 +181,10 @@ class TestEvictedContentIsReinjected:
         for i in range(5):
             cm.add_message("user", f"后续第 {i} 轮：" + "z" * 40)
 
-        # entry 仍在（tool_result_window=50），但注入消息已被 recent_window=1 挤掉
+        # entry 仍在（tool_result_window=50），但注入消息已超预算被压走
         _entries = json.dumps(cm._recent_win.tool_results, ensure_ascii=False)
         assert read_key in _entries, "前置条件：tool-result entry 仍在"
-        assert cm.is_read_visible(read_key) is False, \
+        assert cm.read_state(read_key) == "absent", \
             "模型看不到的消息窗口必须判为不可见"
 
         r2 = tool.execute(ctx, {"path": "app.py"})
@@ -200,12 +203,12 @@ class TestChangedFileStillReadsFresh:
                              "context.recent_window": 50,
                              "context.tool_result_window": 50})
         tool = ReadFileTool()
-        ctx = _ctx(tmp_path, cm.is_read_visible)
+        ctx = _ctx(tmp_path, cm.read_state)
 
         r1 = tool.execute(ctx, {"path": "app.py"})
         _register(cm, r1)
         # 前置条件：此时确实"可见"，若判据写错就会走轻量分支
-        assert cm.is_read_visible(r1.metadata["read_key"]) is True
+        assert cm.read_state(r1.metadata["read_key"]) == "complete"
 
         p.write_text(SRC.replace("return 2", "return 99"), encoding="utf-8")
         r2 = tool.execute(ctx, {"path": "app.py"})
@@ -227,14 +230,14 @@ class TestChangedFileStillReadsFresh:
 
 class TestFailClosedWithoutProbe:
     def test_missing_probe_returns_body(self, tmp_path: Path):
-        """不注入探针（read_visible=None）时不得认为内容仍可见。"""
+        """不注入探针（read_state=None）时不得认为内容仍可见。"""
         _project(tmp_path)
         tool = ReadFileTool()
         ctx = _ctx(tmp_path, None)
 
         tool.execute(ctx, {"path": "app.py"})
         r2 = tool.execute(ctx, {"path": "app.py"})
-        assert ctx.read_visible is None
+        assert ctx.read_state is None
         assert _body() in r2.output, f"探针缺失必须 fail-closed 回正文: {r2.output}"
         assert "return 2" in r2.output
 
@@ -299,10 +302,10 @@ class TestContextManagerCompatibility:
         msgs = cm.get_context()
         assert any("file content" in (m.get("content") or "") for m in msgs), \
             "结果仍应注入上下文"
-        assert cm.is_read_visible("any-key") is False, \
+        assert cm.read_state("any-key") == "absent", \
             "没有注册过 read_key 时必须返回 False（fail-closed）"
-        assert cm.is_read_visible(None) is False
-        assert cm.is_read_visible("") is False
+        assert cm.read_state(None) == "absent"
+        assert cm.read_state("") == "absent"
 
     def test_meta_cannot_override_structural_fields(self):
         """meta 不得覆盖 name/success/output/duration_ms/tool 这些结构性字段。"""
@@ -317,12 +320,106 @@ class TestContextManagerCompatibility:
         assert entry["output"].startswith("real output")
         # meta 自身携带的信息必须保留下来
         assert entry["read_key"] == "k1"
-        # 注入消息同样带上 read_key，供 is_read_visible 查询
-        assert cm.is_read_visible("k1") is True
+        # 注入消息同样带上 read_key，供 read_state 查询
+        assert cm.read_state("k1") == "complete"
 
     def test_unregistered_key_is_invisible(self):
         """注册过其它 key 时，未注册的 key 仍必须返回 False。"""
         cm = ContextManager()
         cm.add_tool_result("read_file", True, "x", meta={"read_key": "k1"})
-        assert cm.is_read_visible("k1") is True
-        assert cm.is_read_visible("k2") is False
+        assert cm.read_state("k1") == "complete"
+        assert cm.read_state("k2") == "absent"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P1-2 — 被截断的交付不得被当成"内容已完整给到模型"
+# ═══════════════════════════════════════════════════════════════════
+
+
+BIG_SRC = "".join(f"def helper_{i}(value):\n    return value + {i}\n\n\n"
+                  for i in range(1, 121))
+
+
+class TestTruncatedDeliveryIsNotClaimedComplete:
+    """注入时被截断的结果，重复读取时不得回"请复用之前的读取结果"。
+
+    实测：真实轨迹里 39 次 ReadCache 命中中有 18 次的上一次交付是被截断的
+    （旧预算 500 字符），模型被要求复用一份它从未完整看到的正文 ——
+    eval_pydata__xarray-4248 即 60 步 0 edit。
+    """
+
+    def _cm(self) -> ContextManager:
+        return ContextManager({"context.max_chars": 10 ** 7,
+                               "context.recent_window": 50,
+                               "context.tool_result_window": 50})
+
+    def _register(self, cm: ContextManager, result, budget: int) -> None:
+        """按 agent.py 的真实形态注入：read_file 成功结果走 evidence 预算。"""
+        cm.add_tool_result("read_file", True, result.output,
+                           truncate=budget, meta=result.metadata)
+
+    def test_truncated_delivery_reported_as_truncated(self, tmp_path: Path):
+        (tmp_path / "big.py").write_text(BIG_SRC, encoding="utf-8")
+        cm = self._cm()
+        tool = ReadFileTool()
+        ctx = _ctx(tmp_path, cm.read_state)
+
+        r1 = tool.execute(ctx, {"path": "big.py"})
+        assert len(r1.output) > 4000, "前置条件：正文必须超过 evidence 预算"
+        self._register(cm, r1, 4000)
+
+        assert cm.read_state(r1.metadata["read_key"]) == "truncated", \
+            "交付被截断时必须报告 truncated，而不是 complete"
+
+    def test_repeat_read_does_not_claim_content_is_held(self, tmp_path: Path):
+        (tmp_path / "big.py").write_text(BIG_SRC, encoding="utf-8")
+        cm = self._cm()
+        tool = ReadFileTool()
+        ctx = _ctx(tmp_path, cm.read_state)
+
+        r1 = tool.execute(ctx, {"path": "big.py"})
+        self._register(cm, r1, 4000)
+        r2 = tool.execute(ctx, {"path": "big.py"})
+
+        assert "[ReadCache]" in r2.output, "仍是轻量命中（未重复注入正文）"
+        assert "请复用之前的读取结果" not in r2.output, \
+            "正文被截断过时不得宣称模型已持有完整内容"
+        assert "被截断" in r2.output and "更窄" in r2.output, \
+            "必须给出可执行的补救路径：改读更窄的行区间"
+
+    def test_complete_delivery_keeps_lightweight_message(self, tmp_path: Path):
+        _project(tmp_path)
+        cm = self._cm()
+        tool = ReadFileTool()
+        ctx = _ctx(tmp_path, cm.read_state)
+
+        r1 = tool.execute(ctx, {"path": "app.py"})
+        self._register(cm, r1, 4000)
+        r2 = tool.execute(ctx, {"path": "app.py"})
+
+        assert cm.read_state(r1.metadata["read_key"]) == "complete"
+        assert "请复用之前的读取结果" in r2.output, "未截断时行为不变"
+
+    def test_narrower_range_still_reachable(self, tmp_path: Path):
+        """补救路径必须真的可用：改读更窄区间得到新 key 并重新交付正文。"""
+        (tmp_path / "big.py").write_text(BIG_SRC, encoding="utf-8")
+        cm = self._cm()
+        tool = ReadFileTool()
+        ctx = _ctx(tmp_path, cm.read_state)
+
+        r1 = tool.execute(ctx, {"path": "big.py"})
+        self._register(cm, r1, 4000)
+        r2 = tool.execute(ctx, {"path": "big.py", "start_line": 200, "end_line": 260})
+
+        assert "[ReadCache]" not in r2.output, "不同范围不是轻量命中"
+        assert r2.metadata["read_key"] != r1.metadata["read_key"]
+        assert "200-260" in r2.output, "交付的必须是请求的行区间"
+
+    def test_absent_probe_never_claims_visible(self, tmp_path: Path):
+        """探针缺失（None）时一律按 absent —— 不得宣称内容可见。"""
+        (tmp_path / "big.py").write_text(BIG_SRC, encoding="utf-8")
+        tool = ReadFileTool()
+        ctx = _ctx(tmp_path, None)
+        r1 = tool.execute(ctx, {"path": "big.py"})
+        r2 = tool.execute(ctx, {"path": "big.py"})
+        assert "[ReadCache]" not in r2.output

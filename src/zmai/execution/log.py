@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -224,7 +225,9 @@ class ExecutionLog:
         try:
             p = Path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(self.to_json(), encoding="utf-8")
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(self.to_json(), encoding="utf-8")
+            os.replace(tmp, p)
             return True
         except Exception as exc:
             logger.warning("ExecutionLog 持久化失败 (忽略): %s", exc)

@@ -45,6 +45,10 @@ class FailureIssue:
     file: str = ""
     line: int = 0
     function: str = ""
+    # 选中的 frame 是否来自测试文件。纯 AssertionError 的 traceback 通常只有测试帧，
+    # 此时 file/line 是断言位置而非业务根因位置。format_failure 据此区分标签，
+    # 避免把测试文件误报为已确认的根因位置。
+    frame_is_test: bool = False
     # 定位点附近源码（±15 行，>> 标记根因行）；文件不可读时为空串。
     source_snippet: str = ""
     # ── 断言值与候选业务文件（供短路径修复）──
@@ -373,9 +377,11 @@ def _extract_expected_actual(text: str) -> tuple[str, str]:
 
     pytest 在失败摘要里输出 ``assert 6 == 5`` 这种已求值的字面量。
     约定 ``assert <actual> == <expected>``：LHS=actual、RHS=expected。
+    支持整数和浮点数（如 assert 30.0 == 27.0）。
     """
-    for pat in (r"assert\s+(-?\d+)\s*!=\s*(-?\d+)",
-                r"assert\s+(-?\d+)\s*==\s*(-?\d+)"):
+    num = r"-?\d+(?:\.\d+)?"
+    for pat in (rf"assert\s+({num})\s*!=\s*({num})",
+                rf"assert\s+({num})\s*==\s*({num})"):
         m = re.search(pat, text)
         if m:
             return m.group(2), m.group(1)  # (expected, actual)
@@ -412,6 +418,30 @@ def _candidate_paths_from_source(test_src: str) -> list[str]:
         s = m.group(1)
         if s not in out:
             out.append(s)
+    return out
+
+
+def _candidate_modules_from_import(test_src: str) -> list[str]:
+    """从测试源码的 import 语句中提取被测业务模块名。
+
+    例如：
+        from src.discounts import best_price  -> ["src.discounts"]
+        from src.net_value import compute_net_value  -> ["src.net_value"]
+        import src.discounts  -> ["src.discounts"]
+    """
+    out: list[str] = []
+    # from X.Y.Z import name1, name2
+    for m in re.finditer(r"^\s*from\s+([\w.]+)\s+import\s+", test_src, re.MULTILINE):
+        mod = m.group(1)
+        if mod and not mod.startswith((".", "os", "sys", "json", "math", "typing")):
+            if mod not in out:
+                out.append(mod)
+    # import X.Y.Z
+    for m in re.finditer(r"^\s*import\s+([\w.]+)\s*$", test_src, re.MULTILINE):
+        mod = m.group(1)
+        if mod and not mod.startswith((".", "os", "sys", "json", "math", "typing")):
+            if mod not in out:
+                out.append(mod)
     return out
 
 
@@ -455,6 +485,15 @@ def _collect_candidate_files(text: str, project_root: str | Path | None,
                     if (low.startswith("tests/") or low.endswith(("test_.py", "_test.py"))):
                         continue
                     cands.append(p)
+                # 3) 从 import 语句提取被测业务模块（如 from src.discounts import best_price）
+                for imp in _candidate_modules_from_import(body):
+                    mod_path = imp.replace(".", "/") + ".py"
+                    # 映射到项目内的实际文件路径
+                    for root_dir in [project_root, Path(project_root) / "src"]:
+                        candidate = Path(root_dir) / mod_path
+                        if candidate.exists():
+                            cands.append(str(candidate))
+                            break
         except Exception:
             pass
 
@@ -558,8 +597,10 @@ def parse_test_failure(traceback_text: str,
     # ── 根因定位：frame 三要素 + 源码上下文 ──
     # 解析整个块（最深的 raise 帧常在头部窗口之外），选中帧后读源码。
     frame = _select_frame(_parse_frames(scope))
+    _frame_is_test = False
     if frame is not None:
         file, line, function = frame.file, frame.line, frame.function
+        _frame_is_test = frame.is_test()
     else:
         # 无任何可识别 frame 时退回旧行为，保证不回归。
         file, line, function = _extract_file(detail), _extract_line(detail), ""
@@ -580,6 +621,7 @@ def parse_test_failure(traceback_text: str,
             expected=expected,
             actual=actual,
             candidate_files=candidate_files,
+            frame_is_test=_frame_is_test,
         )
 
     # 用语义规则匹配；第一条命中优先
@@ -599,19 +641,37 @@ def parse_test_failure(traceback_text: str,
     )
 
 
-def format_failure(issue: FailureIssue) -> str:
-    """把 FailureIssue 格式化成可注入上下文的文本。"""
+def format_failure(issue: FailureIssue, *, include_snippet: bool = True) -> str:
+    """把 FailureIssue 格式化成可注入上下文的文本。
+
+    ``include_snippet=False`` 省略源码片段：常驻证据块每个 step 都要注入，
+    片段是其中体积最大、且可由 ``file:line`` 重新读取获得的部分。
+    默认 True，一次性注入路径（[Repair Plan]）行为不变。
+    """
     lines = [f"- 失败测试: {issue.test_name or '(unknown)'}",
              f"- 错误类型: {issue.error_type}",
              f"- 语义化根因: {issue.semantic}"]
     if issue.file:
-        loc = f"- 根因位置: {issue.file}:{issue.line}" if issue.line else \
-              f"- 根因位置: {issue.file}"
-        if issue.function:
-            loc += f"  (in {issue.function})"
-        lines.append(loc)
-    if issue.source_snippet:
-        lines.append("- 源码上下文（>> 标记根因行）:")
+        if issue.frame_is_test:
+            # 纯 AssertionError：traceback 只有测试帧，file/line 是断言位置，
+            # 不是业务根因位置。明确标注，避免模型把测试文件当成修复目标。
+            loc = f"- 失败断言位置: {issue.file}:{issue.line}" if issue.line else \
+                  f"- 失败断言位置: {issue.file}"
+            lines.append(loc)
+            lines.append("- 注意: traceback 未包含业务源码异常帧，根因位置尚未确定。"
+                         "请根据测试中的函数调用和断言差异（expected vs actual）"
+                         "搜索并读取相关业务源码文件。")
+        else:
+            loc = f"- 根因位置: {issue.file}:{issue.line}" if issue.line else \
+                  f"- 根因位置: {issue.file}"
+            if issue.function:
+                loc += f"  (in {issue.function})"
+            lines.append(loc)
+    if include_snippet and issue.source_snippet:
+        if issue.frame_is_test:
+            lines.append("- 测试文件上下文（>> 标记断言行）:")
+        else:
+            lines.append("- 源码上下文（>> 标记根因行）:")
         lines.append(issue.source_snippet)
     if issue.expected or issue.actual:
         lines.append(f"- 断言值: expected={issue.expected}, actual={issue.actual}")

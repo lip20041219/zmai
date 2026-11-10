@@ -26,6 +26,8 @@ force_edit 预算耗尽。
 from __future__ import annotations
 
 import asyncio
+import sys
+import time
 from pathlib import Path
 
 from tests.test_swe_autoverify_bound import (
@@ -39,14 +41,40 @@ from zmai.agent import AgentContext
 from zmai.swe.agent import MAX_COMPLETION_BLOCKS, SWEAgent
 from zmai.tool import ToolCall, ToolRegistry
 
+
+def test_scripted_backend_shell_request_uses_remaining_wall_budget(
+    tmp_path, monkeypatch,
+):
+    _write_clean_project(tmp_path)
+    backend = _ScriptedBackend([[ToolCall(
+        id="long", name="shell_exec",
+        params={"command": "python -m pytest -q", "timeout": 2400})]])
+    context = AgentContext(
+        agent_id="deadline_chain", task="verify project", backend=backend,
+        tools=ToolRegistry(),
+        config={"project_path": str(tmp_path), "timeout": 30,
+                "timeout.max": 600, "_quiet": True,
+                "_wall_deadline_monotonic": time.monotonic() + 60},
+        metadata={},
+    )
+    seen = _patch_run(monkeypatch)
+    agent = SWEAgent("deadline_chain")
+    asyncio.run(agent.initialize(context))
+    action = asyncio.run(agent.step(context))
+
+    assert seen["cmd"].startswith("python -m pytest")
+    assert 0 < seen["timeout"] <= 57
+    assert action.type != "complete"
+
 # 完整套件命令（超时判定与 scope 判定无关，用最朴素的形态即可）。
+# 使用 sys.executable 确保调用到有 pytest 的解释器，避免依赖外部 PATH。
 _PYTEST_FULL = ToolCall(id="pt", name="shell_exec",
-                        params={"command": "python -m pytest -q"})
+                        params={"command": f"{sys.executable} -m pytest -q"})
 
 
 def _pytest_timeout_calls(n: int) -> list[list[ToolCall]]:
     return [[ToolCall(id=f"pt{i}", name="shell_exec",
-                      params={"command": "python -m pytest -q"})]
+                      params={"command": f"{sys.executable} -m pytest -q"})]
             for i in range(n)]
 
 

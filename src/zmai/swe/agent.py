@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import base64
 import hashlib
 import json
 import logging
@@ -13,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from zmai.agent import Agent, AgentAction, AgentContext, AgentResult, AgentState
 from zmai.context.memory import _truncate_head_tail
@@ -31,6 +32,7 @@ from zmai.swe.planner import generate_plan
 from zmai.swe.scanner import RepositoryInfo, RepositoryScanner
 from zmai.swe.tools import (
     EditTool,
+    FindFileTool,
     GitTool,
     GrepTool,
     OpenInBrowserTool,
@@ -43,6 +45,8 @@ from zmai.swe.tools import (
     cli_scope_names_exclusions,
     is_test_command,
     purge_bytecode_caches,
+    test_scope_changes_root,
+    test_scope_has_opaque_wrapper,
     test_scope_targets,
 )
 from zmai.swe.verifier import (
@@ -98,15 +102,27 @@ def _now_ms() -> int:
     return int(time.monotonic() * 1000)
 
 
-def _test_evidence_budget(tc: ToolCall, result: ToolResult,
-                          cm: ContextManager) -> int | None:
-    """测试失败结果 → evidence 截断预算；其余工具 → None（默认头部截断）。
+def _evidence_budget(tc: ToolCall, result: ToolResult,
+                     cm: ContextManager) -> int | None:
+    """需要"一手证据"的工具结果 → evidence 截断预算；其余 → None（默认头部截断）。
 
     P0-4：测试失败的证据（[test summary] + traceback）在 ContextManager 里若按
     默认 500 字符头部截断，模型只会看到 pytest 的 session/collection 头，看不到
     任何失败根因。测试命令的失败结果因此改走证据保留截断（头摘要 + 尾详情）。
-    普通工具（read_file/grep/git/普通 shell）与成功的测试运行保持原行为。
+
+    读源码同理，且更直接：`read_file` 的正文是模型**据以写 edit 的唯一依据**，
+    而默认 tool_truncate=500 只够 8~15 行（实测 678 行 / 24870 字符的
+    xarray/core/formatting.py 注入后只剩 530 字符），工具的 start_line/end_line
+    分页因此形同虚设 —— 模型看不到函数体，只能反复重读，随后被 FixDriving
+    硬拒（见 eval_pydata__xarray-4248：60 步 0 edit，全部读操作被拒）。
+    范围读最多几百行 ≈ 数千字符，4000 预算下头+尾基本无损；整文件读仍会省略
+    中段，但省略处有显式标记，模型可改用更窄的范围分页。
+
+    grep/git/普通 shell 与成功的测试运行保持原行为（它们的价值是行级摘要/结论，
+    不是待编辑的正文）。
     """
+    if tc.name == "read_file" and result.success:
+        return cm.test_evidence_chars
     if result.success or tc.name != "shell_exec":
         return None
     if not is_test_command(str((tc.params or {}).get("command", ""))):
@@ -140,10 +156,11 @@ def _fmt_test_totals(t: dict[str, int]) -> str:
 _WS_IGNORE_DIRS = frozenset({
     ".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache",
     ".ruff_cache", ".tox", ".venv", "venv", ".eggs", "node_modules",
-    "htmlcov", ".idea", ".vscode",
+    "htmlcov", ".idea", ".vscode", ".zmai", ".zmai_workspace",
 })
 _WS_IGNORE_SUFFIXES = (".pyc", ".pyo", ".pyd")
-_WS_IGNORE_NAMES = frozenset({".coverage", ".DS_Store"})
+_WS_IGNORE_NAMES = frozenset({".coverage", ".DS_Store",
+                              ".model_trace.jsonl", ".agent_result.json"})
 
 # 只读工具按构造不可能改动工作区，跳过指纹遍历（省一次目录树扫描）。
 # 未列出的工具——包括以后新增的——一律计算：默认"可能写"，宁可多算不可漏判。
@@ -206,6 +223,10 @@ def _git_workspace_fingerprint(root: Path) -> dict[str, tuple[int, int]] | None:
         if " -> " in path:                      # rename/copy：取目标路径
             path = path.split(" -> ", 1)[1]
         path = path.strip().strip('"')
+        if (path in (".model_trace.jsonl", ".agent_result.json")
+                or any(part in (".zmai", ".zmai_workspace")
+                       for part in path.replace("\\", "/").split("/"))):
+            continue
         try:
             st = (root / path).stat()
             fp[f"git:{ln[:2]}:{path}"] = (st.st_mtime_ns, st.st_size)
@@ -269,6 +290,17 @@ def _is_full_scope_test_command(command: str) -> bool:
     也会被判为子集——它们确实无法证明覆盖完整套件，被提示去跑完整套件是正确方向，
     不是误判。找不到运行器时返回 True（保守：保持既有行为）。
 
+    ── 命令边界也是范围边界 ──
+    `test_scope_targets` / `cli_scope_filter` 逐段检查**所有** runner，任一子集/
+    过滤选项即判非完整范围（`pytest -q || pytest test_b.py` 不能借第一段拿到完整
+    资格）。`cd sub && pytest -q` 语法上是裸 runner，但工作目录已换到子目录 ——
+    `test_scope_changes_root` 同样判否。范围证据必须与基线来自同一个项目根。
+
+    包装器/分组（`bash -c "cd tests && pytest"` / `(cd tests && pytest)` /
+    `powershell -Command "Set-Location tests; pytest"`）把 `cd` 与 runner 藏进
+    不可静态展开的执行上下文，`test_scope_has_opaque_wrapper` 判否 —— 无法证明
+    完整范围时不授予完整范围证据。
+
     ── N-1：选项也必须过一遍 ──
     光看位置目标不够：`--ignore=test_bug.py` / `--deselect=...` 这类 **flag=值** 形态
     不产生位置 token，于是被判成"完整范围"，而失败的验收测试根本没被收集 —— baseline
@@ -277,9 +309,13 @@ def _is_full_scope_test_command(command: str) -> bool:
     / `--tb=...` …）才保留完整范围资格，"没见过的选项"一律 fail-closed。
     """
     targets = test_scope_targets(command)
+    if test_scope_has_opaque_wrapper(command):
+        return False
     if targets is None:
         return True
     if targets:
+        return False
+    if test_scope_changes_root(command):
         return False
     return not cli_scope_filter(command)
 
@@ -298,6 +334,39 @@ def _fp_key(key: object) -> str:
     """
     k = str(key or "")
     return k.split(":", 2)[2] if k.startswith("git:") else k
+
+
+def _git_fp_key_is_tracked_change(key: object) -> bool:
+    """git 快路径里一个**新增 key** 是否代表已跟踪文件发生变化。
+
+    git 指纹只列出变更文件：clean 文件在基线里没有任何 key，因此一个已跟踪
+    文件被修改后，会以**新 key** 出现（状态行 ` M` / `D ` / `R ` …）。只看
+    "key 是否已存在"会把这种修改误当成新建文件，从而不失效旧的 green。
+    `??`（未跟踪）与 `A*`（新加入索引）才是真正的新文件。
+    """
+    k = str(key or "")
+    if not k.startswith("git:"):
+        return False
+    status = k.split(":", 2)[1].strip()
+    return status not in ("", "??") and not status.startswith("A")
+
+
+def _is_source_read(context: AgentContext, tc: ToolCall) -> bool:
+    """这次 read_file 读的是不是**非测试**源文件。
+
+    读测试文件不推进"待修目标"的定位：agent_24072 在只读过 1 个源文件 + 2 个
+    测试文件时就被判定"读够了"，随后连它尚未看过的 src/reports.py 也被硬拒。
+    判据复用 TestGuard 的 `_is_test_file`（与 `_handle_edit_failure` 同一口径）。
+
+    判不准时返回 True —— 按旧行为计入：`_is_test_file` 在路径无法相对化时本就
+    返回 False（保守），于是这里得到 True，触发条件不放宽。
+    """
+    p = str((tc.params or {}).get("path", "") or "")
+    if not p:
+        return True
+    root = _workspace_root(context)
+    path = Path(p)
+    return not _is_test_file(path if path.is_absolute() else root / path, root)
 
 
 # ── CR-3: 验收文件**内容**基线 ────────────────────────────────────
@@ -468,23 +537,37 @@ def _pyproject_scope_section(raw: bytes) -> str | None:
     return json.dumps(node, sort_keys=True, default=str)
 
 
+def _scope_identity_bytes(name: str, raw: bytes | None) -> str:
+    """配置文件名 + 原始内容 → scope 身份（与 `_scope_config_identity` 同一算法）。
+
+    单独抽出来供守卫快照复用：快照保存原始字节，Runtime 事后用**同一个**
+    解析器重新计算，避免被测解释器与 Agent 解释器的 TOML 能力差异造成误判。
+    """
+    name = name.lower()
+    if raw is None:
+        return _SCOPE_ABSENT
+    if name == "pyproject.toml":
+        section = _pyproject_scope_section(raw)
+    else:
+        entry = _SCOPE_CONFIG_SECTIONS.get(name)
+        if entry is None:
+            return _SCOPE_ABSENT
+        section = _ini_section(raw.decode("utf-8", "replace"), f"[{entry[0]}]")
+    if section is None:
+        return _SCOPE_ABSENT
+    return hashlib.sha256(section.encode("utf-8")).hexdigest()
+
+
 def _scope_config_identity(path: Path) -> str:
     """一个配置文件对 pytest scope 的贡献（内容摘要）。
 
     文件不存在、或没有 pytest 段 → `_SCOPE_ABSENT`（固定值，与任何摘要都不同）。
     """
     try:
-        raw = path.read_bytes()
+        raw: bytes | None = path.read_bytes()
     except OSError:
-        return _SCOPE_ABSENT
-    if path.name.lower() == "pyproject.toml":
-        section = _pyproject_scope_section(raw)
-    else:
-        section = _ini_section(raw.decode("utf-8", "replace"),
-                               f"[{_SCOPE_CONFIG_SECTIONS[path.name.lower()][0]}]")
-    if section is None:
-        return _SCOPE_ABSENT
-    return hashlib.sha256(section.encode("utf-8")).hexdigest()
+        raw = None
+    return _scope_identity_bytes(path.name, raw)
 
 
 def _capture_scope_baseline(context: AgentContext) -> dict[str, str]:
@@ -585,8 +668,13 @@ def _install_acceptance_guard(context: AgentContext) -> None:
     #      本体同样 fail-closed。
     (guard_dir / "sitecustomize.py").write_text(_GUARD_SITECUSTOMIZE, encoding="utf-8")
     manifest = guard_dir / "manifest.json"
-    manifest.write_text(json.dumps({"root": str(root), "files": baseline}),
-                        encoding="utf-8")
+    manifest.write_text(json.dumps({
+        "root": str(root),
+        "files": baseline,
+        # 守卫在 pytest 启动时把这几份配置的原文拍进快照；Runtime 事后用与
+        # run 起始基线相同的算法重算身份，覆盖 A→B→A 的瞬时改配置。
+        "scope_files": sorted(_SCOPE_CONFIG_SECTIONS),
+    }), encoding="utf-8")
     receipt = guard_dir / "receipt"
     receipt.write_text("", encoding="utf-8")
     context.metadata[_GUARD_METADATA_KEY] = {
@@ -595,6 +683,7 @@ def _install_acceptance_guard(context: AgentContext) -> None:
         "digest": _content_digest(manifest),
         "receipt": str(receipt),
         "receipt_seen": "",
+        "scope_snapshot": str(guard_dir / "scope_snapshot.json"),
         # 守卫自身的代码摘要：目录在工作区之外，但模型仍可能顺着 PYTHONPATH 找到
         # 并改写它（改成空壳 + 照写凭据）。与清单同理：摘要不符 → 本次运行不作数。
         "module_digest": _content_digest(guard_dir / "zmai_acceptance_guard.py"),
@@ -638,6 +727,40 @@ def _guard_receipt_advanced(context: AgentContext, g: dict[str, Any]) -> bool:
     return True
 
 
+def _guard_scope_drift(context: AgentContext, g: dict[str, Any]) -> list[str]:
+    """守卫在 pytest 启动时拍下的 scope 配置 vs run 起始基线。
+
+    端状态比对（`_pytest_scope_drift`）看不到 A→B→A：一条命令里先改配置、
+    再跑 pytest、最后恢复，结束后文件与起始逐字节相同。守卫在会话启动时把
+    配置原文写进快照（见 acceptance_guard），Runtime 事后用**与基线相同的
+    算法**重算身份，就能看到测试实际使用的是哪份配置。
+
+    快照缺失（守卫未加载/未写出）→ 返回空：守卫缺失本身由 receipt 判据
+    处理，这里不引入第二套 fail-closed 语义。
+    """
+    snap = g.get("scope_snapshot")
+    if not snap:
+        return []
+    try:
+        data = json.loads(Path(snap).read_text(encoding="utf-8"))
+        files = data.get("files") or {}
+    except (OSError, ValueError, AttributeError):
+        return []
+    baseline = context.metadata.get(_SCOPE_CONFIG_KEY) or {}
+    drifted: list[str] = []
+    for name, want in baseline.items():
+        if name not in files:
+            continue
+        raw_b64 = files[name]
+        try:
+            raw: bytes | None = base64.b64decode(raw_b64) if raw_b64 else None
+        except (TypeError, ValueError):
+            raw = None
+        if _scope_identity_bytes(name, raw) != want:
+            drifted.append(name)
+    return sorted(drifted)
+
+
 def _acceptance_guard_broken(context: AgentContext, test_out: str, cmd: str = "",
                              *, counts: int = 0) -> bool:
     """本次测试运行是否被守卫否掉（或守卫自身已不可信）。
@@ -646,6 +769,8 @@ def _acceptance_guard_broken(context: AgentContext, test_out: str, cmd: str = ""
       判定（既非通过也非失败）；
     * 清单文件与 run 起始记录不一致（被删/被改）→ 守卫的判据不再可信，本次结果
       一律不作为证据（fail-closed：不给"改掉清单就把守卫变成摆设"留静默通道）；
+    * 守卫在 pytest 启动时拍下的 scope 配置与 run 起始不一致 → 测试实际使用的是
+      被临时改过的收集范围（A→B→A）：本次结果同样不作为证据；
     * 命令**确实调用了 pytest**，却没有留下守卫的运行凭据 → 注入被命令内的环境变量
       覆盖/清除，守卫根本没加载：同样不产生任何判定（fail-closed，见
       `_guard_receipt_advanced`）。非 pytest 运行器（unittest / nose）不要求凭据 ——
@@ -672,8 +797,17 @@ def _acceptance_guard_broken(context: AgentContext, test_out: str, cmd: str = ""
                        context.agent_id)
         return True
     _cmd = (cmd or "").lower()
+    _is_pytest = "pytest" in _cmd or "py.test" in _cmd
+    if _is_pytest:
+        _scope_changed = _guard_scope_drift(context, g)
+        if _scope_changed:
+            logger.warning(
+                "pytest scope config changed during the test window (%s): %s",
+                context.agent_id, ", ".join(_scope_changed),
+            )
+            return True
     _advanced = _guard_receipt_advanced(context, g)
-    if ("pytest" in _cmd or "py.test" in _cmd) and counts > 0 and not _advanced:
+    if _is_pytest and counts > 0 and not _advanced:
         logger.warning(
             "Acceptance guard receipt not advanced — guard injection was overridden "
             "(%s): %s", context.agent_id, (cmd or "")[:120],
@@ -685,13 +819,14 @@ def _acceptance_guard_broken(context: AgentContext, test_out: str, cmd: str = ""
 def _acceptance_guard_msg() -> str:
     """守卫否掉本次运行时的指令（测试结果与完成门禁共用同一段话）。"""
     return "\n".join([
-        "[TestGuard] 本次测试运行没有产生有效的守卫判定，两种原因之一：",
-        "1) 测试执行期间验收/测试文件与本次运行开始时的内容不一致（守卫已中止会话）；",
+        "[TestGuard] 本次测试运行没有产生有效的守卫判定，原因之一：",
+        "1) 测试执行期间验收/测试文件，或定义 pytest 收集范围的配置，与本次运行"
+        "开始时的内容不一致（守卫已中止/拒绝该运行）；",
         "2) 守卫根本没有加载 —— 命令改写了 PYTHONPATH / PYTEST_ADDOPTS，"
         "把 Runtime 注入的 pytest 插件覆盖或清掉了。",
         "该运行的结果既不是通过证据，也不是失败证据 —— 它描述的不是项目的"
         "验收标准，不得作为完成依据。",
-        "请先（1）把测试文件恢复到本次运行开始时的原始内容"
+        "请先（1）把测试文件与 pytest scope 配置恢复到本次运行开始时的原始内容"
         "（例如 `git restore <path>` / `git checkout -- <path>`），并"
         "（2）不要用 shell 命令覆盖 PYTHONPATH / PYTEST_ADDOPTS，"
         "再重新运行完整测试套件：python -m pytest -q",
@@ -722,9 +857,38 @@ def _reset_edit_failure_recovery(context: AgentContext) -> None:
     "工具返回 success"。
     """
     context.metadata["edit_failure_recovery_attempts"] = 0
-    context.metadata["edit_recovery_read_allowance"] = 0
+    # D1：强制修改期内的边界重置（"工作区变了但调用失败"那条）**不解除**
+    # force_edit，所以不得在此清掉本周期仍有效的恢复额度 ——
+    # `_arm_force_edit_recovery` 只在 force_edit 由 False→True 的上升沿发放，
+    # 清掉后不会补发，模型就永久失去本周期唯一的取证机会。
+    # 修改成功后解除 force_edit 再调用本函数（置位顺序：force_edit=False →
+    # 本函数），额度照旧清零，故正常的周期重置语义不变。
+    if not context.metadata.get("force_edit"):
+        context.metadata["edit_recovery_read_allowance"] = 0
+        context.metadata["edit_recovery_grep_allowance"] = 0
     context.metadata["completion_block_count"] = 0
-    context.metadata["edit_recovery_grep_allowance"] = 0
+
+
+def _arm_force_edit_recovery(context: AgentContext) -> None:
+    """force_edit 上升沿：目标未知时发放一次 grep"目标发现"额度。
+
+    两个既有额度（`_take_edit_recovery_read` / `_take_edit_recovery_grep`）只在
+    `_handle_edit_failure` 里武装，即必须先有一次 edit/write_file **真的执行且
+    失败**。对"被拦截后不再尝试 edit、继续发读取调用"的模型，这个前置永远不
+    成立，强制期内就没有任何工具能产生新证据：xarray-4248 全程 0 次 edit、
+    28 次调用被拒、终态 timeout；agent_24072 进入强制期后连从未读过的
+    src/reports.py 也被拒。
+
+    这里把"目标未知 → 一次 grep"提前到强制期入口发放，复用既有消费函数与既有
+    状态块声明；不放开 read_file / git / 普通 shell_exec，也不解除 force_edit。
+
+    只在上升沿发放：调用方必须先调用本函数、再置位 force_edit，否则同一强制期内
+    被 LoopGuard 升级路径重复补充额度，一次性语义就失效了。
+    """
+    if context.metadata.get("force_edit"):
+        return  # 已在强制期内（非上升沿），不重复发放
+    if not str(context.metadata.get("edit_failure_target") or ""):
+        context.metadata["edit_recovery_grep_allowance"] = 1
 
 
 def _take_edit_recovery_read(context: AgentContext, tc: ToolCall) -> bool:
@@ -758,6 +922,10 @@ def _take_edit_recovery_grep(context: AgentContext, tc: ToolCall) -> bool:
     模型只能在预算内反复盲试 edit/write_file（pylint-6506/5859/7228 的
     0-byte diff 形态）。额度只认 grep、只发一次、不解除 force_edit，
     也不给 read_file/git/普通 shell 开口子。
+
+    武装点有两个：edit 失败恢复路径（`_handle_edit_failure`），以及强制期入口
+    `_arm_force_edit_recovery`（见其 docstring，覆盖"未发生 edit 就进入强制期"
+    的零证据状态）。
     """
     if tc.name != "grep":
         return False
@@ -835,10 +1003,17 @@ def _handle_edit_failure(context: AgentContext, cm: ContextManager,
     # 的读取额度一并关掉，让下面那句 "read target first" 变成空头支票。
     # 额度只放行 `read_file`（见 _take_edit_recovery_read），不触及 edit/write_file，
     # TestGuard 对测试文件的写保护语义不受影响。
+    # 两次额度：第一次读完整文件了解结构，第二次可聚焦特定行范围调整编辑参数。
+    # 真实运行（agent_24072 Step 74-77）证明 1 次不够：读完完整文件后想再读
+    # 行号范围定位修改点，但额度已耗尽被拦截，导致 regex_replace 持续失败。
     _force_edit_active = bool(context.metadata.get("force_edit"))
     _arm_read = bool(target) and _force_edit_active
     if _arm_read:
-        context.metadata["edit_recovery_read_allowance"] = 1
+        context.metadata["edit_recovery_read_allowance"] = 2
+        # 目标已知 → "目标发现"额度不再适用。必须在入口额度（force_edit 上升沿
+        # 发放）之后清零，否则会残留一次 grep，与定向 read 路径叠加，
+        # 破坏"已有合法 target 时不得再发 grep discovery 额度"这一不变式。
+        context.metadata["edit_recovery_grep_allowance"] = 0
     # 目标未知（TestGuard 拒绝且从未记录过源码目标）→ 发一次 grep 发现额度。
     # 此时若不放行 grep，恢复提示里"先用 grep 定位"在 force_edit 下不可执行：
     # 两个工具都被结构性禁用，模型拿不到任何靶子，只能盲试直到预算耗尽。
@@ -1020,6 +1195,7 @@ You MUST use Windows-compatible commands. Do NOT use Linux/Mac commands:
 | pwd | cd |
 | cat file.txt | type file.txt |
 | head -n 5 file.txt | (no direct equivalent; use read_file with line range) |
+| tail -n 40 file.txt | (no direct equivalent; use read_file with offset/limit, or pytest --tb=short for concise test output) |
 | grep "pattern" file.py | Use the grep tool (not shell command) |
 | touch newfile.txt | echo. > newfile.txt or type nul > newfile.txt |
 | rm file.txt | del file.txt |
@@ -1046,6 +1222,8 @@ You MUST use Windows-compatible commands. Do NOT use Linux/Mac commands:
 - **Do NOT use `cat`** — use `type` or the read_file tool
 - **Do NOT use `pwd`** — use `cd`
 - **Do NOT use `grep`** — use the grep tool (more powerful)
+- **Do NOT use `tail` or `head`** — they do not exist in cmd.exe; use read_file with line range, or pytest `--tb=short` for concise output
+- **Avoid piping pytest to `more` or `findstr`** — the pipe makes the shell return the pager's exit code (0), masking pytest's real pass/fail result. Run pytest bare (`python -m pytest -q`) and read the full output instead.
 - Do NOT run interactive commands (they will hang)
 """
 
@@ -1092,9 +1270,12 @@ Do NOT skip phases. Do NOT reorder phases.
 
 ### Phase 2: Run Tests First ⚠️ (CRITICAL)
 - Run tests via `python -m pytest` (never a bare `pytest`; on Windows prefer `.venv/Scripts/python -m pytest`)
-- See which tests FAIL before reading source code
+- If the task already names the failing test(s), or includes a failure log / traceback, start with those exact tests (`python -m pytest path/to/test_file.py::test_name -q`) — do not re-run the whole suite just to rediscover a failure you already have.
+- If the failure area is unknown, run the full suite once. Once a failure points at a specific module, prefer the narrowest test that reproduces it (single test, then its test file), and widen scope as your change's impact grows.
+- If the public issue describes a specific behavior but names no test, inspect only directly related public code and tests to build a narrow reproduction before running the full suite. Existing unrelated failures are baseline evidence, not additional bugs to fix.
+- When a failing test is named, run it before reading source; otherwise identify a narrow public reproduction first.
 - Capture the failure output — this tells you what to fix
-- ⚠️ DO NOT read source files before running tests
+- Do not edit until you have reproduced the reported behavior; focused source reads are allowed when needed to construct that reproduction.
 
 ### Phase 3: Analyze Failures
 - Review test failure output carefully
@@ -1105,9 +1286,14 @@ Do NOT skip phases. Do NOT reorder phases.
 - Write/edit files to fix the root causes
 - Only modify files that need changes
 - Make minimal, targeted changes
+- Before editing, check the relevant public test and the existing behavior at the changed interface. Do not edit just because an unrelated or environmental test failed.
+- Preserve existing input types and ordering at the changed interface; do not broaden accepted types or add recursive behavior without evidence from the public issue or existing tests.
 
 ### Phase 5: Verify
 - Re-run tests to confirm the fix works
+- Verify in this order: the failing reproduction → existing tests for the changed interface and adjacent behavior → the full suite when feasible. Review the source diff for unrelated changes before submission.
+- A targeted green proves only that target passed — it is NOT evidence that the rest of the project is unaffected or that the task is done. Before you declare completion, run the full suite once: `python -m pytest -q`.
+- If you have a code change and current targeted green evidence, have checked relevant existing behavior, and full verification remains incomplete, you may reply exactly `SUBMIT_CANDIDATE` with no tool calls. You do not need to run the full suite before submitting a candidate. This submits an unverified candidate for independent assessment; it never claims completion. Do not submit with a known new regression.
 - If tests still fail → return to Phase 3 (Analyze)
 - If all tests pass → deliver results with show_to_user
 
@@ -1119,11 +1305,13 @@ Do NOT skip phases. Do NOT reorder phases.
 5. Do not repeatedly ls/dir without purpose
 6. A "Requirements:" / numbered-list section in the user's task is a set of CONSTRAINTS, NOT separate tasks. Lines like "run tests" or "stop after success" tell you HOW to work on your single objective — never spin them into independent sub-tasks, and never keep working after your objective is met.
 7. NEVER run a bare `pytest`. Always run tests via `python -m pytest` (or `.venv/Scripts/python -m pytest` on Windows).
-8. AFTER A TEST FAILURE YOU MUST FIX IT — once you have run tests and seen failures, you are in the FIX PHASE. Read a few related source files to diagnose, THEN make the change with the `edit` or `write_file` tool. Do NOT keep reading file after file without modifying.
-9. READ-TO-FIX LIMIT — after a test failure, you may read at most a few (default 3) files before you MUST emit an `edit` or `write_file` call to fix the code. If you have not modified anything after reading 3 files post-failure, STOP reading and make your best fix now.
-10. NEVER loop: test-fail → read → test-fail → read with no modification. Each pass must move toward an edit. If your read is not advancing you toward a concrete fix, make the fix.
-11. FIX-DRIVEN TOOL CADENCE (mandatory when tests FAIL) — the ONLY acceptable tool sequence is: `shell_exec` (run pytest) → at most 3 `read_file`/`grep` to diagnose → an `edit` or `write_file` that changes code → `shell_exec` (rerun pytest). If you are in the fix phase and you call `read_file` or `grep` without having made a code change, you are failing the task.
-12. The runtime reports a "LIVE REPAIR STATUS" section each step. If it says tests are FAILING, your very next write tool call (`edit` or `write_file`) is MANDATORY — stop reading and make the edit now, even if you are not fully certain of the fix. A verifiable edit is strictly better than endless reading."""  # noqa: E501
+8. AFTER A TEST FAILURE — inspect the failing test, assertion and traceback. Decide whether it is related to the issue or your change. If it is unrelated, environmental, or has no trustworthy pre-edit baseline, do not change unrelated business code to make it green.
+9. READ-TO-FIX LIMIT — use a few focused reads to understand the relevant call chain and existing behavior before editing. If evidence is still insufficient, state what is missing; do not guess a patch merely to satisfy a read limit.
+10. NEVER loop: test-fail → read → test-fail → read with no modification. Each pass must move toward an edit. If your read is not advancing you toward a concrete fix, make the fix. Do NOT re-run the same test command unless you have (a) modified code, (b) observed a change in test results, or (c) obtained new diagnostic evidence that the previous run did not provide. Re-running tests with no code change and no new evidence wastes time and tokens.
+11. FIX-DRIVEN TOOL CADENCE — use the observed failure to select focused reads, make a justified minimal edit, and rerun that test. Do not repeat a test with unchanged code and no new diagnostic purpose.
+12. The runtime reports a "LIVE REPAIR STATUS" each step. Prioritize a justified edit when a relevant failure has been diagnosed; never make a speculative edit for an unrelated or environmental failure.
+13. DO NOT create debug plugins, conftest.py, dump scripts, or extra test files to read source code or capture test output. Use the `read_file` tool directly to inspect source files, and use pytest's built-in options (`--tb=short`, `--tb=long`, `-rf`, `-q`) to control output verbosity. If a command is rejected by TestGuard (e.g. `-p` is a declared exclusion), read the rejection reason and switch to an allowed existing tool — do NOT retry with a renamed or equivalent variant of the same forbidden command.
+14. ENVIRONMENT ERRORS ARE NOT BUGS — if pytest fails with "No module named pytest", the default Python interpreter lacks pytest. Do NOT repeatedly run `python -m pytest` (it will fail the same way). Instead: run `where pytest` to find an interpreter that has pytest, then use its full path (e.g. `C:\path\to\venv\Scripts\python.exe -m pytest -q`). If the project has a `.venv/` directory, use `.venv\Scripts\python -m pytest -q`. Do NOT auto-install pytest or modify the user's environment. If no usable interpreter is found after 2 attempts, report the environment blocker explicitly."""  # noqa: E501
 
 _PLAN_EXECUTION_PROMPT = """
 ## Execution Plan (mandatory)
@@ -1132,6 +1320,107 @@ Below is the plan you must follow when executing this task.
 Proceed step by step in the specified order. After each step, explicitly mark "Step X complete".
 If a step cannot be executed as planned, explain why and provide an alternative.
 After completing all steps, summarize the results."""
+
+
+# ── 权限事实的唯一来源 ────────────────────────────────────────────
+# "当前允许哪些工具 / 被拒时怎么解释" 过去被独立书写在四处：状态块 force_edit
+# 分支、状态块 test_failed 分支、分发处的拒绝文案、edit 失败恢复提示。它们靠注释
+# 手工同步，历史上已漂移三次（本文件内 "这条指令不可执行" / "空头支票" /
+# "状态块若不声明" 三处注释即为学费）。这里收成一份只读派生结果：
+#   * `_permission_state` 只读 metadata，不扣减/归还/重置额度、不执行工具；
+#   * `_tool_policy` 把一次 ToolCall 映射到这份结果上，供分发、拒绝文案与表测试共用。
+# 额度的武装/消费/归还/重置时序**全部留在原处**（`_take_edit_recovery_*`、
+# 分发处、`_reset_edit_failure_recovery`），这里只报告余量。
+# 本结构与真实拦截条件的等价性由 tests/test_swe_tool_policy.py 的表驱动测试钉住。
+
+_PERMISSION_DENIED_LABELS = {  # 状态块里对模型的说法（保持既有措辞）
+    "read": "read_file",
+    "grep": "grep",
+    "git": "git",
+    "shell": "non-test shell_exec",
+}
+
+_REVERT_REJECT_REASON = (
+    "[FixDriving][Recovery] 强制恢复阶段（READ TOOLS DISABLED）："
+    "上一次修改已让项目无法 import（测试收集不起来）。\n"
+    "read_file/grep/git 已被运行时结构性禁用，重复调用不会成功"
+    "（这不是临时错误）。\n"
+    "先恢复：用 `write_file` 写回修改前的正确内容，或用 `edit` "
+    "删除你刚追加/改错的代码。\n"
+    "不要继续添加新代码（仅允许重跑 pytest 验证恢复情况）。"
+)
+
+_FORCE_EDIT_REJECT_REASON = (
+    "[FixDriving] 强制修改阶段（READ TOOLS DISABLED）：测试已失败"
+    "且你已读取足够多文件。\n"
+    "read_file/grep/git/非测试 shell_exec 已被运行时结构性禁用，"
+    "重复调用不会成功，也不会返回新信息（这不是临时错误）。\n"
+    "唯一会执行的调用：`edit`、`write_file`、`show_to_user`、"
+    "以及运行 pytest 的 `shell_exec`。\n"
+    "立即用 `edit` 或 `write_file` 修改代码修复失败的测试。"
+)
+
+
+class _Permission(NamedTuple):
+    """当前权限状态的只读快照（纯派生自 metadata，不含任何副作用）。"""
+
+    denied: frozenset[str]  # 被结构性拦截的工具类；空集 = 不拦截任何工具
+    reason: str  # 被拒时的统一原因；不拦截时为空串
+    read_allowance: int
+    read_target: str
+    grep_allowance: int
+
+
+def _permission_state(context: AgentContext) -> _Permission:
+    """纯函数：读取当前权限状态。不修改 metadata，不消费额度，不执行工具。"""
+    if not context.metadata.get("force_edit", False):
+        return _Permission(frozenset(), "", 0, "", 0)
+    return _Permission(
+        denied=frozenset({"read", "grep", "git", "shell"}),
+        reason=(_REVERT_REJECT_REASON if context.metadata.get("needs_revert")
+                else _FORCE_EDIT_REJECT_REASON),
+        read_allowance=int(context.metadata.get("edit_recovery_read_allowance", 0) or 0),
+        read_target=str(context.metadata.get("edit_failure_target") or ""),
+        grep_allowance=int(context.metadata.get("edit_recovery_grep_allowance", 0) or 0),
+    )
+
+
+def _tool_class(tc: ToolCall) -> str:
+    """ToolCall → 权限类别，取值必须落在 `_permission_state.denied` 的键域内。
+
+    类别与工具名不同名（`read_file` → `read`、非测试 `shell_exec` → `shell`），
+    因此这里必须显式映射；直接返回 `tc.name` 会让 read 永远匹配不上 denied。
+    """
+    if tc.name in ("edit", "write_file", "show_to_user"):
+        return "write"
+    if tc.name == "read_file":
+        return "read"
+    if tc.name == "shell_exec":
+        return ("shell_test"
+                if is_test_command(str((tc.params or {}).get("command", "")))
+                else "shell")
+    return tc.name  # grep / git / 其余工具名与类别同名
+
+
+def _tool_policy(context: AgentContext, tc: ToolCall) -> tuple[bool, str]:
+    """纯函数：这次调用在当前状态下是否会被放行；被拒时给出统一原因。
+
+    放行条件逐条镜像 `_take_edit_recovery_read` / `_take_edit_recovery_grep`
+    的前置判定（工具名、目标匹配、额度余量、目标已知/未知），但**不扣减**额度。
+    """
+    perm = _permission_state(context)
+    if not perm.denied:
+        return True, ""
+    cls = _tool_class(tc)
+    if cls in ("write", "shell_test"):
+        return True, ""
+    if cls == "read" and perm.read_allowance > 0 and perm.read_target:
+        if _norm_target_path((tc.params or {}).get("path", "")) == \
+                _norm_target_path(perm.read_target):
+            return True, ""
+    if cls == "grep" and perm.grep_allowance > 0 and not perm.read_target:
+        return True, ""
+    return False, perm.reason
 
 
 def _build_fix_state_directive(context: AgentContext) -> str:
@@ -1144,10 +1433,18 @@ def _build_fix_state_directive(context: AgentContext) -> str:
     """
     phase = context.metadata.get("repair_phase", "idle")
     force_edit = context.metadata.get("force_edit", False)
+    # ── 持久失败证据 ──
+    # 历史消息压缩（memory.compress）只保留计数摘要（"Previous N rounds /
+    # Encountered N issues"），traceback、根因 file:line 与 expected/actual 会随
+    # 消息滚出 recent window 而永久消失；[Repair Plan] 也只在失败那一刻注入一次。
+    # 这里每个 step 从 metadata 重新渲染结构化 FailureIssue，使证据不依赖历史
+    # 消息是否还在窗口里。
+    _issue = context.metadata.get("last_failure_issue")
     # force_edit 是"读取已被硬拒绝"的硬状态，优先级高于"不注入噪音"：
     # 有一处置位点（regression 恢复）不改 repair_phase，若此时 phase 恰为 idle，
     # 早早 return "" 会让模型在完全禁读的状态下收不到任何状态块。
-    if phase == "idle" and not force_edit:
+    # 有失败证据时同样不能提前返回：证据的有效性与 repair_phase 无关。
+    if phase == "idle" and not force_edit and _issue is None:
         return ""  # 尚未进入修复态，不注入噪音
     test_failed = context.metadata.get("test_failed", False)
     reads_after_fail = context.metadata.get("reads_after_fail", 0)
@@ -1160,9 +1457,14 @@ def _build_fix_state_directive(context: AgentContext) -> str:
         # 清零（防止"拦截→喂数→再触发"的自激）。若此处照旧报读取预算，模型每步
         # 都读到 "0/3 reads used"，会认为诊断额度尚存而反复重试同一个 read/shell
         # —— 拦截是硬性的，但模型看到的状态不是，于是空转到 Force-edit 预算耗尽。
+        _perm = _permission_state(context)
+        _denied_txt = " / ".join(
+            _PERMISSION_DENIED_LABELS[c] for c in ("read", "grep", "git", "shell")
+            if c in _perm.denied
+        )
         lines.append(
-            "- READ TOOLS ARE DISABLED: read_file / grep / git / non-test "
-            "shell_exec are being REJECTED by the runtime right now."
+            f"- READ TOOLS ARE DISABLED: {_denied_txt} are being REJECTED "
+            "by the runtime right now."
         )
         lines.append(
             "- Retrying them cannot succeed — they are blocked, not failing. "
@@ -1173,41 +1475,119 @@ def _build_fix_state_directive(context: AgentContext) -> str:
             "`show_to_user`, and `shell_exec` running pytest."
         )
         lines.append("- Your next tool call MUST be `edit` or `write_file`.")
-        # edit 失败恢复放行了**一次**对目标文件的定向 read。状态块若继续宣称读取
+        # 编辑模式指引：真实故障（agent_30148）中模型在 force_edit 阶段选择 append
+        # 模式修改已有代码，导致在文件末尾追加不相关内容、原始错误逻辑未被替换，
+        # 测试从 3 failed 恶化到 4 failed，陷入恢复困境后连续截断失败。成功运行
+        # （agent_16668）使用 replace_lines 模式，即使参数有误也可通过后续编辑修正。
+        # 此处仅做提示引导，不强制禁用 append（添加全新函数时仍需使用）。
+        lines.append(
+            "- When fixing existing code, prefer `edit` mode `replace_lines` or "
+            "`regex_replace` to replace the target lines precisely. Use `append` only "
+            "when adding a brand-new function or file at the end — never use it to modify "
+            "existing logic. After editing, verify the target code was actually changed "
+            "(no duplicate definitions, no leftover buggy lines)."
+        )
+        # edit 失败恢复放行了**两次**对目标文件的定向 read。状态块若继续宣称读取
         # 全禁用，模型会当成矛盾指令而不敢重读，恢复提示里的 "read target first"
         # 就成了空头支票（与 LoopRecovery 处同一条教训）。
-        _allow = int(context.metadata.get("edit_recovery_read_allowance", 0) or 0)
-        _rt = str(context.metadata.get("edit_failure_target") or "")
-        if _allow > 0 and _rt:
+        # 两次额度的原因：第一次读完整文件了解结构，第二次可聚焦特定行范围定位修改点。
+        if _perm.read_allowance > 0 and _perm.read_target:
             lines.append(
-                f"- EXCEPTION (上一次 edit 失败): ONE `read_file` of `{_rt}` is allowed "
-                "now so you can re-read its real content before retrying the edit. "
-                "After that single read, reads are rejected again."
+                f"- EXCEPTION (上一次 edit 失败): UP TO TWO `read_file` calls on "
+                f"`{_perm.read_target}` are allowed now so you can re-read its real "
+                "content before retrying the edit. After these two reads, reads are "
+                "rejected again."
             )
-        # 目标未知时发的是 grep 发现额度。状态块若不声明它，"读取全禁用"就会
-        # 与恢复提示里的一次性 grep 互相矛盾（同 `_rt` 那条教训）。
-        _gallow = int(context.metadata.get("edit_recovery_grep_allowance", 0) or 0)
-        if _gallow > 0:
+        # 目标未知时发的是 grep 发现额度，两个来源：强制期入口
+        # （`_arm_force_edit_recovery`）与"edit 失败且目标为空"的恢复路径。
+        # 状态块若不声明它，"读取全禁用"就会与这条额度互相矛盾（同 `_rt` 那条教训），
+        # 模型会以为 grep 一定被拒而不敢使用这唯一一次取证机会。
+        if _perm.grep_allowance > 0:
             lines.append(
-                "- EXCEPTION (上一次 edit 失败且目标未知): ONE `grep` is allowed now "
-                "to locate the source file that must be modified. After that single "
-                "grep, reads are rejected again."
+                "- EXCEPTION (目标未知): ONE `grep` is allowed now to locate the "
+                "source file that must be modified — use it for source evidence, "
+                "not for re-reading test files. After that single grep, reads are "
+                "rejected again."
             )
     elif test_failed:
         lines.append(
             f"- tests are FAILING → you MUST emit `edit` or `write_file` to fix "
             f"(you have used {reads_after_fail}/{limit} reads since the failure)"
         )
+        # 区分"工具是否被允许"与"当前建议的下一步"：本状态下运行时**不拦截**
+        # read_file/grep（拦截只在 force_edit 生效），旧文案 "DO NOT call ..."/
+        # "required" 会让模型误以为二者已被结构性拒绝 —— 与真实语义不符。
         lines.append(
-            "- DO NOT call read_file/grep again without a code change. "
-            "Your next write tool call is required."
+            "- read_file/grep are NOT blocked in this state — the runtime still "
+            "allows them — but another read will not advance the fix: your next "
+            "tool call should be `edit` or `write_file`."
+        )
+        lines.append(
+            "- A `[ReadCache]` response means that file is unchanged and already in "
+            "your context — reuse it; re-reading returns no new information."
         )
     else:
         lines.append("- tests are passing or not yet run; keep verifying.")
+    # ── 已读文件列表：force_edit 和 test_failed 阶段共用 ──
+    # 原放在 elif test_failed 分支内，force_edit=True 时被 if force_edit 分支跳过，
+    # 导致提示从未注入真实请求。移到分支外，仅在修复态（force_edit 或 test_failed）
+    # 且有已读文件时追加。过滤空路径避免 ", app.py" 之类的畸形输出。
+    if force_edit or test_failed:
+        _read_seen_raw = context.metadata.get("_read_files_seen") or set()
+        _read_seen_filtered = sorted(p for p in _read_seen_raw if p)
+        if _read_seen_filtered:
+            lines.append(
+                f"- Files already read this session: {', '.join(_read_seen_filtered)} — "
+                "do not re-read these unless you just edited them or need a line range you have not seen."
+            )
+    # ── 注入最后一次有效测试命令 ──────────────────────────
+    # 避免 Agent 在 FixDriving 阶段忘记可用解释器路径，反复执行已知失败的命令。
+    _last_cmd = context.metadata.get("last_working_test_cmd", "")
+    if _last_cmd and not (context.metadata.get("pre_edit_full_suite_failure")
+                          and not context.metadata.get("ever_modified")):
+        lines.append(f"- Last working pytest command (reuse this exact path): `{_last_cmd}`")
+    # ── 常驻失败证据块 ──
+    # 只保留定位所需的结构化字段；源码片段由 read_file 按 file:line 重取
+    # （format_failure 的 include_snippet=False），控制每个 step 的固定开销。
+    # ── 待修 Bug 清单（多 Bug 场景的全局视图）──
+    # 之前只注入单个失败测试（_issue），多 Bug 时 Agent 看不到全局，
+    # 反复读文件但不知道还有多少个没修。这里列出所有失败测试名，
+    # 让 Agent 按清单逐一修复。
+    _failed_names = context.metadata.get("failed_test_names", [])
+    if (_failed_names and context.metadata.get("last_test_full_scope")
+            and not context.metadata.get("ever_modified")):
+        lines.append(
+            "- The full-suite failures are a pre-edit baseline, not proven targets "
+            "of the public issue. Reuse the existing result; make a focused "
+            "reproduction of the reported behavior before choosing a source edit."
+        )
+    elif _failed_names:
+        lines.append("\n## TODO Bug List (state machine: one at a time)")
+        lines.append(f"- Remaining: {len(_failed_names)} failing test(s)")
+        for i, name in enumerate(_failed_names, 1):
+            if i == 1:
+                lines.append(f"  >>> CURRENT TARGET: {name}")
+            else:
+                lines.append(f"  [{i}] {name}")
+        lines.append("")
+        lines.append("STATE MACHINE RULES (mandatory):")
+        lines.append(f"  1. You are currently fixing: {_failed_names[0]}")
+        lines.append("  2. Do NOT read files related to other tests. Only investigate THIS test.")
+        lines.append("  3. Make ONE edit to fix THIS test.")
+        lines.append("  4. Re-run pytest. If THIS test passes, it moves to 'done' and the next becomes CURRENT TARGET.")
+        lines.append("  5. If THIS test still fails after your edit, read its traceback again and fix it — do NOT switch to another test.")
+        lines.append("  6. When the list is empty (0 failing tests), you are done.")
+    if _issue is not None:
+        from zmai.swe.failure import format_failure
+
+        lines.append("\n## FAILURE EVIDENCE (persistent, rebuilt every step)")
+        lines.append(format_failure(_issue, include_snippet=False))
     return "\n".join(lines) + "\n"
 
 
-def _build_system_prompt(backend: Backend | None = None) -> str:
+def _build_system_prompt(
+    backend: Backend | None = None, *, test_selection_strategy: str = "adaptive",
+) -> str:
     """Build the full system prompt (base instructions + platform guide + backend identity)."""
     # Backend identity — read dynamically from backend instance
     identity_parts = []
@@ -1222,8 +1602,21 @@ def _build_system_prompt(backend: Backend | None = None) -> str:
                 identity_parts.append(f"Current model: {bm}.")
         identity_parts.append("")
 
+    if test_selection_strategy not in ("adaptive", "legacy"):
+        raise ValueError(f"Unknown test selection strategy: {test_selection_strategy}")
+    base_prompt = _BASE_SYSTEM_PROMPT
+    if test_selection_strategy == "legacy":
+        if "start with those exact tests" not in base_prompt:
+            raise RuntimeError("Adaptive test selection instruction is missing")
+        base_prompt = base_prompt.replace(
+            "- If the task already names the failing test(s), or includes a failure log / traceback, start with those exact tests (`python -m pytest path/to/test_file.py::test_name -q`) — do not re-run the whole suite just to rediscover a failure you already have.\n"
+            "- If the failure area is unknown, run the full suite once. Once a failure points at a specific module, prefer the narrowest test that reproduces it (single test, then its test file), and widen scope as your change's impact grows.",
+            "- Run the full suite first, even when the task already names failing tests or includes a failure log / traceback.\n"
+            "- After that first full run, use the failing test to diagnose the issue and widen verification as the change's impact grows.",
+            1,
+        )
     platform_prompt = _build_platform_prompt()
-    return "\n".join(identity_parts) + _BASE_SYSTEM_PROMPT + platform_prompt
+    return "\n".join(identity_parts) + base_prompt + platform_prompt
 
 
 class SWEAgent(Agent):
@@ -1234,6 +1627,9 @@ class SWEAgent(Agent):
 
     async def initialize(self, context: AgentContext) -> None:
         logger.info("SWEAgent initializing: %s", context.agent_id)
+        # 新任务开始：不得残留上一任务的失败证据（context/metadata 被复用时
+        # last_failure_issue 会把上一个任务的根因位置带进本次的常驻证据块）。
+        context.metadata.pop("last_failure_issue", None)
         # Initialize ContextManager
         if "cm" not in context.metadata:
             context.metadata["cm"] = ContextManager(config=context.config)
@@ -1347,7 +1743,7 @@ class SWEAgent(Agent):
             existing = {t.name for t in context.tools.list()}
             for tool in [
                 ReadFileTool(), WriteFileTool(), EditTool(),
-                GrepTool(), ShellTool(), GitTool(),
+                GrepTool(), FindFileTool(), ShellTool(), GitTool(),
                 ShowToUserTool(), OpenInBrowserTool(),
             ]:
                 if tool.name not in existing:
@@ -1501,7 +1897,10 @@ class SWEAgent(Agent):
                 memory_context = "\n## Memory Context\n" + "\n".join(mem_lines) + "\n"
 
         bc = context.backend.config if hasattr(context.backend, "config") else {}
-        system_prompt = _build_system_prompt(backend=context.backend) + memory_context
+        system_prompt = _build_system_prompt(
+            backend=context.backend,
+            test_selection_strategy=context.config.get("test_selection_strategy", "adaptive"),
+        ) + memory_context
         # 注入当前修复状态：让模型每个 step 都看到"测试失败/已读N文件/必须修改"
         system_prompt += _build_fix_state_directive(context)
 
@@ -1524,12 +1923,23 @@ class SWEAgent(Agent):
 
         # Get messages from ContextManager
         ctx_messages = cm.get_context()
+        # force_edit 阶段模型需要输出 edit/write_file 工具调用。deepseek-v4-flash
+        # 等思考模型会先用大量 token 进行推理（reasoning_tokens），再输出实际响应。
+        # v3 实测：FixDriving 后连续 3 次 stop_reason=length，completion_tokens 全部
+        # 是 reasoning_tokens，没有剩余 token 生成工具调用。默认 4096 不足以覆盖
+        # "思考 + 工具调用"，因此在 force_edit 阶段提高输出上限。
+        # 注意：tool_choice="required" 在 DeepSeek 思考模式下返回 HTTP 400，不可用。
+        _force_edit_active = bool(context.metadata.get("force_edit"))
+        _base_max_tokens = int(bc.get("max_tokens", 4096))
+        _effective_max_tokens = max(_base_max_tokens, 8192) if _force_edit_active else _base_max_tokens
         request = BackendRequest(
             messages=ctx_messages,
             tools=tool_defs or None,
             system_prompt=system_prompt,
-            max_tokens=bc.get("max_tokens", 4096),
+            max_tokens=_effective_max_tokens,
             temperature=bc.get("temperature", 0.7),
+            metadata={"_wall_deadline_monotonic": context.config.get(
+                "_wall_deadline_monotonic")},
         )
 
         # ── Backend invocation (with auto-retry) ──────────────
@@ -1551,6 +1961,17 @@ class SWEAgent(Agent):
             except Exception as e:
                 last_error = e
                 response = None
+            # Every successful backend response consumes tokens, including one
+            # discarded as truncated and retried below.
+            if response is not None and response.usage:
+                _tok = context.metadata.setdefault("token_usage", {
+                    "input_tokens": 0, "output_tokens": 0,
+                    "cache_read_tokens": 0, "cache_write_tokens": 0,
+                })
+                _tok["input_tokens"] += response.usage.input_tokens
+                _tok["output_tokens"] += response.usage.output_tokens
+                _tok["cache_read_tokens"] += response.usage.cache_read_tokens
+                _tok["cache_write_tokens"] += response.usage.cache_write_tokens
             # ── P1-B: 退化响应不进入正常回合 ──────────────────
             # HTTP 200 + 空/截断响应走同一条 retry budget 与退避：它与网络抖动
             # 一样属于"这一次调用没拿到可用输出"，不该被当成一次模型决策消费。
@@ -1563,6 +1984,25 @@ class SWEAgent(Agent):
                                    attempt + 1, max_retries, _degenerate, context.agent_id)
                     last_error = RuntimeError(f"[DEGENERATE_RESPONSE] {_degenerate}")
                     response = None
+                    # ── 截断恢复：不重复相同请求 ──────────────
+                    # stop_reason=length/max_tokens 且无 tool_calls 时，模型在生成
+                    # 纯文本时达到输出限制。重试完全相同的请求会得到相同的截断结果
+                    # （确定性），属于无效重试。注入恢复消息引导模型直接输出工具调用，
+                    # 使下一次请求的上下文不同，避免确定性重复。
+                    if "truncated" in _degenerate and attempt < max_retries - 1:
+                        request.messages.append({
+                            "role": "user",
+                            "content": (
+                                "[Recovery] 上一次响应被截断（stop_reason=length），"
+                                "没有产生任何工具调用。\n"
+                                "不要输出解释性文本或分析。直接输出一个 edit 或 write_file "
+                                "工具调用来修复失败的测试。修复后再运行 pytest 验证。\n"
+                                "如果你处于强制修改阶段（READ TOOLS DISABLED），唯一可执行的"
+                                "写操作是 edit 或 write_file——立即调用其中一个。"
+                            ),
+                        })
+                        logger.info("Truncation recovery: injected guidance message before retry %d",
+                                    attempt + 2)
             if last_error is None:
                 break
             if attempt < max_retries - 1:
@@ -1578,6 +2018,15 @@ class SWEAgent(Agent):
                     attempt + 1, max_retries, last_error,
                 )
 
+        # ── 轨迹快照：本次模型调用**实际**收到的输入 ──────────────
+        # system_prompt 是 BackendRequest 的独立字段，不在 metadata["messages"]
+        # 里；截断重试还会往 request.messages 追加恢复消息。所以这里取 request
+        # 本身（重试循环结束后的最终形态），而不是 cm.get_context() 的副本。
+        context.metadata["__last_request__"] = {
+            "system_prompt": request.system_prompt,
+            "messages": [dict(m) for m in request.messages],
+        }
+
         if last_error or response is None:
             _l = context.metadata.get("__log__")
             if _l:
@@ -1590,21 +2039,22 @@ class SWEAgent(Agent):
             _graph_enter(context, Node.FAILED, "backend_call_failed")
             return AgentAction.fail(str(last_error or "Backend produced no response"))
 
-        # ── Token 用量累积（G1）──────────────────────────
-        # Backend 已解析 usage（input/output/cache），逐轮累加进 metadata。
-        # finalize() 将其透出到 AgentResult，Runtime.run() 再透出给 Runner，
-        # 供 result.json 统计整体 token 消耗。
-        if response.usage:
-            _tok = context.metadata.setdefault("token_usage", {
-                "input_tokens": 0, "output_tokens": 0,
-                "cache_read_tokens": 0, "cache_write_tokens": 0,
-            })
-            _tok["input_tokens"] += response.usage.input_tokens
-            _tok["output_tokens"] += response.usage.output_tokens
-            _tok["cache_read_tokens"] += response.usage.cache_read_tokens
-            _tok["cache_write_tokens"] += response.usage.cache_write_tokens
-
-        if response.content:
+        deepseek_protocol = getattr(context.backend, "provider", "") == "deepseek"
+        if deepseek_protocol:
+            assistant_message: dict[str, Any] = {
+                "role": "assistant", "content": response.content or None,
+            }
+            reasoning = response.metadata.get("reasoning_content")
+            if reasoning is not None:
+                assistant_message["reasoning_content"] = reasoning
+            if response.tool_calls:
+                assistant_message["tool_calls"] = (
+                    response.metadata.get("tool_calls_raw") or [
+                        {"id": tc.id, "type": "function", "function": {
+                            "name": tc.name, "arguments": json.dumps(tc.params)}}
+                        for tc in response.tool_calls])
+            cm.add_api_message(assistant_message)
+        elif response.content:
             cm.add_message("assistant", response.content)
 
         if response.tool_calls:
@@ -1626,6 +2076,7 @@ class SWEAgent(Agent):
             fix_read_limit = int(context.config.get("fix.read_limit", 3))
             test_failed = context.metadata.get("test_failed", False)
             reads_after_fail = context.metadata.get("reads_after_fail", 0)
+            src_reads_after_fail = context.metadata.get("src_reads_after_fail", 0)
             # ── Repair phase 状态机（跨步持久化）──
             # 驱动：idle→diagnose(测试失败)→plan(注入修复计划)→edit(修改成功)→verify(测试通过)→done
             repair_phase = context.metadata.get("repair_phase", "idle")
@@ -1639,9 +2090,10 @@ class SWEAgent(Agent):
                     project_path=context.config.get("project_path"),
                     config=context.config,
                     timeout=context.config.get("timeout", 30),
-                    # P1-1: 把"这份内容是否仍在模型可见窗口"的判据交给 ContextManager。
-                    # 工具只拿探针，不持有 cm 引用。
-                    read_visible=cm.is_read_visible,
+                    # P1-1/P1-2: 把"这份内容在模型可见窗口中的交付状态"的判据交给
+                    # ContextManager（完整 / 被截断 / 不在窗口）。工具只拿探针，
+                    # 不持有 cm 引用。
+                    read_state=cm.read_state,
                     # CR-4: 测试命令的子进程环境（守卫注入）。非测试命令不使用。
                     env=_acceptance_guard_env(context),
                 )
@@ -1652,6 +2104,14 @@ class SWEAgent(Agent):
                 # 测试失败且已达到读取阈值后，read_file/grep 只会让 agent 继续空转。
                 # 结构性阻断读取，逼 agent 下一步只能是 edit/write_file（或重跑 pytest）。
                 _force_edit = context.metadata.get("force_edit", False)
+                _prior_full = context.metadata.get("pre_edit_full_suite_failure")
+                _repeat_full = bool(
+                    tc.name == "shell_exec" and _prior_full
+                    and not context.metadata.get("ever_modified")
+                    and _prior_full["fingerprint"] == context.metadata.get("__ws_fingerprint__")
+                    and is_test_command(str((tc.params or {}).get("command", "")))
+                    and _is_full_scope_test_command(str((tc.params or {}).get("command", "")))
+                )
                 # FixDriving 强制修改阶段：拦截所有非写、非展示工具。
                 # 若只拦 read_file/grep，执着的 LLM 可反复用 shell_exec 重跑失败的
                 # pytest 来"逃逸"——每次失败重跑都会把 reads_after_fail 清零，
@@ -1672,39 +2132,41 @@ class SWEAgent(Agent):
                 # shell 照旧被拒绝，其它文件也拿不到这个额度。
                 # 目标未知时改发一次 grep 发现额度：两个取用函数互斥（read 只认
                 # read_file、grep 只认 grep 且要求 target 为空），不会双重消耗。
-                _recovery_read = _force_edit and (
-                    _take_edit_recovery_read(context, tc)
-                    or _take_edit_recovery_grep(context, tc)
-                )
-                if (_force_edit and not _test_cmd_exempt and not _recovery_read
+                # 分别记录是哪个额度被取用（互斥），供下方 D2 的"执行失败归还"用。
+                _recovery_grep = False
+                _recovery_read = False
+                if _force_edit:
+                    _recovery_read = _take_edit_recovery_read(context, tc)
+                    if not _recovery_read:
+                        _recovery_grep = _take_edit_recovery_grep(context, tc)
+                    _recovery_read = _recovery_read or _recovery_grep
+                if _repeat_full:
+                    result = ToolResult.err(
+                        "[REPEATED_FULL_SUITE] A complete pre-edit full-suite failure "
+                        "is already recorded for this unchanged source. This call was not "
+                        "executed and supplies no new test evidence. Use the existing "
+                        "failure list; reproduce the public issue with a focused test or "
+                        "command before editing. After a code change, rerun the needed "
+                        "regression tests."
+                    )
+                    _intercepted = True
+                elif (_force_edit and not _test_cmd_exempt and not _recovery_read
                         and tc.name not in ("edit", "write_file", "show_to_user")):
-                    # 恢复态优先：上一次修改已让项目无法 import 时，正确的下一步是
-                    # "撤回那次修改"，而不是继续叠加新修改（P1-D）。
-                    if context.metadata.get("needs_revert"):
-                        _reject_msg = (
-                            "[FixDriving][Recovery] 强制恢复阶段（READ TOOLS DISABLED）："
-                            "上一次修改已让项目无法 import（测试收集不起来）。\n"
-                            "read_file/grep/git 已被运行时结构性禁用，重复调用不会成功"
-                            "（这不是临时错误）。\n"
-                            "先恢复：用 `write_file` 写回修改前的正确内容，或用 `edit` "
-                            "删除你刚追加/改错的代码。\n"
-                            "不要继续添加新代码（仅允许重跑 pytest 验证恢复情况）。"
-                        )
-                    else:
-                        _reject_msg = (
-                            "[FixDriving] 强制修改阶段（READ TOOLS DISABLED）：测试已失败"
-                            "且你已读取足够多文件。\n"
-                            "read_file/grep/git/非测试 shell_exec 已被运行时结构性禁用，"
-                            "重复调用不会成功，也不会返回新信息（这不是临时错误）。\n"
-                            "唯一会执行的调用：`edit`、`write_file`、`show_to_user`、"
-                            "以及运行 pytest 的 `shell_exec`。\n"
-                            "立即用 `edit` 或 `write_file` 修改代码修复失败的测试。"
-                        )
-                    result = ToolResult.err(_reject_msg)
+                    # 原因文案的唯一出处是 `_permission_state`（恢复态优先：
+                    # 上一次修改已让项目无法 import 时，正确的下一步是"撤回那次修改"，
+                    # 而不是继续叠加新修改 —— P1-D）。
+                    result = ToolResult.err(_permission_state(context).reason)
                     _intercepted = True
                 else:
                     result = context.tools.execute_tool(tc.name, tc.params, tctx)
                     _intercepted = False
+                    # D2：grep 额度在执行**之前**就已扣减。若这次调用因工具自身
+                    # 失败（缺 pattern / 正则错误 / 参数校验 / 超时 / 未注册），
+                    # 模型没有拿到任何证据，一次性额度必须归还 —— 否则本强制期
+                    # 唯一的取证机会被一次手误吃掉。
+                    # "no matches" 是 ToolResult.ok（tools.py:1023），属正常证据，不归还。
+                    if _recovery_grep and not result.success:
+                        context.metadata["edit_recovery_grep_allowance"] = 1
                 _dur = _now_ms() - _ts
                 # ── P1-3: 用工作区真实状态判断"是否发生修改" ──
                 # 只认工具名（write_file/edit）会漏掉一切经 shell 的修改：
@@ -1714,6 +2176,7 @@ class SWEAgent(Agent):
                 # 完成），且修改前的 green state 不会被失效。
                 # 这里改为比对工作区指纹 —— 判断"实际有没有变"，而不是猜命令意图。
                 _ws_changed = False
+                _existing_files_modified = False
                 if not _intercepted and tc.name not in _READ_ONLY_TOOLS:
                     _explicit_root = _explicit_workspace_root(context)
                     _fp = _workspace_fingerprint(
@@ -1756,6 +2219,7 @@ class SWEAgent(Agent):
                         # _green_once 完成；也防同一步内"先全绿再动测试"靠
                         # CompletionState 完成）。只作废旧证据，不记 ever_modified。
                         context.metadata["test_success_count"] = 0
+                        context.metadata.pop("candidate_test_evidence", None)
                         if completion:
                             completion.record_modification(step=context.step_count)
                         # 立刻把恢复指令交给模型（step 末随上下文进入下一轮）
@@ -1792,6 +2256,42 @@ class SWEAgent(Agent):
                     # 向 LoopGuard 提供 progress（_ws_changed 同源）。违规态下
                     # 整次调用都不算进展，即使同一命令里也改了源码 —— 违规主导。
                     _ws_changed = _fp_changed and not (_gone or _rewritten)
+                    # ── 区分"工作区变化"与"修复进展" ──────────────
+                    # 仅创建新文件（调试插件、临时转储文件等）不算修复进展，
+                    # 不应清除 test_failed/reads_after_fail/force_edit 或重置
+                    # LoopGuard no_progress。判据是指纹 key 集合：已有文件在
+                    # _prev_fp 中且内容变化/被删除，才算修改了目标代码。
+                    # （被删除的验收文件走 CR-1，_ws_changed 已为 False，
+                    # 不会落到这里。）
+                    _existing_files_modified = False
+                    if _ws_changed and _prev_fp is not None:
+                        for _k, _v in _fp.items():
+                            if _k in _prev_fp and _prev_fp[_k] != _v:
+                                _existing_files_modified = True
+                                break
+                        if not _existing_files_modified:
+                            # 新增的 git key 可能是"已跟踪文件被修改"（clean 文件
+                            # 基线里没有 key），不能一律当成新建文件；目录树的
+                            # 删除则表现为 key 消失。
+                            _existing_files_modified = any(
+                                _git_fp_key_is_tracked_change(k)
+                                for k in _fp if k not in _prev_fp
+                            ) or any(k not in _fp for k in _prev_fp)
+                    # ── CR-5: pytest 范围配置在两次测试之间被改动 ──
+                    # 测试结果处理与纯文本收尾都会重新比对 scope 配置，但 step
+                    # 入口与 post-tool 的完成门禁只看 green 计数。改已有配置文件
+                    # 会走 _existing_files_modified，**新增** setup.cfg /
+                    # pyproject.toml 却属于"新文件"——若不在改动点作废旧 green，
+                    # 本步末就会直接 COMPLETED，而新配置下的完整套件从未跑过。
+                    _scope_drift_now = _pytest_scope_drift(context)
+                    if _scope_drift_now:
+                        context.metadata["test_success_count"] = 0
+                        context.metadata.pop("candidate_test_evidence", None)
+                        completion.record_modification(step=context.step_count)
+                        logger.warning(
+                            "pytest scope config changed — prior green invalidated "
+                            "(%s): %s", context.agent_id, ", ".join(_scope_drift_now),
+                        )
                     context.metadata["__ws_fingerprint__"] = _fp
                 # ── 修改证据独立于工具 success ──
                 # 判据是"工作区**实际**有没有变"（工作区指纹），而不是"命令是否返回 0"。
@@ -1804,6 +2304,7 @@ class SWEAgent(Agent):
                 if _ws_changed and not result.success:
                     had_modification = True
                     context.metadata["ever_modified"] = True
+                    context.metadata.pop("candidate_test_evidence", None)
                     if completion:
                         completion.record_modification(step=context.step_count)
                     context.metadata["test_success_count"] = 0
@@ -1816,13 +2317,19 @@ class SWEAgent(Agent):
                     # ever_modified=True 并解除 force_edit，同时清空 test_failed ——
                     # 既是 no_change 逃逸口，也让 FixDriving 被无声解除。
                     # 指纹比对天然区分二者：只读 git 不改变工作区 → _ws_changed False。
-                    if tc.name in ("write_file", "edit") or _ws_changed:
+                    # 修复进展判据：edit 只能修改已有文件；write_file/shell/git
+                    # 需要确实修改了已有文件（而非仅创建新文件）。创建临时调试
+                    # 插件等新文件不算修复进展，不应清除失败修复状态或解除 force_edit。
+                    _repair_progress = (tc.name == "edit") or _existing_files_modified
+                    if _repair_progress:
                         had_modification = True
                         # 记录真实代码修改：eval 守卫据此放行完成判定
                         context.metadata["ever_modified"] = True
+                        context.metadata.pop("candidate_test_evidence", None)
                         # 修改成功 → 退出修复态（已产生进展），进入"修改"阶段
                         test_failed = False
                         reads_after_fail = 0
+                        src_reads_after_fail = 0
                         context.metadata["force_edit"] = False
                         repair_phase = "edit"
                         # ── CompletionState: 任何修改使旧测试结果失效 ──
@@ -1887,6 +2394,14 @@ class SWEAgent(Agent):
                         _totals = parse_test_totals(test_out)
                         _total_tests = (_totals["passed"] + _totals["failed"]
                                         + _totals["errors"])
+                        # ── 记录最后一次有效测试命令 ──────────────
+                        # pytest 实际运行并产生 passed/failed 计数时记录完整命令。
+                        # 纯 collection error（只有 errors、没有 passed/failed）不算
+                        # "可用"——它说明环境/导入有问题，记录它会让 FixDriving 把
+                        # 一条必然再次失败的命令注入给 Agent。
+                        if _totals["passed"] > 0 or _totals["failed"] > 0:
+                            context.metadata["last_working_test_cmd"] = \
+                                tc.params.get("command", "")
                         _guard_broken = _acceptance_guard_broken(
                             context, test_out, _cmd_l, counts=_total_tests)
                         # ── Regression Detection（本轮 vs 上一轮）──
@@ -1906,15 +2421,68 @@ class SWEAgent(Agent):
                         # 若要容忍 -q 增删或 pytest vs python -m pytest 的改写，
                         # 再提取 pytest 的目标参数作为 key。
                         _scope = " ".join(sorted(_cmd_l.split()))
+                        _test_ids = (result.metadata or {}).get("pytest_failed_ids")
+                        _ids_complete = isinstance(_test_ids, list)
+                        _baseline_safe = (
+                            _ids_complete and _totals["passed"] + _totals["failed"] > 0
+                            and not _guard_broken and not _scope_drift
+                            and not any(_acceptance_violation(context))
+                            and not cli_scope_names_exclusions(_cmd_l)
+                        )
+                        _pre_edit = context.metadata.setdefault("pre_edit_test_baselines", {})
+                        _new_failure_ids: list[str] = []
+                        if _baseline_safe and not context.metadata.get("ever_modified"):
+                            _pre_edit.setdefault(_scope, {
+                                "failed_ids": list(_test_ids), "totals": dict(_totals),
+                            })
+                        elif context.metadata.get("ever_modified"):
+                            _before = _pre_edit.get(_scope)
+                            _comparison = {"scope": _scope, "status": "unknown",
+                                           "reason": "missing_or_incomplete_baseline"}
+                            if _before and _baseline_safe:
+                                _old_ids = set(_before["failed_ids"])
+                                _new_ids = set(_test_ids)
+                                _new_failure_ids = sorted(_new_ids - _old_ids)
+                                _comparison = {
+                                    "scope": _scope,
+                                    "status": "new_failures" if _new_failure_ids else "comparable",
+                                    "pre_existing": sorted(_old_ids & _new_ids),
+                                    "resolved": sorted(_old_ids - _new_ids),
+                                    "introduced": _new_failure_ids,
+                                }
+                                cm.add_message("user",
+                                    "[TEST_BASELINE] 同一测试范围内："
+                                    f"原有失败 {len(_comparison['pre_existing'])}，"
+                                    f"已修复 {len(_comparison['resolved'])}，"
+                                    f"新增失败 {len(_new_failure_ids)}。"
+                                    "原有失败不能自动归咎于本次修改；新增失败必须解决。"
+                                )
+                            context.metadata["test_baseline_comparison"] = _comparison
+                            if _comparison["status"] == "new_failures":
+                                context.metadata.setdefault("unresolved_regressions", {})[_scope] = _new_failure_ids
+                            elif _comparison["status"] == "comparable":
+                                context.metadata.setdefault("unresolved_regressions", {}).pop(_scope, None)
                         _prev_totals = (
                             context.metadata.get("last_test_totals")
                             if context.metadata.get("last_test_scope") == _scope
                             else None
                         )
                         _verdict = classify_test_progress(_prev_totals, _totals)
+                        if _new_failure_ids:
+                            _prev_totals = _prev_totals or _pre_edit[_scope]["totals"]
+                            _verdict = "regression"
+                        if _verdict == "regression":
+                            context.metadata.setdefault("unresolved_regressions", {})[_scope] = (
+                                _new_failure_ids or ["unclassified_regression"])
+                        elif passed and _baseline_safe:
+                            context.metadata.setdefault("unresolved_regressions", {}).pop(_scope, None)
                         if _totals["passed"] + _totals["failed"] > 0:
                             context.metadata["last_test_totals"] = dict(_totals)
                             context.metadata["last_test_scope"] = _scope
+                            # 保存所有失败测试名，用于生成待修 Bug 清单
+                            import re as _re
+                            _failed_names = _re.findall(r"FAILED\s+(\S+)", test_out)
+                            context.metadata["failed_test_names"] = _failed_names
                             # 测试重新被收集起来 → 已从"改坏"状态恢复
                             context.metadata.pop("needs_revert", None)
                         # 计数正常的运行照旧记录（含首次 "first"）；无计数的运行只在
@@ -1943,9 +2511,11 @@ class SWEAgent(Agent):
                                 "[Regression]\n"
                                 f"previous test result: {_fmt_test_totals(_prev_totals)}\n"
                                 f"current test result: {_fmt_test_totals(_totals)}\n\n"
-                                "Regression detected: the latest modification made the "
-                                "test state worse. Reconsider the latest change before "
-                                "continuing."
+                                + (f"New failing tests after modification: "
+                                   f"{', '.join(_new_failure_ids[:10])}. "
+                                   if _new_failure_ids else "")
+                                + "Regression detected. Reconsider the latest change before "
+                                  "continuing."
                             )
                             if _module_broken:
                                 # ── 回退/恢复路径（P0-B / P1-D）──
@@ -1958,9 +2528,14 @@ class SWEAgent(Agent):
                                 context.metadata["needs_revert"] = True
                                 # 重新进入保护态：唯一合法的推进是 edit/write_file
                                 # （恢复动作本身）或重跑 pytest 验证。
+                                _arm_force_edit_recovery(context)
                                 context.metadata["force_edit"] = True
                                 _stats(context, module_broken_regressions=1)
-                                cm.add_message("user",
+                                # ── 注入最近修改文件的原始内容（用于恢复）──
+                                # WriteFileTool 会在覆盖前备份原始内容到 context.config["_file_backups"]。
+                                # 此前 [Recovery] 只说"写回正确内容"，但 Agent 没有原始内容可参考，
+                                # 只能重新生成（常再次丢失函数）。这里直接提供原始内容。
+                                _recovery_msg = (
                                     "[Recovery] 刚才的修改让项目无法再被 import —— 测试已经"
                                     "收集不起来（collection/import error）。这不是失败变少，"
                                     "而是把项目改坏了。\n"
@@ -1972,6 +2547,17 @@ class SWEAgent(Agent):
                                     "3. 恢复之后重新诊断原问题，再动手修改。\n"
                                     "在测试恢复可收集之前，不要继续添加新代码。"
                                 )
+                                _backups = context.config.get("_file_backups", {})
+                                if _backups:
+                                    # 展示所有备份文件，按最近修改优先排序（逆序）。
+                                    # 不限制数量：备份最多 10 个文件，且实际导致回归的
+                                    # 文件可能不是最近修改的（如先改了辅助文件、最后才改 bug.py）。
+                                    # 遗漏真正出问题的文件比消息稍长更危险。
+                                    _all_backups = list(_backups.items())[::-1]
+                                    _recovery_msg += "\n\n已修改文件的原始内容（可直接用于恢复）：\n"
+                                    for _bpath, _bcontent in _all_backups:
+                                        _recovery_msg += f"\n--- {_bpath} (修改前，{len(_bcontent)} chars) ---\n{_bcontent}\n--- END {_bpath} ---"
+                                cm.add_message("user", _recovery_msg)
                         _baseline = context.metadata.get("baseline_test_count")
                         # partial_green：子集全绿但未覆盖完整基线。
                         # 它不是 failed，但也不能算 full_green / complete。
@@ -1988,6 +2574,15 @@ class SWEAgent(Agent):
                         # `_total_tests >= _baseline`，于是"只验证了子集"被当成
                         # "完整套件全绿"，携带未验证范围判定完成（fail-open）。
                         _full_scope_cmd = _is_full_scope_test_command(_cmd_l)
+                        if _totals["passed"] + _totals["failed"] > 0:
+                            context.metadata["last_test_full_scope"] = _full_scope_cmd
+                        if (_full_scope_cmd and _baseline_safe and not passed
+                                and _totals["failed"] > 0 and _totals["errors"] == 0
+                                and not context.metadata.get("ever_modified")):
+                            context.metadata["pre_edit_full_suite_failure"] = {
+                                "fingerprint": dict(context.metadata.get("__ws_fingerprint__") or {}),
+                                "failed_ids": list(_test_ids),
+                            }
                         # ── N-1: 命令行缩范围 ────────────────────────────
                         # 与 CR-5（配置文件改范围）是同一件事的两种载体。两档判据：
                         #   1) 白名单之外的一切选项 → 本次不作**完整范围证据**（不锁
@@ -2014,18 +2609,30 @@ class SWEAgent(Agent):
                                                     and not _guard_broken
                                                     and not _scope_drift)
                         if _baseline is None:
-                            if _total_tests > 0 and _full_scope_cmd and _acceptance_files_intact:
+                            # 只由"真正执行过测试且收集完整"的完整范围运行建立：
+                            # 纯 collection error 的 errors 计数不是套件规模，把它
+                            # 锁成基线会让后续判断建立在错误数量上（fail-closed：
+                            # 宁可不建，等下一次干净的完整范围运行再建）。
+                            if (_totals["passed"] + _totals["failed"] > 0
+                                    and _totals["errors"] == 0
+                                    and _full_scope_cmd and _acceptance_files_intact):
                                 context.metadata["baseline_test_count"] = _total_tests
                             elif _total_tests > 0:
-                                # 非完整范围（无论成败）：不锁定 baseline，本次也不算
-                                # full_green。下一轮由 partial_green 分支提示跑完整套件，
-                                # 届时再建立基线。
+                                # 非完整范围（无论成败），或完整范围但收集不完整
+                                # （errors>0）/没有真正执行测试：不锁定 baseline，
+                                # 本次也不算 full_green。下一轮由 partial_green
+                                # 分支提示跑完整套件，届时再建立基线。
                                 _scope_complete = False
-                        elif passed and _baseline > 0 and _total_tests < _baseline:
+                        elif passed and _baseline > 0 and not (
+                                _full_scope_cmd and _total_tests >= _baseline):
+                            # 数量达到基线也不够：基线可能被 `-x` / `--maxfail`
+                            # 提前停止的运行低估，子集也可能因新增测试而变大。
+                            # 唯一能证明"完整"的仍是命令本身未指定目标。
                             logger.warning(
-                                "TestGuard: test count %d < baseline %d — "
-                                "partial green, forcing full-suite re-run",
-                                _total_tests, _baseline,
+                                "TestGuard: passing run is not full-scope green "
+                                "(tests=%d, baseline=%d, full_scope_cmd=%s) — "
+                                "forcing full-suite re-run",
+                                _total_tests, _baseline, _full_scope_cmd,
                             )
                             _stats(context, test_guard_triggered=1)
                             _scope_complete = False
@@ -2049,7 +2656,14 @@ class SWEAgent(Agent):
                         # （既非通过证据也非失败证据，fail-closed —— 见下面 _no_verdict），
                         # 只把指令换成可执行的方向，并交给连续超时预算收尾。
                         _timeout_evidence = exit_code == 124 or "timeout (" in test_out
-                        _no_test_evidence = _total_tests == 0 and not _timeout_evidence
+                        # 纯 collection error（passed=0, failed=0, errors>0）同样不构成
+                        # 有效测试证据：测试根本没有运行起来，是环境/导入/配置问题，
+                        # 不是业务代码缺陷。若误判为失败证据，Agent 会在测试环境尚未
+                        # 建立时就进入修复阶段修改业务代码（Phase 19 C2 即此问题）。
+                        _no_test_evidence = (
+                            _total_tests == 0
+                            or (_totals["passed"] == 0 and _totals["failed"] == 0)
+                        ) and not _timeout_evidence
                         # ── CR-1: 测试文件缺失期间的测试结果不作为任何判定证据 ──
                         # 与超时同理：它既不能证明通过，也不能证明失败。测试文件
                         # 已从工作区消失时，"剩下全绿"描述的是一个被收缩过的验收
@@ -2074,6 +2688,11 @@ class SWEAgent(Agent):
                         _no_verdict = (_no_test_evidence or _timeout_evidence
                                        or _files_missing or _guard_broken
                                        or bool(_scope_drift) or _scope_declared)
+                        if _full_scope_cmd and not _no_verdict:
+                            # A completed broad run resolves the *scope* question
+                            # even when it reports failures. Keep failure evidence,
+                            # but do not tell the model that it only ran a subset.
+                            context.metadata["test_scope_incomplete"] = False
                         if _files_missing:
                             cm.add_message("user", _acceptance_files_msg(
                                 *_acceptance_violation(context)))
@@ -2114,14 +2733,48 @@ class SWEAgent(Agent):
                             cm.add_message("user", _cli_scope_msg(_cli_scope_options))
                         elif _no_test_evidence:
                             context.metadata["test_scope_incomplete"] = True
-                            context.metadata["required_next_action"] = "run_full_test_suite"
-                            cm.add_message("user",
-                                "[NO_TEST_EVIDENCE] 本次测试运行没有执行任何测试"
-                                "（解析不出 passed/failed/error 计数）。exit 0、输出里出现"
-                                "通过字样，都不构成测试通过的证据。\n"
-                                "下一步必须运行完整测试套件取得结构化计数："
-                                "python -m pytest -q"
-                            )
+                            _unparsed_target = (_totals["errors"] == 0
+                                                and bool(test_scope_targets(_cmd_l)))
+                            context.metadata["required_next_action"] = (
+                                "rerun_unfiltered_targeted_test" if _unparsed_target
+                                else "run_full_test_suite")
+                            if _totals["errors"] > 0:
+                                # 纯 collection error：测试收集阶段就失败了（导入错误、
+                                # 语法错误、配置问题），没有任何测试真正运行。这是环境
+                                # 问题，不是业务代码缺陷——不要据此修改业务代码。
+                                cm.add_message("user",
+                                    "[NO_TEST_EVIDENCE] 本次测试运行在收集阶段就失败了"
+                                    f"（{_totals['errors']} errors，0 passed, 0 failed）。"
+                                    "常见原因：Python 解释器找不到项目模块（ModuleNotFoundError）、"
+                                    "源文件有语法错误、或 pytest 配置不正确。\n"
+                                    "这是环境/配置问题，不是业务代码缺陷——不要据此修改业务代码。\n"
+                                    "下一步：1) 确认使用了正确的 Python 解释器（项目 .venv 或"
+                                    "已安装依赖的解释器）；2) 检查工作目录是否为项目根目录；"
+                                    "3) 修复环境问题后重新运行完整测试套件取得结构化计数。"
+                                )
+                            else:
+                                cm.add_message("user",
+                                    "[NO_TEST_EVIDENCE] 本次输出无法解析 passed/failed/error"
+                                    " 计数，不能确认测试是否执行或通过；exit 0 和输出里的"
+                                    "通过字样都不构成测试通过证据。\n"
+                                    + (
+                                        "本次指定了定向测试目标。去掉 grep/head/tail 等输出"
+                                        "过滤，仅重跑同一目标并保留 pytest 汇总与退出码；"
+                                        "不要为补齐这次定向证据而运行全量测试。"
+                                        if _unparsed_target else
+                                        "下一步必须运行完整测试套件取得结构化计数："
+                                        "python -m pytest -q"
+                                    )
+                                )
+                        # 修改后首次运行的任意测试范围若没有同范围可信基线，
+                        # 失败不能直接归因于本次编辑；仍保留失败和完成阻断。
+                        _unbaselined_post_edit_failure = bool(
+                            context.metadata.get("ever_modified")
+                            and not passed and not _no_verdict
+                            and _verdict != "regression"
+                            and context.metadata.get("test_baseline_comparison", {}).get(
+                                "status") == "unknown"
+                        )
                         if completion and not _no_verdict:
                             completion.record_test_result(
                                 exit_code=exit_code,
@@ -2135,14 +2788,28 @@ class SWEAgent(Agent):
                         if not _no_verdict and not (passed and _scope_complete):
                             context.metadata["test_success_count"] = 0
                         if passed and not _no_verdict:
-                            # 测试通过 → 退出修复态，清空失败后读取计数，进入"验证"阶段
-                            test_failed = False
-                            reads_after_fail = 0
+                            if context.metadata.get("ever_modified") and not _scope_complete:
+                                context.metadata["candidate_test_evidence"] = {
+                                    "step": context.step_count,
+                                    "command": tc.params.get("command", ""),
+                                    "tests": _total_tests,
+                                }
+                            # 测试通过 → 进入"验证"阶段
                             repair_phase = "verify"
                             # 立即持久化：后续可能因全绿硬终止提前 return，避免阶段停留在 edit
                             context.metadata["repair_phase"] = "verify"
                             if _scope_complete:
                                 # ── full_green：达到基线 + exit 0 + verify 通过 ──
+                                # 只有**完整范围**的全绿才解除失败态与失败后读数：子集
+                                # 通过不是"失败已修复"的证据 —— 同一个 passed 在上方已按
+                                # _scope_complete 门控 success_count，N-2 也已禁止子集
+                                # 全绿充当完成证据。若在此处解除，read→子集 pytest→read
+                                # 就能无限交替逃逸 FixDriving（读数永远攒不满
+                                # fix.read_limit、test_failed 恒为 False），与失败路径上
+                                # 已修的同类逃逸同源（见下方"首次进入修复态才清零"）。
+                                test_failed = False
+                                reads_after_fail = 0
+                                src_reads_after_fail = 0
                                 # 累计"测试全绿"次数；一旦 ≥1 即具备硬终止资格，
                                 # 防止 success → success → success 无限循环。
                                 prev_green = context.metadata.get("test_success_count", 0)
@@ -2150,6 +2817,9 @@ class SWEAgent(Agent):
                                 # 清空子集未覆盖标记（已覆盖完整基线）。
                                 context.metadata["test_scope_incomplete"] = False
                                 context.metadata["required_next_action"] = ""
+                                # 全绿：旧失败证据已失效，清掉常驻证据块，
+                                # 避免模型围绕已修复的根因继续调查。
+                                context.metadata.pop("last_failure_issue", None)
                             else:
                                 # ── partial_green：不 complete、不累计 success ──
                                 # 明确告知模型：本次通过但未覆盖基线，必须运行完整套件。
@@ -2178,16 +2848,40 @@ class SWEAgent(Agent):
                                     + (
                                         f"只执行了 {_total_tests}/{_baseline} 个测试"
                                         "（未覆盖完整基线套件）。\n"
+                                        if _baseline and _total_tests < _baseline else
+                                        f"本次命令只运行了指定的测试子集"
+                                        f"（{_total_tests} 个测试；基线 {_baseline}）"
+                                        "——数量不等于范围。\n"
                                         if _baseline else
                                         f"只执行了 {_total_tests} 个测试，且尚未建立完整"
                                         "基线——首次运行就是子集，无法证明已覆盖整个测试"
                                         "套件。\n"
                                     )
-                                    + "本次结果不能作为最终完成验证。\n"
-                                    "不要继续随机读取、修改文件或重复运行同一个子集。\n"
-                                    "下一步必须运行完整测试套件：python -m pytest -q\n"
-                                    "只有完整测试数量达到基线且全部通过后才能完成任务。"
+                                    + "本次结果只能证明该范围通过，不能作为无回归或最终"
+                                    "完成验证。\n"
+                                    "先运行与改动接口直接相关的现有测试和边界场景，"
+                                    "检查源码 diff 是否包含无关改动；不要重复运行已绿的同一子集。\n"
+                                    "完整完成仍需完整套件通过：python -m pytest -q。"
+                                    "若完整验证仍未完成，且已有修改后的定向通过证据、"
+                                    "已检查相关现有行为、无已知新增回归，可选择 SUBMIT_CANDIDATE；"
+                                    "提交候选前无需先运行全量测试，候选不代表完成。"
                                 )
+                        elif _unbaselined_post_edit_failure:
+                            # No trustworthy pre-edit comparator for this exact scope.
+                            # Preserve the failure, but do not force an unrelated edit.
+                            test_failed = False
+                            repair_phase = "verify"
+                            context.metadata["repair_phase"] = "verify"
+                            context.metadata.pop("last_failure_issue", None)
+                            context.metadata["failed_test_names"] = []
+                            cm.add_message("user",
+                                ("[UNBASELINED_FULL_SUITE_FAILURE] 完整测试" if _full_scope_cmd
+                                 else "[UNBASELINED_TEST_FAILURE] 定向测试")
+                                + "失败，但本次修改前"
+                                "没有同范围基线；尚不能证明这些失败是新增回归。"
+                                "请核对失败与任务、改动及环境的关系；未确认前不要改动无关源码。"
+                                "完整套件未通过，任务仍不得判定完成。"
+                            )
                         elif not _no_verdict:
                             # 测试失败 → 进入修复态：强制后续进入修改阶段
                             if not test_failed:
@@ -2196,6 +2890,7 @@ class SWEAgent(Agent):
                                 # （读数永远攒不满 fix.read_limit，force_edit 永不激活），
                                 # 直到耗尽 max_steps 提前终止。
                                 reads_after_fail = 0
+                                src_reads_after_fail = 0
                                 # ── P0-1: 新失败解除计划闩锁 ──
                                 # 首次失败 / 修复后再次失败都算"新失败"，必须重新进入
                                 # 诊断→规划。否则首个失败会把后续所有失败的根因分析
@@ -2219,6 +2914,10 @@ class SWEAgent(Agent):
                                 # 整个解析/生成块用 try 兜底：即使模块缺失或解析失败，
                                 # 也不能让 Agent step 崩溃（Repair Plan 是增强而非硬依赖）。
                                 _plan_msg = ""
+                                # 新失败先清除旧证据：解析成功会立刻写回（见
+                                # `_issue is not None`），解析失败/异常则宁可不显示，
+                                # 也不让上一轮的根因位置冒充本次失败的证据。
+                                context.metadata.pop("last_failure_issue", None)
                                 try:
                                     from zmai.swe.failure import (
                                         format_failure,
@@ -2249,11 +2948,11 @@ class SWEAgent(Agent):
                                     )
                                     _plan_msg = ""
                                 cm.add_message("user",
-                                    "[Repair Plan] 测试失败。请按以下闭环立即修复（不要只读不修）：\n"  # noqa: E501
+                                    "[Repair Plan] 测试失败。先判断与任务或最新修改的关系，再按闭环修复：\n"  # noqa: E501
                                     "1. 诊断：从上面的失败信息找出根因（必要时只读取最相关的 1-2 个源码文件）\n"  # noqa: E501
                                     "2. 计划：明确要修改哪个文件、添加或改动什么代码\n"
-                                    "3. 修改：用 `edit` 或 `write_file` 工具实施修改\n"
-                                    "4. 验证：重新运行 `python -m pytest`，直到通过\n"
+                                    "3. 修改：确认相关后，用 `edit` 或 `write_file` 实施修改\n"
+                                    "4. 验证：先重跑刚失败的测试命令，再扩大回归范围\n"
                                     # P0-1: 头+尾截断。pytest 把 traceback 放在输出尾部，
                                     # 取头部 800 字符只剩 rootdir/collected 噪声，"失败分析"
                                     # 段不含任何根因信息。
@@ -2288,6 +2987,10 @@ class SWEAgent(Agent):
                         and not (result.metadata or {}).get("cached")
                         and test_failed and not had_modification):
                     reads_after_fail += 1
+                    # 其中读的是非测试源文件的次数 —— FixDriving 的触发下限。
+                    # 读测试文件不构成"定位过待修目标"，不该让它单独凑满阈值。
+                    if _is_source_read(context, tc):
+                        src_reads_after_fail += 1
                 # ── LoopGuard: record every tool call ─────
                 if guard:
                     guard.record_tool_call(
@@ -2296,10 +2999,9 @@ class SWEAgent(Agent):
                         success=result.success,
                         output=result.output or "",
                         error=result.error,
-                        # P1: 复用 P1-3 已算出的工作区证据 —— 只看工具名无法区分
-                        # git status（只读）与 git checkout（写），也让 shell 的
-                        # 真实修改能被 LoopGuard 记录。
-                        ws_changed=_ws_changed,
+                        # 复用已算出的"已有文件被修改"证据 —— 创建临时调试插件
+                        # 等新文件不算修复进展，不应重置 LoopGuard no_progress 计数。
+                        ws_changed=_existing_files_modified,
                     )
                 # ── 修复效率统计（供审计，不改变行为）──
                 _stats(context, total_calls=1)
@@ -2313,10 +3015,17 @@ class SWEAgent(Agent):
                     elif (result.metadata or {}).get("cached"):
                         _stats(context, duplicate_reads=1)
                 if tc.name == "shell_exec" and not _intercepted:
-                    _cmd = str((tc.params or {}).get("command", "")).lower()
-                    if "pytest" in _cmd:
+                    _raw_cmd = str((tc.params or {}).get("command", ""))
+                    # 用 is_test_command 而非 "pytest" in cmd：后者会把 where pytest、
+                    # pip install pytest、cat pytest.ini 等环境探测/非测试命令误计为
+                    # 测试执行。is_test_command 只认段首为测试运行器的真实调用。
+                    if is_test_command(_raw_cmd):
                         _stats(context, pytest_calls=1)
-                        # 无修改重跑：距上次修改的 pytest 且结果相同 → 无进展重跑
+                        # 审计指标：本 step 内该 pytest 调用之前没有发生工作区修改
+                        # （edit / 修改已有文件的 write_file）。注意这是"同步骤内
+                        # 无前置修改"的粗粒度代理，不等于"测试结果未变"或"冗余测试"：
+                        # 上一步修改后在本步验证的 pytest 也会计入，因为 had_modification
+                        # 每步重置。该指标仅用于 swe_stats 审计，不参与任何控制逻辑。
                         if not had_modification:
                             _stats(context, unchanged_pytest_calls=1)
                 if tc.name in ("edit", "write_file"):
@@ -2354,10 +3063,11 @@ class SWEAgent(Agent):
                     success=result.success,
                     output=result.output or "",
                     error=result.error,
-                    truncate=_test_evidence_budget(tc, result, cm),
+                    truncate=_evidence_budget(tc, result, cm),
                     # P1-1: 把工具自带的 read_key 一路带进注入模型的那条消息，
-                    # 供 is_read_visible() 后续判断该结果是否还在可见窗口。
+                    # 供 read_state() 后续判断该结果在可见窗口中的交付状态。
                     meta=result.metadata,
+                    tool_call_id=tc.id if deepseek_protocol else None,
                 )
                 # ── Edit syntax validation feedback + limited repair ──
                 # 语法验证失败的编辑：结构化错误已随工具结果进入上下文（含
@@ -2385,6 +3095,7 @@ class SWEAgent(Agent):
                         _graph_enter(context, Node.EDIT_RECOVERY,
                                      f"edit_validation_repair_exhausted "
                                      f"{_repair_attempts}/{_max_repair}")
+                        _arm_force_edit_recovery(context)
                         context.metadata["force_edit"] = True
                         context.metadata["repair_phase"] = "plan"
                         cm.add_message("user",
@@ -2534,6 +3245,7 @@ class SWEAgent(Agent):
             context.metadata["has_run_test"] = has_run_test
             context.metadata["test_failed"] = test_failed
             context.metadata["reads_after_fail"] = reads_after_fail
+            context.metadata["src_reads_after_fail"] = src_reads_after_fail
             # ── Repair phase 状态机持久化（跨步驱动诊断→计划→修改→验证）──
             context.metadata["repair_phase"] = repair_phase
             context.metadata["repair_plan_injected"] = repair_plan_injected
@@ -2558,8 +3270,14 @@ class SWEAgent(Agent):
             # repair_plan_injected 保持 False，此时不得强制修改——否则就是对一条
             # 运行时自己都没能定位的失败强行要求改代码（fail-open）。定位未就绪时
             # 继续允许读取，由 LoopGuard（no_progress）与 max_steps 兜底。
+            # C1: 再加一条"至少读过 1 个非测试源文件"。读数阈值只证明"读了 N 次"，
+            # 不证明"定位过待修目标"——读测试文件同样会攒满它（agent_24072 读了
+            # 1 个源文件 + 2 个测试文件即被强制修改，随即连未看过的 src/reports.py
+            # 也被拒）。只收窄触发时机，不放宽任何拦截/门禁：仍未定位时读满阈值也
+            # 不进入强制期，由 LoopGuard 与 max_steps 兜底。
             _graph_enter(context, Node.FIX_DRIVING, f"reads_after_fail={reads_after_fail}")
-            if test_failed and repair_plan_injected and reads_after_fail >= fix_read_limit:
+            if (test_failed and repair_plan_injected and reads_after_fail >= fix_read_limit
+                    and src_reads_after_fail >= 1):
                 logger.warning(
                     "FixDriving: test failed, %d reads after failure without modification — forcing fix phase",  # noqa: E501
                     reads_after_fail,
@@ -2569,6 +3287,7 @@ class SWEAgent(Agent):
                     guard.reset()  # 给予全新方向，避免 no_progress 误伤分析阶段
                 repair_phase = "plan"  # 强制回到"计划→修改"，阻断只读停滞
                 # 结构性拦截：下一轮起禁止 read_file/grep，直到 agent 产生一次修改
+                _arm_force_edit_recovery(context)
                 context.metadata["force_edit"] = True
                 cm.add_message("user",
                     f"[FixDriving] 测试已失败，但你已读取 {reads_after_fail} 个相关文件仍未修改代码（当前阶段：{repair_phase}）。\n"  # noqa: E501
@@ -2577,6 +3296,7 @@ class SWEAgent(Agent):
                     f"先做出你认为正确的修改，然后重新运行 `python -m pytest` 验证。"
                 )
                 context.metadata["reads_after_fail"] = 0
+                context.metadata["src_reads_after_fail"] = 0
                 context.metadata["messages"] = cm.get_context()
                 # ── ExecutionLog: fix_driving ─────────
                 _l = context.metadata.get("__log__")
@@ -2601,8 +3321,9 @@ class SWEAgent(Agent):
                         "LoopGuard blocked: reason=%s, details=%s",
                         loop_result.reason, loop_result.details,
                     )
-                    # Reset guard so next step starts fresh
-                    guard.reset()
+                    # 衰减式重置：清零瞬时模式计数器，但保留 no_progress 历史压力，
+                    # 避免模型每 N 步获得一次完整免费预算。真实修改会完全清零。
+                    guard.soft_reset()
                     # ── 修复效率统计 ──
                     _stats(context, loopguard_blocks=1)
                     # ── 结构化恢复信号：列出最近的无效动作 + 规定下一步策略 ──
@@ -2627,7 +3348,13 @@ class SWEAgent(Agent):
                     _escalate = recoveries >= recover_limit and (
                         repair_plan_injected
                         or bool(context.metadata.get("ever_modified")))
+                    if context.metadata.get("test_baseline_comparison", {}).get(
+                            "status") == "unknown":
+                        # An earlier edit is not a target for a new failure whose
+                        # pre-edit state is unknown. Never force another blind edit.
+                        _escalate = False
                     if _escalate:
+                        _arm_force_edit_recovery(context)
                         context.metadata["force_edit"] = True
                         context.metadata["repair_phase"] = "plan"
                     recovery_msg = (
@@ -2723,6 +3450,34 @@ class SWEAgent(Agent):
 
         # Context compaction
         cm.compact()
+
+        # Submission is distinct from a verified completion. A public targeted
+        # green can justify preserving a candidate, never a success verdict.
+        if (response.content or "").strip() == "SUBMIT_CANDIDATE":
+            evidence = context.metadata.get("candidate_test_evidence")
+            blockers = []
+            if not context.metadata.get("ever_modified") or not evidence:
+                blockers.append("no current post-edit targeted test evidence")
+            if (context.metadata.get("unresolved_regressions")
+                    or context.metadata.get("needs_revert")
+                    or context.metadata.get("test_progress") == "regression"):
+                blockers.append("known new test failures remain")
+            if any(_acceptance_violation(context)) or _pytest_scope_drift(context):
+                blockers.append("test files or test scope changed")
+            if not blockers:
+                context.metadata["candidate_submitted"] = True
+                context.metadata["candidate_verification"] = "incomplete"
+                context.metadata["messages"] = cm.get_context()
+                _graph_enter(context, Node.DONE, "candidate_submitted")
+                return AgentAction.candidate(
+                    output="Candidate patch submitted; full verification remains incomplete.")
+            blocks = context.metadata.get("completion_block_count", 0) + 1
+            context.metadata["completion_block_count"] = blocks
+            if blocks > MAX_COMPLETION_BLOCKS:
+                return AgentAction.fail("Candidate submission blocked repeatedly: " + "; ".join(blockers))
+            cm.add_message("user", "[CANDIDATE_BLOCKED] " + "; ".join(blockers))
+            context.metadata["messages"] = cm.get_context()
+            return AgentAction.cont(output="Candidate submission blocked: " + "; ".join(blockers))
 
         # ── Objective verification ────────────────────────────
         # Agent must not claim completion based solely on tool call success.
@@ -3035,10 +3790,11 @@ class SWEAgent(Agent):
         Determines actual status by priority (highest first):
           1. timed_out → TIMEOUT (max_steps exhausted)
           2. step_failed → FAILED (step() returned fail with error)
-          3. replan exhausted + Plan incomplete → FAILED
-          4. All tools failed → FAILED
-          5. Verification failed → FAILED
-          6. Everything else → COMPLETED
+          3. candidate_submitted → CANDIDATE (independent acceptance pending)
+          4. replan exhausted + Plan incomplete → FAILED
+          5. All tools failed → FAILED
+          6. Verification failed → FAILED
+          7. Everything else → COMPLETED
         """
         timed_out = context.metadata.get("timed_out", False)
         step_failed = context.metadata.get("step_failed", False)
@@ -3062,6 +3818,8 @@ class SWEAgent(Agent):
                 "SWEAgent step failed: %s (%s)",
                 context.agent_id, error or "unknown error",
             )
+        elif context.metadata.get("candidate_submitted"):
+            status = AgentState.CANDIDATE
         elif replan_count >= MAX_REPLANS and plan and not plan.is_finished:
             status = AgentState.FAILED
             logger.info(
@@ -3115,6 +3873,13 @@ class SWEAgent(Agent):
                 "token_usage": context.metadata.get("token_usage", {}),
                 "ever_modified": context.metadata.get("ever_modified", False),
                 "test_success_count": context.metadata.get("test_success_count", 0),
+                "pre_edit_test_baselines": context.metadata.get("pre_edit_test_baselines", {}),
+                "test_baseline_comparison": context.metadata.get(
+                    "test_baseline_comparison", {}),
+                "candidate_submitted": context.metadata.get("candidate_submitted", False),
+                "candidate_verification": context.metadata.get("candidate_verification"),
+                "candidate_test_evidence": context.metadata.get("candidate_test_evidence"),
+                "unresolved_regressions": context.metadata.get("unresolved_regressions", {}),
                 "edit_repair_attempts": context.metadata.get("edit_repair_attempts", 0),
                 "edit_failure_recovery_attempts": context.metadata.get(
                     "edit_failure_recovery_attempts", 0),

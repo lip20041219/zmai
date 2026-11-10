@@ -41,6 +41,8 @@ zmai = "zmai.cli.main:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "ruff>=0.1", "mypy>=1.0"]
+# 全屏 TUI（zmai tui）：可选安装，基础包仍为零依赖
+tui = ["textual>=8.0,<9"]
 # tests/test_swe_fix_driving.py 用真实 Flask 项目验证端到端修复闭环
 test = ["pytest>=7", "flask>=3", "tomli>=2; python_version < '3.11'"]
 

@@ -11,7 +11,7 @@ from zmai.config import Config
 def run_config(argv: list[str]) -> None:
     """`zmai config <get|set|list>`"""
     config = Config()
-    theme = Theme.dark()
+    theme = Theme.crt()
     if not argv or argv[0] not in ("get", "set", "list"):
         print("usage: zmai config <get|set|list> [key] [value]")
         sys.exit(1)

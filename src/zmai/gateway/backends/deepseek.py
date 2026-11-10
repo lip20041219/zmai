@@ -20,15 +20,33 @@ from zmai.gateway.base import (
 )
 from zmai.gateway.errors import validate_backend_response
 from zmai.tool import ToolCall
+from zmai.tool.base import remaining_wall_seconds
 
 logger = logging.getLogger("zmai.gateway.backends.deepseek")
+
+
+def _validate_tool_history(messages: list[dict[str, Any]]) -> None:
+    """Fail before HTTP if context pruning broke an assistant/tool exchange."""
+    pending: set[str] = set()
+    for message in messages:
+        if pending and message.get("role") != "tool":
+            raise BackendError("DeepSeek tool history incomplete before next message")
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            pending = {call["id"] for call in message["tool_calls"]}
+        elif message.get("role") == "tool":
+            call_id = message.get("tool_call_id")
+            if call_id not in pending:
+                raise BackendError("DeepSeek tool response has no matching call")
+            pending.remove(call_id)
+    if pending:
+        raise BackendError("DeepSeek tool history missing result")
 
 class DeepSeekBackend(Backend):
     """DeepSeek API Backend (OpenAI 兼容格式)。
 
     统一配置字段（所有 Backend 共用）:
         api_key:     API Key（默认从 DEEPSEEK_API_KEY 环境变量读取）。
-        model:       模型名称（默认 deepseek-v4-flash）。
+        model:       模型名称（默认 deepseek-flash）。
         base_url:    API 基础 URL（默认 https://api.deepseek.com/v1）。
         timeout:     请求超时秒数（默认 120）。
         max_tokens:  最大生成 token 数（默认 4096）。
@@ -48,7 +66,9 @@ class DeepSeekBackend(Backend):
             logger.warning("%s 未设置，DeepSeekBackend 无法正常工作", self._env_key)
 
         # 统一配置字段（所有 Backend 共用同一套 key 名）
-        self._model: str = c.get("model", "deepseek-v4-flash")
+        self._model: str = c.get("model", "deepseek-flash")
+        self._thinking: dict[str, str] = c.get("thinking", {"type": "enabled"})
+        self._reasoning_effort: str = c.get("reasoning_effort", "high")
         self._base_url: str = c.get("base_url", "https://api.deepseek.com/v1").rstrip("/")
         self._timeout: int = int(c.get("timeout", 120))
         self._max_tokens: int = int(c.get("max_tokens", 4096))
@@ -63,7 +83,11 @@ class DeepSeekBackend(Backend):
         messages = []
         if request.system_prompt:
             messages.append({"role": "system", "content": request.system_prompt})
-        messages.extend(request.messages)
+        for message in request.messages:
+            messages.append({key: message[key] for key in (
+                "role", "content", "reasoning_content", "tool_calls", "tool_call_id")
+                if key in message})
+        _validate_tool_history(messages)
 
         tools = None
         if request.tools:
@@ -81,7 +105,9 @@ class DeepSeekBackend(Backend):
         body: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
-            "max_tokens": self._max_tokens,
+            "max_tokens": request.max_tokens or self._max_tokens,
+            "thinking": self._thinking,
+            "reasoning_effort": self._reasoning_effort,
         }
         if tools:
             body["tools"] = tools
@@ -97,8 +123,12 @@ class DeepSeekBackend(Backend):
             method="POST",
         )
 
+        remaining = remaining_wall_seconds(request.metadata)
+        if remaining is not None and remaining <= 2:
+            raise BackendError("task wall budget exhausted before model request")
+        http_timeout = min(self._timeout, max(1.0, remaining - 1)) if remaining is not None else self._timeout
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=http_timeout) as resp:
                 result = json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
@@ -157,12 +187,32 @@ class DeepSeekBackend(Backend):
         finish = choice.get("finish_reason", "stop")
         stop_reason = "tool_use" if finish == "tool_calls" else finish
 
+        reported_model = result.get("model")
+        # Official compatibility alias: the old V4 Flash name routes to Flash.
+        equivalent = (body["model"] == "deepseek-flash"
+                      and reported_model == "deepseek-v4-flash")
+        mismatch = reported_model is not None and reported_model != body["model"] and not equivalent
+        identity_status = ("unreported" if reported_model is None else
+                           "equivalent" if equivalent else
+                           "mismatch" if mismatch else "verified")
+        if mismatch:
+            logger.warning("DeepSeek model identity mismatch: requested=%s reported=%s",
+                           body["model"], reported_model)
         return BackendResponse(
             content=content,
             tool_calls=tool_calls,
             usage=usage,
             stop_reason=stop_reason,
-            metadata={"model": result.get("model", self._model)},
+            metadata={"model": reported_model or self._model,
+                      "configured_model": self._model,
+                      "requested_model": body["model"],
+                      "reported_model": reported_model,
+                      "model_identity_mismatch": mismatch,
+                      "model_identity_status": identity_status,
+                      "thinking": self._thinking,
+                      "reasoning_effort": self._reasoning_effort,
+                      "reasoning_content": msg.get("reasoning_content"),
+                      "tool_calls_raw": tool_calls_raw},
         )
 
     def stream(self, request: BackendRequest) -> Iterator[BackendEvent]:
@@ -181,7 +231,7 @@ plugin = _BackendPlugin(
     name="deepseek",
     backend_class=DeepSeekBackend,
     label="DeepSeek",
-    default_model="deepseek-v4-flash",
+    default_model="deepseek-flash",
     default_base_url="https://api.deepseek.com/v1",
     default_timeout=120,
     default_max_tokens=4096,

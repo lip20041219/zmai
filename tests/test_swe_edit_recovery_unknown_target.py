@@ -162,8 +162,8 @@ class TestT2FilterIsPrecise:
         assert ctx.metadata.get("force_edit") is True, "前置条件：必须处于 force_edit"
 
         # 合法源码 target 必须被保留（过滤器不得误伤），并走原有的定向 read 路径
-        assert ctx.metadata.get("edit_recovery_read_allowance") == 1, \
-            "落点是业务源码时，定向 read 额度必须照发（过滤器不得误伤）"
+        assert ctx.metadata.get("edit_recovery_read_allowance") == 2, \
+            "落点是业务源码时，定向 read 额度必须照发（过滤器不得误伤），共两次"
         assert _allowance(ctx, "edit_recovery_grep_allowance") == 0, \
             "已有合法 target 时不得再发 grep discovery 额度"
         assert injected, "必须注入 [EDIT_FAILURE_RECOVERY]"

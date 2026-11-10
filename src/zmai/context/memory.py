@@ -215,7 +215,7 @@ class SummaryMemory:
         tests: list[str] = []
 
         for msg in old_messages:
-            content = msg.get("content", "")
+            content = msg.get("content") or ""
             role = msg.get("role", "")
             meta = msg.get("metadata", {})
 

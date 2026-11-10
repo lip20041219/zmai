@@ -25,7 +25,7 @@ def run_plugin(argv: list[str]) -> None:
             print("no plugins installed.")
             print("  use: zmai plugin install <file.py>")
             return
-        theme = Theme.dark()
+        theme = Theme.crt()
         print(f"  {theme.dim('Plugin directory:')}")
         print(f"    {PLUGINS_HOME}")
         print()

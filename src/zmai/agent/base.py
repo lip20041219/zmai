@@ -26,6 +26,7 @@ class AgentState(Enum):
       FAILED     — 终态，不可转换
       CANCELLED  — 终态，不可转换
       TIMEOUT    — 终态，不可转换
+      CANDIDATE  — 终态：提交待独立验收补丁，不表示完成
     """
 
     CREATED = "created"
@@ -37,6 +38,7 @@ class AgentState(Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     TIMEOUT = "timeout"
+    CANDIDATE = "candidate"
 
     @property
     def is_terminal(self) -> bool:
@@ -45,6 +47,7 @@ class AgentState(Enum):
             AgentState.FAILED,
             AgentState.CANCELLED,
             AgentState.TIMEOUT,
+            AgentState.CANDIDATE,
         )
 
     @property
@@ -59,7 +62,7 @@ class AgentState(Enum):
 
 @dataclass
 class AgentAction:
-    type: Literal["continue", "pause", "complete", "fail"]
+    type: Literal["continue", "pause", "complete", "fail", "candidate"]
     output: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     pause_reason: str | None = None
@@ -76,6 +79,10 @@ class AgentAction:
     @classmethod
     def complete(cls, output: str = "", metadata: dict | None = None) -> AgentAction:
         return cls(type="complete", output=output, metadata=metadata or {})
+
+    @classmethod
+    def candidate(cls, output: str = "", metadata: dict | None = None) -> AgentAction:
+        return cls(type="candidate", output=output, metadata=metadata or {})
 
     @classmethod
     def fail(cls, error: str, metadata: dict | None = None) -> AgentAction:

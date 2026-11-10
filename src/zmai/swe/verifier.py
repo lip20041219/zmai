@@ -309,6 +309,26 @@ def parse_test_totals(test_output: str) -> dict[str, int]:
     }
 
 
+def parse_pytest_failure_ids(test_output: str) -> list[str] | None:
+    """Return complete failed/error node IDs from pytest's final summary.
+
+    None means the output cannot prove the full failure set. In particular,
+    counts from a clipped log must never become a trusted pre-edit baseline.
+    """
+    text = strip_ansi(test_output)
+    summaries = list(re.finditer(r"(?m)^=+ short test summary info =+\s*$", text))
+    totals = parse_test_totals(text)
+    if not re.search(r"(?m)^.*\d+ (?:passed|failed|errors?)\b.* in \d+(?:\.\d+)?s\s*$", text):
+        return None
+    if totals["failed"] + totals["errors"] == 0:
+        return [] if not summaries else None
+    if len(summaries) != 1:
+        return None
+    tail = text[summaries[0].end():]
+    ids = re.findall(r"(?m)^(?:FAILED|ERROR)\s+(\S+)", tail)
+    return ids if len(ids) == len(set(ids)) == totals["failed"] + totals["errors"] else None
+
+
 # pytest 自己发出的"这次调用根本没跑测试"信号。
 # 只认 pytest 的**报文文本**，不认裸退出码：exit 4/5 是 pytest 的用法错误 / 零收集
 # 专用码，但别的命令（make、自写脚本）也会用 4，按退出码放行会让非测试命令的失败

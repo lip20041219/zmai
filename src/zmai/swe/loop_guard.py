@@ -154,6 +154,15 @@ class LoopGuard:
         self._last_modification_step: int = -1
         self._call_count_since_last_mod: int = 0
 
+        # 停滞证据：no_progress 必须同时看到它，理由见 check() 规则 2。
+        # 两种来源，都是"这一步确实没往前走"的直接观察：
+        #   ① 某条签名的**第二次**出现（读到同一个文件/跑同一条命令）；
+        #   ② 一次成功、但工作区没有变化的写操作（反复创建调试插件等新文件）。
+        # 与 _steps_without_change 同生命周期（真实修改清零），因此衡量的是
+        # "本轮停滞期间是否真的在重复或空写"。
+        self._seen_signatures: set[str] = set()
+        self._stall_evidence: int = 0
+
         # 当前 step 的工具调用（暂存，record_tool_call 时更新）
         self._current_step_calls: list[dict[str, Any]] = []
 
@@ -184,6 +193,13 @@ class LoopGuard:
                 工作区证据优先于工具名：只看名字无法区分 git 的读写两种用法。
         """
         sig = _tool_call_signature(name, params)
+        if sig in self._seen_signatures:
+            self._stall_evidence += 1
+        else:
+            self._seen_signatures.add(sig)
+        # ② 成功但没推进工作区的写操作（创建新文件：临时调试插件、草稿脚本）
+        if name in self._WRITE_TOOLS and success and ws_changed is False:
+            self._stall_evidence += 1
         entry = {
             "name": name,
             "signature": sig,
@@ -216,15 +232,15 @@ class LoopGuard:
             self._last_failure_sig = ""
 
         # ── 检测代码修改 ─────────────────────────────────
-        # 写工具（write_file/edit）按工具名认定：它们成功即必然改写了工作区
-        # （空 diff / 截断会被工具本身拒绝），因此语义不变。
-        # 其余工具（shell_exec / git）靠工作区证据判定 —— 而 ws_changed 是
-        # **工作区的真实事实**，与"命令是否成功"无关，因此不受 success 约束：
-        # `git stash pop` 冲突、`git checkout` 部分失败、shell 改完文件才返回非零，
-        # 都是"执行失败但确实推进了工作区"。progress 应由 workspace evidence 决定，
-        # 而不是由工具的 success 位决定（否则这些真实修改不被记录，
-        # _steps_without_change 会继续累加，把已经发生的进展当成停滞）。
-        if (success and name in self._WRITE_TOOLS) or ws_changed:
+        # ws_changed 是调用方用工作区指纹算出的**真实**进展证据，优先于工具名：
+        #   True  → 确实修改了已有文件（含 shell/git 改文件）→ 记录进展
+        #   False → 工作区变化仅为创建新文件（调试插件等），不算修复进展
+        #   None  → 未提供（旧调用点/测试）→ 退回按工具名判断，保持兼容
+        # 写工具（write_file/edit）按工具名认定仅在 ws_changed=None 时生效：
+        # 它们成功即必然改写了工作区（空 diff/截断会被工具本身拒绝）。
+        # 其余工具（shell_exec/git）靠工作区证据判定，与 success 无关：
+        # `git stash pop` 冲突、`git checkout` 部分失败都是"执行失败但推进了工作区"。
+        if ws_changed is True or (ws_changed is None and success and name in self._WRITE_TOOLS):
             self._record_modification()
 
     def record_no_modification(self) -> None:
@@ -236,10 +252,12 @@ class LoopGuard:
         self._steps_without_change += 1
 
     def _record_modification(self) -> None:
-        """重置无修改计数。"""
+        """重置无修改计数（连带清零本轮停滞的重复证据）。"""
         self._steps_without_change = 0
         self._last_modification_step = len(self._call_history)
         self._call_count_since_last_mod = 0
+        self._seen_signatures.clear()
+        self._stall_evidence = 0
 
     def reset(self) -> None:
         """重置所有循环计数器。
@@ -252,8 +270,27 @@ class LoopGuard:
         self._last_failure_sig = ""
         self._steps_without_change = 0
         self._call_count_since_last_mod = 0
+        # 新策略纪元：旧纪元的重复证据不能用来触发新纪元的 no_progress
+        self._seen_signatures.clear()
+        self._stall_evidence = 0
         # 不清除 _call_history（保留完整历史用于调试）
         # 不清除 _last_modification_step
+
+    def soft_reset(self) -> None:
+        """拦截后衰减式重置：清零瞬时模式计数器，但保留 no_progress 历史压力。
+
+        与 reset() 的区别：no_progress 计数器不全清零，而是减去 threshold-2，
+        使连续拦截的间隔逐步缩短，避免模型每 N 步获得一次完整免费预算。
+        真实代码修改仍会通过 record_tool_call(ws_changed=True) 完全清零。
+        """
+        self._consecutive_identical = 0
+        self._last_signature = ""
+        self._consecutive_failures = 0
+        self._last_failure_sig = ""
+        # 保留 no_progress 压力：减去 threshold-2，最低为 0
+        _retain = max(0, self._threshold - 2)
+        self._steps_without_change = max(0, self._steps_without_change - _retain)
+        self._call_count_since_last_mod = 0
 
     def reset_hard(self) -> None:
         """完全重置（包括调用历史）。"""
@@ -280,11 +317,20 @@ class LoopGuard:
             })
 
         # 2. 连续无修改检测
-        if self._steps_without_change >= self._threshold:
+        # "没改文件"只是**前置指标**，不等于"在重复"。实测 7 个真实 run 的 20 次
+        # 触发里，首次触发时全历史精确重复调用数为 0 的有 6 个 run（pylint-5859
+        # @7 calls、flask-4045 @8、xarray-4248 @8、pylint-7228 @10、flask-4992 @9、
+        # requests-3362 @11）——模型正在逐个读**新**文件，运行时却宣告"检测到重复的
+        # 无进展动作"并要求停止 read/shell，对仍在进行的根因定位是错误干预。
+        # 要求"确实观察到过重复调用"（规则 1 的同款证据）后才判 no_progress：
+        # 真正空转的 run 仍会触发（xarray-4248 @18/@36、pylint-5859 @22/@28/@37、
+        # pylint-6506 @10/@21），20 次触发保留 8 次，其余 12 次是纯调查窗口。
+        if self._steps_without_change >= self._threshold and self._stall_evidence > 0:
             return _blocked("no_progress", {
                 "count": self._steps_without_change,
                 "threshold": self._threshold,
                 "total_calls": len(self._call_history),
+                "stall_evidence": self._stall_evidence,
             })
 
         # 3. 连续相同调用检测
@@ -316,6 +362,7 @@ class LoopGuard:
             "consecutive_identical": self._consecutive_identical,
             "consecutive_failures": self._consecutive_failures,
             "steps_without_change": self._steps_without_change,
+            "stall_evidence": self._stall_evidence,
             "last_modification_step": self._last_modification_step,
             "threshold": self._threshold,
         }

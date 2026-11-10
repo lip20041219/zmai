@@ -9,6 +9,7 @@
   FAILED     — 终态：执行失败
   CANCELLED  — 终态：用户取消
   TIMEOUT    — 终态：超时（max_steps 或 wall-clock）
+  CANDIDATE  — 终态：补丁已提交，尚未完成独立验收
 
 转换规则（_TRANSITIONS 表强制执行）:
   CREATED     → PLANNING | EXECUTING | FAILED | CANCELLED
@@ -50,6 +51,7 @@ _TRANSITIONS: dict[tuple[str, str], bool] = {
     ("executing", "failed"): True,    # 执行失败
     ("executing", "cancelled"): True, # 执行阶段取消
     ("executing", "timeout"): True,   # 执行超时
+    ("executing", "candidate"): True, # 补丁已提交，等待独立验收
 
     # ── VERIFYING → 下一步 ────────────────────────
     ("verifying", "completed"): True, # 验证通过
@@ -57,9 +59,10 @@ _TRANSITIONS: dict[tuple[str, str], bool] = {
     ("verifying", "executing"): True, # 验证失败后重试执行（修复循环）
     ("verifying", "cancelled"): True, # 验证阶段取消
     ("verifying", "timeout"): True,   # 验证超时
+    ("verifying", "candidate"): True, # 验证尚不充分的候选补丁
 }
 
-_TERMINAL = {"completed", "failed", "cancelled", "timeout"}
+_TERMINAL = {"completed", "failed", "cancelled", "timeout", "candidate"}
 
 
 class LifecycleManager:
@@ -118,6 +121,10 @@ class LifecycleManager:
     def complete(self, agent_id: str) -> None:
         """标记完成 → COMPLETED。"""
         self._transition(agent_id, "completed")
+
+    def candidate(self, agent_id: str) -> None:
+        """提交待独立验收的候选补丁；不表示测试全绿。"""
+        self._transition(agent_id, "candidate")
 
     def fail(self, agent_id: str) -> None:
         """标记失败 → FAILED。"""

@@ -55,6 +55,104 @@ class TestFailureParserShortPath:
         assert issue.actual == "6", issue.actual
         assert issue.test_name == "test_button_works"
 
+    def test_extracts_float_expected_actual(self, tmp_path: Path):
+        """浮点数断言（如 assert 30.0 == 27.0）也应正确提取 expected/actual。"""
+        float_traceback = '''
+_______ test_best_price_prefers_the_membership_discount_when_larger ________
+
+    def test_best_price_prefers_the_membership_discount_when_larger():
+>       assert best_price(ITEMS, 3) == 27.0
+E       AssertionError: assert 30.0 == 27.0
+E        +  where 30.0 = best_price([{'price': 10.0, 'qty': 2}], 3)
+
+tests/test_discounts.py:44: AssertionError
+'''
+        issue = parse_test_failure(float_traceback, project_root=tmp_path)
+        assert issue is not None
+        assert issue.expected == "27.0", f"expected should be 27.0, got {issue.expected}"
+        assert issue.actual == "30.0", f"actual should be 30.0, got {issue.actual}"
+        assert issue.frame_is_test is True
+
+    def test_infers_candidate_from_import_statement(self, tmp_path: Path):
+        """从测试文件的 import 语句中推断被测业务文件。"""
+        # 创建测试文件和对应的业务文件
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "src").mkdir()
+        test_file = tmp_path / "tests" / "test_discounts.py"
+        test_file.write_text(
+            "from src.discounts import best_price\n"
+            "\n"
+            "ITEMS = [{'price': 10.0, 'qty': 2}]\n"
+            "\n"
+            "def test_best_price():\n"
+            "    assert best_price(ITEMS, 3) == 27.0\n",
+            encoding="utf-8",
+        )
+        # 创建对应的业务文件，让 exists() 检查通过
+        (tmp_path / "src" / "discounts.py").write_text(
+            "def best_price(items, level):\n    return 30.0\n",
+            encoding="utf-8",
+        )
+
+        traceback = '''
+_______ test_best_price ________
+
+    def test_best_price():
+>       assert best_price(ITEMS, 3) == 27.0
+E       AssertionError: assert 30.0 == 27.0
+
+tests/test_discounts.py:6: AssertionError
+'''
+        issue = parse_test_failure(traceback, project_root=tmp_path)
+        assert issue is not None
+        assert len(issue.candidate_files) > 0, \
+            f"应该从 import 语句推断出候选业务文件: {issue.candidate_files}"
+        # 应该包含 discounts.py
+        found = any("discounts.py" in c.replace("\\", "/") for c in issue.candidate_files)
+        assert found, f"候选文件应包含 discounts.py: {issue.candidate_files}"
+
+    def test_fix_plan_points_to_candidate_file_for_assertion_error(self, tmp_path: Path):
+        """纯 AssertionError 且有候选文件时，修复计划应直接指向候选文件。"""
+        from zmai.swe.fix_planner import generate_fix_plan
+        # 创建测试文件和对应的业务文件
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "src").mkdir()
+        test_file = tmp_path / "tests" / "test_discounts.py"
+        test_file.write_text(
+            "from src.discounts import best_price\n"
+            "\n"
+            "ITEMS = [{'price': 10.0, 'qty': 2}]\n"
+            "\n"
+            "def test_best_price():\n"
+            "    assert best_price(ITEMS, 3) == 27.0\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "src" / "discounts.py").write_text(
+            "def best_price(items, level):\n    return 30.0\n",
+            encoding="utf-8",
+        )
+
+        traceback = '''
+_______ test_best_price ________
+
+    def test_best_price():
+>       assert best_price(ITEMS, 3) == 27.0
+E       AssertionError: assert 30.0 == 27.0
+
+tests/test_discounts.py:6: AssertionError
+'''
+        issue = parse_test_failure(traceback, project_root=tmp_path)
+        assert issue is not None
+        assert issue.frame_is_test is True
+        plan = generate_fix_plan(issue)
+        steps = "\n".join(plan.steps)
+        # 修复计划应该提到 discounts.py，而不是只说"用 grep 搜索"
+        assert "discounts.py" in steps, \
+            f"修复计划应直接指向候选文件 discounts.py: {steps}"
+        # 不应该说"用 grep 搜索"（因为我们已经知道文件了）
+        assert "grep" not in steps.lower(), \
+            f"已有候选文件时不应该再引导用 grep 搜索: {steps}"
+
     def test_fix_plan_prefers_candidate_file(self, tmp_path: Path):
         from zmai.swe.fix_planner import generate_fix_plan
         (tmp_path / "test_app.py").write_text(TEST_APP_BRACES, encoding="utf-8")
@@ -79,7 +177,7 @@ class TestReadCache:
         """内容仍在模型可见窗口 → 轻量命中。
 
         P1-1 起"轻量命中"需要两个条件同时成立：文件未变（sha256）**且**这份内容
-        仍在模型可见窗口（由 ToolContext.read_visible 探针给出）。因此本用例按
+        仍在模型可见窗口（由 ToolContext.read_state 探针给出）。因此本用例按
         agent 侧的真实形态注册一次结果，而不是给一个没有任何可见性证据的裸
         ToolContext —— 裸上下文下探针缺失，工具会按 fail-closed 直接回正文。
         """
@@ -91,7 +189,7 @@ class TestReadCache:
         tool = ReadFileTool()  # 同一实例 = 同一修复上下文
         ctx = ToolContext(agent_id="a", workspace_path=tmp_path,
                           project_path=tmp_path, timeout=10,
-                          read_visible=cm.is_read_visible)
+                          read_state=cm.read_state)
         r1 = tool.execute(ctx, {"path": "app.py"})
         assert r1.success
         cm.add_tool_result("read_file", True, r1.output, meta=r1.metadata)

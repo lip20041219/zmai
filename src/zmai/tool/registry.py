@@ -196,7 +196,13 @@ class ToolRegistry:
                 )
             return ToolResult.err(f"{name}: 参数校验失败")
 
-        timeout = context.timeout or 0
+        # 外层超时取"调用方预算"与"工具自报预算"的较大者：工具的专用预算（如 shell
+        # 的测试命令）不得被默认 30s 提前截断。不覆盖 `timeout_for` 的工具返回 None，
+        # 行为与改动前完全一致；外层保护本身保留。
+        tool_timeout = tool.timeout_for(context, params) or 0
+        cleanup_margin = (2 if tool.name == "shell_exec"
+                          and context.config.get("_wall_deadline_monotonic") is not None else 0)
+        timeout = max(context.timeout or 0, tool_timeout + cleanup_margin)
         if timeout > 0:
             return self._execute_with_timeout(tool, context, params, timeout)
         return tool.execute(context, params)
@@ -205,40 +211,47 @@ class ToolRegistry:
     def _execute_with_timeout(
         tool: Tool, context: ToolContext, params: dict[str, Any], timeout: int
     ) -> ToolResult:
-        """在单独的线程中执行工具，超时后放弃等待。
+        """在守护线程中执行工具，超时后放弃等待。
 
-        不能用 `with ThreadPoolExecutor(...)`：退出时 __exit__ 调
-        shutdown(wait=True)，会 join 那个卡住的线程 —— 于是 fut.result(timeout)
-        的超时形同虚设，整个 run 照样阻塞到线程自己跑完（CI 里表现为 pytest
-        卡死到 job 超时）。必须 shutdown(wait=False)。
+        用 daemon=True 的 threading.Thread 替代 ThreadPoolExecutor：
+        ThreadPoolExecutor 的工作线程默认非守护，shutdown(wait=False)
+        后线程仍存活，Python 退出时会 join 所有非守护线程 → 进程挂起、
+        execution_log 无法持久化（A/B 实验中 A2/B2 均因此卡住）。
+        守护线程在主线程退出时自动终止，不会阻塞进程退出。
 
-        ponytail: 线程无法强杀，卡住的工具线程会泄漏到进程结束。要真正回收
-        需要子进程隔离 —— 先按"不再阻塞调用方"修，泄漏留到需要时。
+        线程无法强杀，卡住的工具线程会随进程结束被回收；要真正回收
+        需要子进程隔离，此处先解决进程退出阻塞问题。
         """
-        import concurrent.futures
+        import queue
+        import threading
         import time
 
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        result_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
+
+        def worker() -> None:
+            try:
+                result_queue.put(tool.execute(context, params))
+            except Exception as exc:
+                result_queue.put(exc)
+
+        t = threading.Thread(target=worker, daemon=True, name=f"tool-{tool.name}")
+        t.start()
         start = time.monotonic()
         try:
-            fut = pool.submit(tool.execute, context, params)
-            try:
-                result = fut.result(timeout=timeout)
-                result.duration_ms = int((time.monotonic() - start) * 1000)
-                return result
-            except concurrent.futures.TimeoutError:
-                elapsed = int((time.monotonic() - start) * 1000)
-                logger.error("工具执行超时: %s (%ds)", tool.name, timeout)
-                return ToolResult(
-                    success=False, output="",
-                    error=f"{tool.name}: 执行超时 ({timeout}s)",
-                    duration_ms=elapsed,
-                )
-            except Exception as e:
-                elapsed = int((time.monotonic() - start) * 1000)
-                logger.error("工具执行失败: %s: %s", tool.name, e)
-                return ToolResult(
-                    success=False, output="", error=str(e), duration_ms=elapsed,
-                )
-        finally:
-            pool.shutdown(wait=False)
+            result = result_queue.get(timeout=timeout)
+        except queue.Empty:
+            elapsed = int((time.monotonic() - start) * 1000)
+            logger.error("工具执行超时: %s (%ds)", tool.name, timeout)
+            return ToolResult(
+                success=False, output="",
+                error=f"{tool.name}: 执行超时 ({timeout}s)",
+                duration_ms=elapsed,
+            )
+        if isinstance(result, Exception):
+            elapsed = int((time.monotonic() - start) * 1000)
+            logger.error("工具执行失败: %s: %s", tool.name, result)
+            return ToolResult(
+                success=False, output="", error=str(result), duration_ms=elapsed,
+            )
+        result.duration_ms = int((time.monotonic() - start) * 1000)
+        return result

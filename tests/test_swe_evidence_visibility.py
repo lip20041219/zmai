@@ -16,13 +16,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
+from zmai.agent import AgentContext
 from zmai.context.manager import ContextManager
-from zmai.swe.agent import _test_evidence_budget
+from zmai.swe.agent import SWEAgent, _build_fix_state_directive, _evidence_budget
 from zmai.swe.failure import format_failure, parse_test_failure
 from zmai.swe.tools import _cap_shell_output, _test_summary_prefix
-from zmai.tool import ToolCall, ToolResult
+from zmai.tool import ToolCall, ToolRegistry, ToolResult
 
 # ═══════════════════════════════════════════════════════════════════
 # 测试数据
@@ -269,19 +271,190 @@ class TestEvidenceBudgetWiring:
         cm = self._cm()
         for cmd in ("python -m pytest -q", "pytest tests/", "python -m unittest"):
             tc = self._tc("shell_exec", command=cmd)
-            assert _test_evidence_budget(tc, ToolResult.err("exit 1"), cm) == 4321
+            assert _evidence_budget(tc, ToolResult.err("exit 1"), cm) == 4321
 
     def test_successful_test_run_keeps_default(self):
         cm = self._cm()
         tc = self._tc("shell_exec", command="python -m pytest -q")
-        assert _test_evidence_budget(tc, ToolResult.ok("302 passed"), cm) is None
+        assert _evidence_budget(tc, ToolResult.ok("302 passed"), cm) is None
 
     def test_non_test_command_keeps_default(self):
         cm = self._cm()
         tc = self._tc("shell_exec", command="git status")
-        assert _test_evidence_budget(tc, ToolResult.err("exit 128"), cm) is None
+        assert _evidence_budget(tc, ToolResult.err("exit 128"), cm) is None
 
     def test_non_shell_tool_keeps_default(self):
         cm = self._cm()
         tc = self._tc("read_file", path="pytest.log")
-        assert _test_evidence_budget(tc, ToolResult.err("not found"), cm) is None
+        assert _evidence_budget(tc, ToolResult.err("not found"), cm) is None
+
+    # ── 源码正文是一手证据：read_file 成功结果同样走 evidence 预算 ──
+    def test_successful_read_uses_evidence_budget(self):
+        """读到的源码正文是模型写 edit 的唯一依据，不得按 500 字符头部截断。
+
+        实测 eval_pydata__xarray-4248：678 行 / 24870 字符的
+        xarray/core/formatting.py 注入模型后只剩 530 字符（第 1~15 行），
+        模型看不到待改函数体，只能反复重读，随后被 FixDriving 硬拒
+        —— 60 步、0 次 edit、全部读操作被拒。
+        """
+        cm = self._cm()
+        tc = self._tc("read_file", path="xarray/core/formatting.py")
+        assert _evidence_budget(tc, ToolResult.ok("1|def f():\n"), cm) == 4321
+
+    def test_grep_and_git_keep_default(self):
+        cm = self._cm()
+        assert _evidence_budget(self._tc("grep", pattern="x"),
+                                ToolResult.ok("found 3"), cm) is None
+        assert _evidence_budget(self._tc("git", args="status"),
+                                ToolResult.ok("clean"), cm) is None
+
+    def test_long_file_read_is_visible_to_model(self):
+        """机制级复现：一条 678 行的 read_file 结果注入上下文后必须远多于 500 字符。"""
+        cm = ContextManager(config={})
+        body = "".join(f"{i}|    def helper_{i}(self, value):\n" for i in range(1, 679))
+        tc = ToolCall(id="c1", name="read_file", params={"path": "formatting.py"})
+        cm.add_tool_result(name="read_file", success=True, output=body,
+                           truncate=_evidence_budget(tc, ToolResult.ok(body), cm))
+
+        msg = [m for m in cm.get_context()
+               if "read_file" in str(m.get("content", ""))][-1]["content"]
+        assert len(msg) > 3000, f"源码正文仍被过度截断: {len(msg)} 字符"
+        assert "中间省略" in msg or "...(截断)" in msg, "截断必须有显式标记"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 7 — 常驻失败证据块：压缩后仍可见、可替换、可清除
+# ═══════════════════════════════════════════════════════════════════
+
+# 带数值断言的失败块（pytest 摘要里的 `assert <actual> == <expected>`）
+_ASSERT_FAILURE_BLOCK = '''\
+_____________________________ test_total ______________________________________
+
+    def test_total():
+>       assert total(items) == 5
+E       assert 6 == 5
+
+src/calc.py:12: in total
+    return sum(values)
+'''
+
+
+def _ctx(metadata: dict, **overrides) -> AgentContext:
+    """只带 metadata 的上下文：常驻证据块除 metadata 外不读其它字段。"""
+    kwargs: dict = {"agent_id": "evidence", "task": "", "backend": None,
+                    "tools": ToolRegistry(), "config": {}, "metadata": dict(metadata)}
+    kwargs.update(overrides)
+    return AgentContext(**kwargs)
+
+
+def _parse_issue(text: str, root: Path | None = None):
+    return parse_test_failure(_shell_error("python -m pytest -q", text), root)
+
+
+class TestPersistentFailureEvidence:
+    def test_evidence_enters_directive(self):
+        """失败后，结构化证据必须出现在每轮模型调用的提示词里。"""
+        issue = _parse_issue(_pytest_output(_FAILURE_BLOCK))
+        assert issue is not None
+        block = _build_fix_state_directive(
+            _ctx({"last_failure_issue": issue, "repair_phase": "plan",
+                  "test_failed": True}))
+
+        assert "FAILURE EVIDENCE" in block
+        assert "test_parse_config" in block          # 测试名
+        assert "TypeError" in block                  # 错误类型
+        assert "根因位置: src/app.py:42" in block     # 根因文件与行号
+
+    def test_expected_actual_included_when_present(self):
+        """expected / actual 存在时必须一并给出。"""
+        issue = _parse_issue(_pytest_output(_ASSERT_FAILURE_BLOCK))
+        assert issue is not None
+        assert (issue.expected, issue.actual) == ("5", "6")   # 前提
+
+        block = _build_fix_state_directive(_ctx({"last_failure_issue": issue}))
+        assert "expected=5, actual=6" in block
+
+    def test_evidence_survives_compaction(self):
+        """压缩把历史消息压成计数摘要后，根因位置仍可从 metadata 重建。"""
+        cm = ContextManager(config={"context.max_chars": 1200,
+                                    "context.recent_window": 1,
+                                    "context.tool_result_window": 1})
+        raw = _pytest_output(_FAILURE_BLOCK, pad_before=200)
+        evidence = _shell_error("python -m pytest -q", raw)
+        cm.add_tool_result("shell_exec", False, "", error=evidence,
+                           truncate=cm.test_evidence_chars)
+        issue = _parse_issue(_pytest_output(_FAILURE_BLOCK))
+        cm.add_message("user", "[Repair Plan] 测试失败。失败分析：\n"
+                               f"{format_failure(issue)}")
+        assert "根因位置" in _model_view(cm), "前提：压缩前证据在上下文里"
+
+        for i in range(8):
+            cm.add_message("user", f"filler round {i} " + "x" * 200)
+        cm.compact()
+
+        view = _model_view(cm)
+        assert "根因位置" not in view, "前提：压缩后原始证据已滚出窗口"
+        assert "Previous" in view or "历史摘要" in view, "前提：摘要确实生成了"
+
+        block = _build_fix_state_directive(_ctx({"last_failure_issue": issue,
+                                                 "repair_phase": "plan"}))
+        assert "根因位置: src/app.py:42" in block, \
+            f"压缩后常驻证据块必须仍给出根因位置:\n{block}"
+
+    def test_no_evidence_no_block(self):
+        """没有 FailureIssue 时不得注入空白或虚假的失败信息。"""
+        assert _build_fix_state_directive(_ctx({})) == "", "idle 且无证据应保持空"
+
+        block = _build_fix_state_directive(
+            _ctx({"repair_phase": "plan", "test_failed": True}))
+        assert block, "修复态本身仍应有状态块"
+        assert "FAILURE EVIDENCE" not in block
+        assert "根因位置" not in block
+
+    def test_new_failure_replaces_old_evidence(self):
+        """新失败必须替换旧证据，不得两条并存。"""
+        old = _parse_issue(_pytest_output(_FAILURE_BLOCK))          # test_parse_config
+        new = _parse_issue(_pytest_output(_ASSERT_FAILURE_BLOCK))   # test_total
+        meta = {"last_failure_issue": old, "repair_phase": "plan"}
+        assert "test_parse_config" in _build_fix_state_directive(_ctx(meta))
+
+        meta["last_failure_issue"] = new
+        block = _build_fix_state_directive(_ctx(meta))
+        assert "test_total" in block
+        assert "test_parse_config" not in block, "旧证据不得残留"
+
+    def test_block_excludes_source_snippet(self, tmp_path: Path):
+        """常驻块不夹带源码片段与 traceback（每步固定开销）。"""
+        src = tmp_path / "src"
+        src.mkdir()
+        lines = [f"# filler {i}" for i in range(1, 61)]
+        lines[41] = "def parse_config(text, defaults=None):"
+        (src / "app.py").write_text("\n".join(lines), encoding="utf-8")
+
+        issue = _parse_issue(_pytest_output(_FAILURE_BLOCK), tmp_path)
+        assert issue is not None and issue.source_snippet, "前提：确实解析出了片段"
+        # 一次性注入路径（[Repair Plan]）行为不变：默认仍带片段
+        assert "源码上下文" in format_failure(issue)
+
+        block = _build_fix_state_directive(_ctx({"last_failure_issue": issue}))
+        assert "根因位置" in block
+        assert "源码上下文" not in block, "常驻块不得重复附加源码片段"
+
+    def test_unparsable_output_is_safe(self):
+        """解析失败（无可用证据）时不得伪造证据，也不得抛异常。"""
+        assert parse_test_failure("", None) is None
+        assert parse_test_failure("   \n  ", None) is None
+
+        block = _build_fix_state_directive(_ctx({"repair_phase": "plan"}))
+        assert "FAILURE EVIDENCE" not in block
+
+    def test_initialize_clears_stale_evidence(self, tmp_path: Path):
+        """新任务初始化后不得残留上一任务的失败证据。"""
+        agent = SWEAgent("evidence_init")
+        ctx = _ctx({"last_failure_issue": _parse_issue(_pytest_output(_FAILURE_BLOCK))},
+                   config={"project_path": str(tmp_path)})
+        assert ctx.metadata.get("last_failure_issue") is not None
+
+        asyncio.run(agent.initialize(ctx))
+
+        assert ctx.metadata.get("last_failure_issue") is None

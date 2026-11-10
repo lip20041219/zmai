@@ -13,8 +13,22 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
+
+import pytest
+
+# 防止 pytest 子进程使用 stale __pycache__ 字节码：编辑 bug.py 后，
+# 若源文件 mtime 与 .pyc 头部记录一致，Python 会跳过重编译，导致
+# 第二次 pytest 读到修改前的 VALUE。本测试文件所有集成用例均依赖
+# "编辑→重跑 pytest 看到结果变化"，统一禁用字节码写入。
+# 用 fixture 而非 import 时 setdefault：后者会对整个 pytest 进程生效，
+# 让其它模块的子进程也拿不到 __pycache__（test_pyc_stale_cache_invalidate /
+# test_swe_shell_modification 会因此失败）。
+@pytest.fixture(autouse=True)
+def _disable_bytecode(monkeypatch):
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
 
 from zmai.agent import AgentContext
 from zmai.gateway.base import (
@@ -129,7 +143,7 @@ def _write_project(tmp_path: Path) -> None:
 
 def _pytest() -> ToolCall:
     return ToolCall(id="pt", name="shell_exec",
-                    params={"command": "python -m pytest -q"})
+                    params={"command": f"{sys.executable} -m pytest -q"})
 
 
 def _bad_edit() -> ToolCall:
@@ -517,6 +531,130 @@ def test_revert_after_breaking_edit_restores_diagnosable_state(tmp_path):
     assert ctx.metadata["last_test_totals"]["failed"] == 1
 
 
+# ── Test 7：write_file 破坏 import 后，[Recovery] 应包含原始文件内容 ──
+def test_write_file_breaking_import_recovery_includes_original_content(tmp_path):
+    """write_file 整体重写导致项目无法 import 时，[Recovery] 消息必须包含
+    被修改文件的原始内容，让 Agent 可以直接恢复，而不是凭记忆重新生成。
+
+    这是 C1/C2 真实失败的根因修复：Agent 用 write_file 重写 reports.py 后丢失
+    函数，[Recovery] 只说"写回正确内容"但没有提供原始内容，Agent 多次重新生成
+    都无法恢复正确的函数。
+    """
+    def _breaking_write_file() -> ToolCall:
+        """用 write_file 覆盖 bug.py，写入导入不存在模块的内容 → collection error。
+
+        语法正确但无法 import，触发 module_broken regression。
+        """
+        return ToolCall(id="bwf", name="write_file",
+                        params={"path": "bug.py", "content": "import nonexistent_module\n"})
+
+    script = [
+        [_pytest()],                # 1 passed, 1 failed → 基线
+        [_breaking_write_file()],   # write_file 覆盖 bug.py，破坏 import
+        [_pytest()],                # collection error → regression + module_broken
+        None,
+    ]
+    ctx, _ = _run(tmp_path, script, max_steps=4)
+
+    # 1) 检测到 module_broken regression
+    assert ctx.metadata["swe_stats"]["module_broken_regressions"] == 1
+    assert ctx.metadata["needs_revert"] is True
+
+    # 2) [Recovery] 消息必须包含原始文件内容
+    text = _messages_text(ctx)
+    assert "[Recovery]" in text
+    # 原始 bug.py 内容是 "VALUE = 1\n"，应出现在恢复消息中
+    assert "VALUE = 1" in text, "[Recovery] 应包含被修改文件的原始内容"
+    assert "bug.py" in text, "[Recovery] 应标注原始内容属于哪个文件"
+
+    # 3) 原始内容备份应存在于 context.config
+    backups = ctx.config.get("_file_backups", {})
+    assert "bug.py" in backups
+    assert backups["bug.py"] == "VALUE = 1\n"
+
+
+# ── Test 8：多次 write_file 后，备份应保留最初有效内容，不被恢复失败覆盖 ──
+def test_backup_preserves_original_after_failed_recovery_attempt(tmp_path):
+    """场景：有效文件 → write_file 破坏 → 触发恢复 → Agent 再次 write_file（恢复失败）
+    → 再次触发恢复。此时备份和 [Recovery] 消息必须仍保留**最初的有效内容**，
+    而不是被中间的破坏内容覆盖。
+
+    这是 C1/C2 真实失败的关键：Agent 第一次 write_file 破坏文件后，[Recovery]
+    要求恢复，但 Agent 第二次 write_file 仍然写错（丢失函数），此时如果备份被
+    覆盖为破坏后的内容，原始有效内容就永久丢失了。
+    """
+    def _write_broken(content: str) -> ToolCall:
+        return ToolCall(id="bwf", name="write_file",
+                        params={"path": "bug.py", "content": content})
+
+    script = [
+        [_pytest()],                          # 1 passed, 1 failed → 基线
+        [_write_broken("import nonexistent_a\n")],  # 第一次破坏
+        [_pytest()],                          # collection error → regression #1 + [Recovery]
+        [_write_broken("import nonexistent_b\n")],  # 第二次 write_file（恢复失败，仍破坏）
+        [_pytest()],                          # collection error → regression #2
+        None,
+    ]
+    ctx, _ = _run(tmp_path, script, max_steps=6)
+
+    # 1) 两次 module_broken regression
+    assert ctx.metadata["swe_stats"]["module_broken_regressions"] == 2
+
+    # 2) 关键断言：备份必须仍保留最初的有效内容 "VALUE = 1\n"
+    #    而不是被中间的破坏内容 "import nonexistent_a\n" 覆盖
+    backups = ctx.config.get("_file_backups", {})
+    assert "bug.py" in backups
+    assert backups["bug.py"] == "VALUE = 1\n", \
+        f"备份应保留最初有效内容，实际为: {backups.get('bug.py')!r}"
+
+    # 3) 第二次 [Recovery] 消息也必须包含最初的有效内容
+    text = _messages_text(ctx)
+    assert "VALUE = 1" in text, \
+        "第二次 [Recovery] 应仍包含最初的有效内容，让 Agent 可以正确恢复"
+
+
+# ── Test 9：恢复消息应优先展示实际发生回归的文件 ──
+def test_recovery_message_prioritizes_actual_regression_file(tmp_path):
+    """当多个文件被修改时，[Recovery] 消息应优先展示实际导致回归的文件，
+    而不只是最近修改的几个文件。
+
+    当前实现只展示最近 3 个备份文件。如果实际出问题的文件不在最近 3 个中，
+    Agent 就看不到它的原始内容。
+    """
+    def _write_file(path: str, content: str) -> ToolCall:
+        return ToolCall(id=f"wf_{path}", name="write_file",
+                        params={"path": path, "content": content})
+
+    # 创建多个辅助文件
+    (tmp_path / "helper1.py").write_text("H1 = 1\n", encoding="utf-8")
+    (tmp_path / "helper2.py").write_text("H2 = 2\n", encoding="utf-8")
+    (tmp_path / "helper3.py").write_text("H3 = 3\n", encoding="utf-8")
+    (tmp_path / "helper4.py").write_text("H4 = 4\n", encoding="utf-8")
+
+    script = [
+        [_pytest()],                          # 基线
+        # 先修改 4 个辅助文件（不破坏 import）
+        [_write_file("helper1.py", "H1 = 10\n")],
+        [_write_file("helper2.py", "H2 = 20\n")],
+        [_write_file("helper3.py", "H3 = 30\n")],
+        [_write_file("helper4.py", "H4 = 40\n")],
+        # 最后修改 bug.py 并破坏 import（实际导致回归的文件）
+        [_write_file("bug.py", "import nonexistent\n")],
+        [_pytest()],                          # collection error → regression
+        None,
+    ]
+    ctx, _ = _run(tmp_path, script, max_steps=8)
+
+    # 1) 检测到 module_broken regression
+    assert ctx.metadata["swe_stats"]["module_broken_regressions"] == 1
+
+    # 2) [Recovery] 消息必须包含 bug.py 的原始内容（实际导致回归的文件）
+    text = _messages_text(ctx)
+    assert "[Recovery]" in text
+    assert "bug.py" in text, "[Recovery] 应包含实际导致回归的文件 bug.py"
+    assert "VALUE = 1" in text, "[Recovery] 应包含 bug.py 的原始有效内容"
+
+
 # ══════════════════════════════════════════════════════════════════
 # P1-1：不同测试命令共用 last_test_totals → 假 Regression
 # ══════════════════════════════════════════════════════════════════
@@ -562,8 +700,8 @@ def test_cross_command_run_is_not_regression(tmp_path):
     [Regression] / [Recovery] 不得注入。
     """
     script = [
-        [_cmd("python -m pytest -q test_fail.py")],   # 0 passed, 1 failed
-        [_cmd("python -m pytest -q broken/")],        # collection error（另一套范围）
+        [_cmd(f"{sys.executable} -m pytest -q test_fail.py")],   # 0 passed, 1 failed
+        [_cmd(f"{sys.executable} -m pytest -q broken/")],        # collection error（另一套范围）
         None,
     ]
     ctx, _ = _run(tmp_path, script, max_steps=4, project=_write_cross_project)
@@ -624,3 +762,67 @@ def test_same_command_recovery_is_not_regression(tmp_path):
     assert ctx.metadata["test_progress"] == "progress"
     assert "[Regression]" not in _messages_text(ctx)
     assert ctx.metadata["swe_stats"].get("regression_detected", 0) == 0
+
+
+# ── Phase 20：首次运行就是 collection error 不得进入修复阶段 ──────────
+def _write_collection_error_project(tmp_path: Path) -> None:
+    """测试文件导入不存在的模块 → pytest 收集阶段失败（collection error）。"""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "test_broken_import.py").write_text(
+        "from src.nonexistent_module import foo\n"
+        "def test_foo():\n    assert foo() == 1\n",
+        encoding="utf-8",
+    )
+
+
+def test_first_run_collection_error_not_test_failed(tmp_path):
+    """首次运行就是 collection error → 不得设置 test_failed，不得进入修复阶段。
+
+    Phase 19 C2 的根因：pytest 因 ModuleNotFoundError 失败（0 passed, 0 failed,
+    9 errors），但 _no_test_evidence 只判断 _total_tests == 0，导致 collection
+    error 被误判为有效测试失败，Agent 进入 force_edit 并修改业务代码。
+    修复后：纯 collection error（passed=0, failed=0）应标记为无测试证据，
+    不设置 test_failed，Agent 收到包含 errors 计数的 [NO_TEST_EVIDENCE] 消息。
+    """
+    script = [
+        [_pytest()],  # collection error → 无测试证据，不得 test_failed
+        None,
+    ]
+    ctx, _ = _run(tmp_path, script, max_steps=3, project=_write_collection_error_project)
+
+    text = _messages_text(ctx)
+    # 必须收到 NO_TEST_EVIDENCE，且消息包含 errors 计数
+    assert "[NO_TEST_EVIDENCE]" in text, f"应包含 [NO_TEST_EVIDENCE]: {text[-1000:]}"
+    assert "errors" in text.lower(), "消息应说明这是收集阶段错误"
+    # 不得设置 test_failed（collection error 不是业务代码缺陷）
+    assert ctx.metadata.get("test_failed", False) is False, \
+        "collection error 不得设置 test_failed"
+    # 不得记录为可用测试命令
+    assert "last_working_test_cmd" not in ctx.metadata, \
+        "collection error 的命令不得记录为 last_working_test_cmd"
+    # 不得进入 force_edit（没有有效失败证据就不应该强制修复）
+    assert ctx.metadata.get("force_edit", False) is False, \
+        "无有效测试证据时不得进入 force_edit"
+
+
+def test_collection_error_after_valid_counts_still_regression(tmp_path):
+    """反向保证：有基线后掉进 collection error 仍触发回归检测（不受修复影响）。
+
+    修复 _no_test_evidence 不能破坏已有的回归检测：当之前有有效测试结果，
+    然后修改代码导致 collection error 时，这是最严重的退化，必须触发
+    regression + module_broken 恢复路径。
+    """
+    script = [
+        [_pytest()],          # 建立基线（1 passed, 1 failed）
+        [_breaking_edit()],   # 破坏 import
+        [_pytest()],          # collection error → regression + module_broken
+        None,
+    ]
+    ctx, _ = _run(tmp_path, script, max_steps=4)
+
+    # 回归检测必须仍然生效
+    assert ctx.metadata["test_progress"] == "regression"
+    assert ctx.metadata["swe_stats"]["module_broken_regressions"] == 1
+    assert ctx.metadata["needs_revert"] is True
+    assert "[Regression]" in _messages_text(ctx)

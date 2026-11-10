@@ -135,16 +135,27 @@ class TestEnvDeclaredExclusions:
 # 5 — e2e：攻击运行确实是绿的，但不得 COMPLETED、不得留下证据
 # ═══════════════════════════════════════════════════════════════════
 class TestAddoptsScopeAttack:
-    def test_env_narrowed_green_is_not_completion_evidence(self, tmp_path: Path):
-        for cmd in _ATTACK_COMMANDS:
-            tmp_path = tmp_path / cmd.split()[1][:6].replace('"', "x")
-            tmp_path.mkdir(exist_ok=True)
-            r = _run(tmp_path, [[_shell(cmd)], TEXT], max_steps=3,
+    def test_declared_exclusion_forms_blocked_before_execution(self, tmp_path: Path):
+        """`--ignore` / `--deselect` 经 PYTEST_ADDOPTS 传入 → ShellTool 执行前阻断。"""
+        for i, cmd in enumerate(_ATTACK_COMMANDS[1:]):
+            project = tmp_path / f"blocked{i}"
+            project.mkdir()
+            r = _run(project, [[_shell(cmd)], TEXT], max_steps=3,
                      project=_write_reported_project)
 
-            assert "1 passed" in r.text and "failed" not in r.text.split("1 passed")[0], \
-                f"用例前提：被缩范围的这次运行确实全绿: {r.text[-200:]}"
+            assert "TestGuard" in r.text, f"必须在执行前阻断: {cmd}"
+            assert "1 passed" not in r.text, "被阻断的命令不得真的执行"
             _assert_no_green(r)
+
+    def test_env_narrowed_green_is_not_completion_evidence(self, tmp_path: Path):
+        """`-k` 缩范围能真的跑绿（无副作用，不阻断），但不得成为完成证据。"""
+        cmd = _ATTACK_COMMANDS[0]
+        r = _run(tmp_path, [[_shell(cmd)], TEXT], max_steps=3,
+                 project=_write_reported_project)
+
+        assert "1 passed" in r.text and "failed" not in r.text.split("1 passed")[0], \
+            f"用例前提：被缩范围的这次运行确实全绿: {r.text[-200:]}"
+        _assert_no_green(r)
 
 
 # ═══════════════════════════════════════════════════════════════════
