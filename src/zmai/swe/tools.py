@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import logging
 import os
@@ -96,6 +97,58 @@ def _validate_written_py(full: Path) -> tuple[bool, str]:
     return False, structured
 
 
+def _api_surface(source: str) -> dict[str, str] | None:
+    """Public API surface of a Python source: public top-level names, class
+    methods/attributes and base classes. Returns None when unparsable."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    surface: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.name.startswith("_"):
+            surface[f"函数 {node.name}"] = ast.unparse(node.args)
+        elif isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
+            surface[f"类 {node.name}"] = ", ".join(ast.unparse(b) for b in node.bases)
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and not item.name.startswith("_"):
+                    surface[f"方法 {node.name}.{item.name}"] = ast.unparse(item.args)
+                elif isinstance(item, (ast.Assign, ast.AnnAssign)):
+                    targets = item.targets if isinstance(item, ast.Assign) else [item.target]
+                    for target in targets:
+                        if isinstance(target, ast.Name) and not target.id.startswith("_"):
+                            surface[f"属性 {node.name}.{target.id}"] = "present"
+    return surface
+
+
+def _public_api_changes(old_text: str, new_text: str) -> list[str]:
+    """删除或改变签名的公共接口条目（只提示，不作为失败）。"""
+    before = _api_surface(old_text)
+    after = _api_surface(new_text)
+    if before is None or after is None:
+        return []
+    changes: list[str] = []
+    for key, signature in before.items():
+        if key not in after:
+            changes.append(f"删除 {key}")
+        elif signature != after[key]:
+            changes.append(f"签名变化 {key}: {signature} -> {after[key]}")
+    return changes
+
+
+def _public_api_warning(old_text: str, new_text: str) -> str:
+    changes = _public_api_changes(old_text, new_text)
+    if not changes:
+        return ""
+    lines = ["[PUBLIC_API_CHANGE] 本次修改改变了已有的公共接口，可能破坏调用者或子类："]
+    lines.extend(f"- {change}" for change in changes[:8])
+    lines.append(
+        "action_required: 先用 grep/read_file 检查这些名字的引用与继承；"
+        "优先保留原名称或保持兼容（别名/委派），除非任务明确要求移除。"
+    )
+    return "\n".join(lines)
+
+
 def _invalidate_bytecode_cache(full: Path) -> None:
     """写入 .py 后作废它自己的 __pycache__ 字节码缓存。
 
@@ -145,10 +198,9 @@ def purge_bytecode_caches(root: Path) -> None:
 def _write_checked(full: Path, content: str, orig_text: str, label: str) -> tuple[bool, str]:
     """写入前做 diff 安全检查，写入后做 Python 语法验证。
 
-    返回 (ok, error_message)。ok=False 时 error 为结构化消息，包括：
-      - EDIT_NO_CHANGE: 新内容与原内容相同 → 空 diff，不得计入真实修改
-      - EDIT_TRUNCATION: 原内容非空但新内容为空 → 明显截断/清空文件
-      - EDIT_VALIDATION_FAILED: 写出的 .py 无法通过语法验证
+    返回 (ok, message)。ok=False 时 message 为结构化错误（EDIT_NO_CHANGE /
+    EDIT_TRUNCATION / EDIT_VALIDATION_FAILED）；ok=True 时 message 可能携带
+    PUBLIC_API_CHANGE 提示（删除/改签公共接口），调用方应把它附加到成功输出。
     """
     if content == orig_text:
         return False, (
@@ -168,7 +220,16 @@ def _write_checked(full: Path, content: str, orig_text: str, label: str) -> tupl
         return False, f"[EDIT_WRITE_ERROR] 写入失败: {e}"
     # 写完立刻作废旧字节码，保证下一次 pytest/import 看到的是刚写下的源码。
     _invalidate_bytecode_cache(full)
-    return _validate_written_py(full)
+    ok, message = _validate_written_py(full)
+    if ok and full.suffix.lower() == ".py":
+        warning = _public_api_warning(orig_text, content)
+        if warning:
+            return True, warning
+    return ok, message
+
+
+def _with_detail(output: str, detail: str) -> str:
+    return f"{output}\n{detail}" if detail else output
 
 
 def _resolve_tool_path(context: ToolContext, user_path: str) -> tuple[bool, Path, str]:
@@ -887,7 +948,7 @@ class EditTool(Tool):
                     result = ToolResult.err(msg)
                     _emit_tool_result(self.name, context, params, result, _st)
                     return result
-                result = ToolResult.ok(output=f"appended {path}")
+                result = ToolResult.ok(output=_with_detail(f"appended {path}", msg))
                 _emit_tool_result(self.name, context, params, result, _st)
                 return result
 
@@ -916,7 +977,8 @@ class EditTool(Tool):
                 echo_start = max(1, start - 3)
                 echo_end = min(len(lines), mod_end + 3, echo_start + _MAX_ECHO_LINES - 1)
                 echo = _render_edit_echo(lines, echo_start, echo_end, path)
-                result = ToolResult.ok(output=f"replaced {path}:{start}-{end}\n{echo}")
+                result = ToolResult.ok(
+                    output=_with_detail(f"replaced {path}:{start}-{end}\n{echo}", msg))
                 _emit_tool_result(self.name, context, params, result, _st)
                 return result
 
@@ -952,7 +1014,8 @@ class EditTool(Tool):
                 echo_start = max(1, first_diff - 3)
                 echo_end = min(len(new_lines), first_diff + 10, echo_start + _MAX_ECHO_LINES - 1)
                 echo = _render_edit_echo(new_lines, echo_start, echo_end, path)
-                result = ToolResult.ok(output=f"replaced {n} matches in {path}\n{echo}")
+                result = ToolResult.ok(
+                    output=_with_detail(f"replaced {n} matches in {path}\n{echo}", msg))
                 _emit_tool_result(self.name, context, params, result, _st)
                 return result
 
@@ -970,7 +1033,8 @@ class EditTool(Tool):
                 echo_start = max(1, ln - 3)
                 echo_end = min(len(lines), mod_end + 3, echo_start + _MAX_ECHO_LINES - 1)
                 echo = _render_edit_echo(lines, echo_start, echo_end, path)
-                result = ToolResult.ok(output=f"inserted at {path}:{ln}\n{echo}")
+                result = ToolResult.ok(
+                    output=_with_detail(f"inserted at {path}:{ln}\n{echo}", msg))
                 _emit_tool_result(self.name, context, params, result, _st)
                 return result
 
