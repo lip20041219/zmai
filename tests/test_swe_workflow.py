@@ -11,6 +11,9 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+
+import pytest
 
 from zmai.swe.agent import (
     _BASE_SYSTEM_PROMPT,
@@ -114,6 +117,11 @@ class TestWorkflowInSystemPrompt:
 
 class TestWindowsPlatformPrompt:
     """_build_platform_prompt() 在 Windows 下应包含正确的命令兼容说明。"""
+
+    @pytest.fixture(autouse=True)
+    def _pretend_windows(self, monkeypatch):
+        """_build_platform_prompt() 按 sys.platform 分支；在 Linux CI 上也测 Windows 分支。"""
+        monkeypatch.setattr(sys, "platform", "win32")
 
     def test_windows_prompt_includes_tail_alternative(self):
         """Windows 平台提示应包含 tail 的替代说明。"""

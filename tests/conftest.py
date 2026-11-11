@@ -53,6 +53,7 @@ _MOCK_BACKENDS = [
     "read_loop",
     "requirements_run",
     "echo",
+    "traj_probe",
 ]
 for _name in _MOCK_BACKENDS:
     os.environ.setdefault(f"{_name.upper()}_API_KEY", "sk-mock")

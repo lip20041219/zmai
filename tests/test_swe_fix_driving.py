@@ -403,11 +403,15 @@ _GREP_NO_MATCH = ToolCall(id="g5", name="grep",
 
 # D1：测试命令在导入期改写**既有源文件**（快照/生成物类测试的真实形态）→
 # 工作区真的变了，但测试仍然失败 → 命中"工作区变了但调用失败"的边界重置。
+# 用哨兵文件控制生效时机：本用例只允许**第二次** pytest 触发改写。若首次运行就
+# 改写，`ever_modified` 会被这次测试副作用置位，失败随即被判定为"无基线的修改后
+# 失败"（不再进入修复态），用例根本到不了它要验证的边界。
 TAMPER_CONFTEST = '''\
 import pathlib
 
-with pathlib.Path("app.py").open("a", encoding="utf-8") as fh:
-    fh.write("# tampered by conftest\\n")
+if pathlib.Path("arm_tamper.flag").exists():
+    with pathlib.Path("app.py").open("a", encoding="utf-8") as fh:
+        fh.write("# tampered by conftest\\n")
 '''
 
 
@@ -536,7 +540,11 @@ class TestForceEditEntryDiscoveryAllowance:
         (project / "conftest.py").write_text(TAMPER_CONFTEST, encoding="utf-8")
         results = _capture_tool_results(monkeypatch)
 
+        # 进入强制期后写入哨兵（新文件，不算修复进展/不解除 force_edit），
+        # 让第二次 pytest 在导入期改写 app.py 并继续失败。
         script = [[_PYTEST], *_only_reads(["app.py", "module_a.py", "module_b.py"]),
+                  [ToolCall(id="arm", name="write_file",
+                            params={"path": "arm_tamper.flag", "content": "1"})],
                   [_PYTEST], [_GREP_SRC], None]
         ctx, _ = asyncio.run(_run_agent(project, _ScriptedBackend(script), max_steps=8))
 
@@ -1156,8 +1164,10 @@ class TestPytestStatsClassification:
         script: list[list[ToolCall] | None] = [
             [ToolCall(id="1", name="shell_exec",
                       params={"command": "python -m pytest -q"})],
+            # 定向范围：编辑前重跑完整套件会被 REPEATED_FULL_SUITE 拦截，
+            # 本用例验证的是"完整路径解释器调用"能被识别为 pytest 调用。
             [ToolCall(id="2", name="shell_exec",
-                      params={"command": r"C:\venv\Scripts\python.exe -m pytest -q"})],
+                      params={"command": r"C:\venv\Scripts\python.exe -m pytest test_app.py -q"})],
             None,
         ]
         backend = _ScriptedBackend(script)
@@ -1248,14 +1258,15 @@ class TestFixDrivingStickyEscape:
         _write_flask_project(project)
 
         # step1 pytest(失败) → step2 连续3次read(触发force_edit)
-        # step3 再次shell_exec pytest(必须被拦截，证明无法逃逸)
+        # step3 再次 shell_exec 跑定向 pytest（允许执行，但不能逃逸）
         # step4 edit(唯一被允许的推进动作) → step5 pytest(全绿) → 完成
+        # 用定向范围而非完整套件：编辑前重跑完整套件会被 REPEATED_FULL_SUITE 拦截。
         script: list[list[ToolCall] | None] = [
             [ToolCall(id="1", name="shell_exec",
                       params={"command": f"{sys.executable} -m pytest -q"})],
             _diagnostic_reads(),
             [ToolCall(id="5", name="shell_exec",
-                      params={"command": f"{sys.executable} -m pytest -q"})],
+                      params={"command": f"{sys.executable} -m pytest test_app.py -q"})],
             [ToolCall(id="6", name="edit",
                       params={"path": "app.py", "mode": "regex_replace",
                               "old_text": r"def index\(\):",
@@ -1414,7 +1425,14 @@ class TestRootCauseLatchLifecycle:
 
         monkeypatch.setattr(failure_mod, "parse_test_failure", _flaky)
 
-        script: list[list[ToolCall] | None] = [[_PYTEST], [_PYTEST], None]
+        # 第二次用定向范围：编辑前重跑完整套件会被 REPEATED_FULL_SUITE 拦截，
+        # 而本用例要验证的是"新的失败会让解析重试"。
+        script: list[list[ToolCall] | None] = [
+            [_PYTEST],
+            [ToolCall(id="p2", name="shell_exec",
+                      params={"command": f"{sys.executable} -m pytest test_app.py -q"})],
+            None,
+        ]
         backend = _ScriptedBackend(script)
         ctx, _action = asyncio.run(_run_agent(project, backend))
 

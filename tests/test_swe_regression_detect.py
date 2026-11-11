@@ -147,6 +147,11 @@ def _pytest() -> ToolCall:
                     params={"command": f"{sys.executable} -m pytest -q"})
 
 
+def _pytest_focused() -> ToolCall:
+    return ToolCall(id="ptf", name="shell_exec",
+                    params={"command": f"{sys.executable} -m pytest test_all.py -q"})
+
+
 def _bad_edit() -> ToolCall:
     """把 VALUE 从 1 改成 0：test_a 由通过变失败 → regression。"""
     return ToolCall(id="fix", name="edit",
@@ -402,7 +407,9 @@ def test_force_edit_closes_loop_with_real_diff(tmp_path):
         [_pytest()],                    # 1) pytest 失败
         _diagnostic_reads(),    # 2) 攒满阈值 → force_edit=True
         [_read()],                      # 3) read 被拒绝，无死循环
-        [_pytest()],                    # 4) force_edit 下 pytest 仍可执行（RC-3）
+        # 4) force_edit 下 pytest 仍可执行（RC-3）。用定向范围：编辑前重跑
+        #    完整套件会被 REPEATED_FULL_SUITE 拦截，不属于本用例验证的语义。
+        [_pytest_focused()],
         [_fix_edit()],                  # 5) 被迫 edit
         [_pytest()],                    # 6) 修改后重新验证
     ]

@@ -678,7 +678,7 @@ class TestSWEAgentLoopGuardIntegration:
 
         asyncio.run(run())
 
-    def test_no_loop_during_normal_operation(self):
+    def test_no_loop_during_normal_operation(self, tmp_path):
         """正常的工具调用序列不应触发循环检测。"""
         from collections.abc import Iterator
 
@@ -723,6 +723,10 @@ class TestSWEAgentLoopGuardIntegration:
             def capabilities(self) -> set[BackendCapability]:
                 return {BackendCapability.TOOL_USE}
 
+        # 工作区必须自包含：write_file 修改的是**已有文件**才算进展。
+        # 依赖 cwd 里恰好存在 main.py 会让本用例在干净 checkout（CI）上失败。
+        (tmp_path / "main.py").write_text("original", encoding="utf-8")
+
         async def run():
             agent = SWEAgent("test_normal")
             registry = ToolRegistry()
@@ -737,7 +741,7 @@ class TestSWEAgentLoopGuardIntegration:
                 task="test",
                 backend=NormalBackend(),
                 tools=registry,
-                config={"loop_guard.threshold": 3},
+                config={"loop_guard.threshold": 3, "project_path": str(tmp_path)},
                 metadata={"loop_guard": LoopGuard(threshold=3)},
             )
             # 所有步骤都应为 continue（不触发循环）
