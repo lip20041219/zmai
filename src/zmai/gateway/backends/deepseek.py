@@ -126,7 +126,8 @@ class DeepSeekBackend(Backend):
         remaining = remaining_wall_seconds(request.metadata)
         if remaining is not None and remaining <= 2:
             raise BackendError("task wall budget exhausted before model request")
-        http_timeout = min(self._timeout, max(1.0, remaining - 1)) if remaining is not None else self._timeout
+        http_timeout = (min(self._timeout, max(1.0, remaining - 1))
+                        if remaining is not None else self._timeout)
         try:
             with urllib.request.urlopen(req, timeout=http_timeout) as resp:
                 result = json.loads(resp.read().decode())

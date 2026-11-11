@@ -471,7 +471,7 @@ class TestDeepSeekBackend:
     def test_init_defaults(self):
         backend = DeepSeekBackend(config={"api_key": "test-key"})
         assert backend.name == "deepseek"
-        assert backend.model == "deepseek-v4-flash"
+        assert backend.model == "deepseek-flash"
         assert backend._base_url == "https://api.deepseek.com/v1"
 
     def test_init_custom_config(self):
@@ -518,7 +518,8 @@ class TestDeepSeekBackend:
         此前 DeepSeekBackend 硬编码使用 self._max_tokens，忽略 request.max_tokens，
         导致 agent 无法在 force_edit 等阶段动态调整输出上限。
         """
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import MagicMock, patch
+
         from zmai.gateway.base import BackendRequest
 
         backend = DeepSeekBackend(config={"api_key": "test-key", "max_tokens": 4096})
@@ -546,7 +547,8 @@ class TestDeepSeekBackend:
 
     def test_fallback_to_backend_default_when_request_max_tokens_zero(self):
         """request.max_tokens 为 0/None 时，应回退到后端默认值。"""
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import MagicMock, patch
+
         from zmai.gateway.base import BackendRequest
 
         backend = DeepSeekBackend(config={"api_key": "test-key", "max_tokens": 4096})
@@ -802,7 +804,7 @@ class TestBackendInvalidResponse:
         sent = json.loads(request.data.decode())
         assert "messages" in sent, "应为 OpenAI messages 格式"
         assert "model" in sent
-        assert sent["model"] == "deepseek-v4-flash"
+        assert sent["model"] == "deepseek-flash"
 
     # ── GeminiBackend ──────────────────────────────────────
 
@@ -884,6 +886,7 @@ class TestPluginRegistryDefaultSelection:
 
     def test_http_timeout_uses_remaining_wall_budget(self, monkeypatch):
         import time
+
         from zmai.config import Config
         from zmai.gateway.plugin import PluginRegistry
 
