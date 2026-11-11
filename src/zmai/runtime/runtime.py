@@ -31,10 +31,14 @@ logger = logging.getLogger("zmai.runtime")
 def _redact_error(error: BaseException) -> str:
     message = str(error)
     for name, value in os.environ.items():
-        if any(part in name.upper() for part in ("KEY", "TOKEN", "SECRET", "PASSWORD")) and len(value) >= 8:
+        if (any(part in name.upper()
+                for part in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
+                and len(value) >= 8):
             message = message.replace(value, "[REDACTED]")
-    return re.sub(r"(?i)(?:sk-[A-Za-z0-9_-]{12,}|(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+)",
-                  "[REDACTED]", message)
+    return re.sub(
+        r"(?i)(?:sk-[A-Za-z0-9_-]{12,}|"
+        r"(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+)",
+        "[REDACTED]", message)
 
 ProgressCB = Callable[[str, str], None] | None
 

@@ -87,7 +87,8 @@ class TestWorkflowInSystemPrompt:
         """系统提示应包含 TestGuard 拒绝后切换工具的规则。"""
         assert "TestGuard" in _BASE_SYSTEM_PROMPT
         assert "declared exclusion" in _BASE_SYSTEM_PROMPT
-        assert "do NOT retry" in _BASE_SYSTEM_PROMPT.lower() or "do not retry" in _BASE_SYSTEM_PROMPT.lower()
+        assert ("do NOT retry" in _BASE_SYSTEM_PROMPT.lower()
+                or "do not retry" in _BASE_SYSTEM_PROMPT.lower())
 
     def test_prompt_requires_evidence_for_rerunning_tests(self):
         """系统提示应要求重复测试有充分理由（代码修改/结果变化/新证据）。"""
@@ -687,8 +688,8 @@ class TestDegenerateResponseReason:
 
     def test_truncated_length_no_tool_calls(self):
         """stop_reason=length 且无 tool_calls 应判定为截断。"""
-        from zmai.swe.agent import _degenerate_response_reason
         from zmai.gateway.base import BackendResponse, TokenUsage
+        from zmai.swe.agent import _degenerate_response_reason
         resp = BackendResponse(
             content="some long text that got cut off",
             tool_calls=[],
@@ -702,8 +703,8 @@ class TestDegenerateResponseReason:
 
     def test_truncated_max_tokens_no_tool_calls(self):
         """stop_reason=max_tokens 且无 tool_calls 应判定为截断。"""
-        from zmai.swe.agent import _degenerate_response_reason
         from zmai.gateway.base import BackendResponse, TokenUsage
+        from zmai.swe.agent import _degenerate_response_reason
         resp = BackendResponse(
             content="text",
             tool_calls=[],
@@ -716,8 +717,8 @@ class TestDegenerateResponseReason:
 
     def test_truncated_with_tool_calls_is_normal(self):
         """带 tool_calls 的截断响应不判定为退化（按设计重试确定性截断无意义）。"""
-        from zmai.swe.agent import _degenerate_response_reason
         from zmai.gateway.base import BackendResponse, TokenUsage, ToolCall
+        from zmai.swe.agent import _degenerate_response_reason
         resp = BackendResponse(
             content="",
             tool_calls=[ToolCall(id="t1", name="edit", params={"path": "a.py"})],
@@ -728,8 +729,8 @@ class TestDegenerateResponseReason:
 
     def test_empty_response_is_degenerate(self):
         """content 和 tool_calls 同时为空应判定为空响应。"""
-        from zmai.swe.agent import _degenerate_response_reason
         from zmai.gateway.base import BackendResponse, TokenUsage
+        from zmai.swe.agent import _degenerate_response_reason
         resp = BackendResponse(
             content="",
             tool_calls=[],
@@ -742,8 +743,8 @@ class TestDegenerateResponseReason:
 
     def test_normal_content_is_not_degenerate(self):
         """有 content 的正常响应不判定为退化。"""
-        from zmai.swe.agent import _degenerate_response_reason
         from zmai.gateway.base import BackendResponse, TokenUsage
+        from zmai.swe.agent import _degenerate_response_reason
         resp = BackendResponse(
             content="done",
             tool_calls=[],

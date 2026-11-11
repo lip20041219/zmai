@@ -420,6 +420,6 @@ class TestTruncatedDeliveryIsNotClaimedComplete:
         (tmp_path / "big.py").write_text(BIG_SRC, encoding="utf-8")
         tool = ReadFileTool()
         ctx = _ctx(tmp_path, None)
-        r1 = tool.execute(ctx, {"path": "big.py"})
+        tool.execute(ctx, {"path": "big.py"})
         r2 = tool.execute(ctx, {"path": "big.py"})
         assert "[ReadCache]" not in r2.output
