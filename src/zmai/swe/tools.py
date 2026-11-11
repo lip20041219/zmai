@@ -17,6 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from zmai.swe.acceptance_guard import NONCE_MARKER
 from zmai.swe.verifier import (
     parse_pytest_failure_ids,
     parse_test_totals,
@@ -1756,6 +1757,14 @@ def _collapse_test_output(output: str, exit_code: int, cmd: str) -> tuple[str, b
     # 也不能继续返回上一次的摘要。只折叠同命令、同正文的重复结果。
     failed_names = re.findall(r"FAILED\s+(\S+)", output)
     stable_output = re.sub(r"\bin \d+(?:\.\d+)?s\b", "in <time>", output)
+    # P0-2：守卫 nonce 每次运行都不同，必须从哈希里归一化，否则重复测试永远不折叠；
+    # 但折叠后的输出仍要带上**本次** nonce —— Runtime 用它核验这份结果不是旧输出。
+    # marker 可能与 pytest 进度输出粘在同一行（`.......[100%][AcceptanceGuard:nonce] …`），
+    # 因此按子串提取而不是按行首。
+    _nonce_match = re.search(re.escape(NONCE_MARKER) + r"\s+\S+", output)
+    nonce_line = _nonce_match.group(0) if _nonce_match else ""
+    stable_output = re.sub(re.escape(NONCE_MARKER) + r"\s+\S+",
+                           NONCE_MARKER + " <nonce>", stable_output)
     hash_content = cmd + "|" + summary_line + "|" + stable_output
     cur_hash = hashlib.sha256(hash_content.encode()).hexdigest()
 
@@ -1767,6 +1776,8 @@ def _collapse_test_output(output: str, exit_code: int, cmd: str) -> tuple[str, b
             f"Failing: {', '.join(failed_names[:5]) if failed_names else '(none)'}\n"
             f"Use read_file to inspect code, or change code before re-running."
         )
+        if nonce_line:
+            collapsed += f"\n{nonce_line}"
         return collapsed, True
     # 更新缓存
     if shell_self:
@@ -1928,7 +1939,10 @@ class ShellTool(Tool):
                     failure_details = _extract_failure_details(output)
                     if failure_details:
                         summary = summary + failure_details + "\n"
-            result_meta = {"exit_code": exit_code}
+            result_meta = {"exit_code": exit_code,
+                           # P0-2：回放必须复现**实际执行**的命令（已剥离
+                           # pager / head-tail 等输出管道），而不是原始工具参数。
+                           "effective_command": cmd}
             if _TEST_CMD_RE.search(cmd):
                 result_meta["pytest_failed_ids"] = failure_ids
             if exit_code != 0:

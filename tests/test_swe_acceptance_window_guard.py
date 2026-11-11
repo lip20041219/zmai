@@ -172,8 +172,22 @@ class TestSingleCallTamperRunRestore:
 # 1b — 反向对照：关掉 CR-4 注入（== 修复前），同一条攻击序列必须重新 COMPLETED
 # ═══════════════════════════════════════════════════════════════════
 class TestCounterfactualWithoutGuard:
-    def test_attack_completes_when_guard_disabled(self, tmp_path: Path):
-        """证明 1 号用例否掉的正是这条攻击，而不是别的原因（如夹具本身不成立）。"""
+    def test_attack_completes_when_guard_disabled(self, tmp_path: Path,
+                                                  monkeypatch):
+        """证明 1 号用例否掉的正是这条攻击，而不是别的原因（如夹具本身不成立）。
+
+        P0-2/P0-3 又加了独立复核（nonce + 独立回放 + 测试环境覆盖）。要让这条
+        反事实只检验"守卫层"的作用，必须把新层一起关掉；否则攻击会被新层拦下，
+        反事实不再说明旧守卫层的价值。
+        """
+        monkeypatch.setattr("zmai.swe.agent._verify_guard_nonce",
+                            lambda *args, **kwargs: (True, ""))
+        monkeypatch.setattr(
+            "zmai.swe.agent._replay_record",
+            lambda context, ledger, record: setattr(
+                record.integrity, "replay_verified", True))
+        monkeypatch.setattr("zmai.swe.agent._completion_evidence_trusted",
+                            lambda context: (True, ""))
         _write_split_project(tmp_path)
         r = _run(tmp_path, [[_tamper_run_restore()], TEXT], max_steps=2,
                  project=lambda p: None, guard=False)

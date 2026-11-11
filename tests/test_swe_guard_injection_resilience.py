@@ -150,10 +150,20 @@ class TestGuardArtifactsAreDigestChecked:
 # ═══════════════════════════════════════════════════════════════════
 class TestCounterfactualWithoutInjectionHardening:
     def test_attack_completes_when_fix_disabled(self, tmp_path: Path, monkeypatch):
-        # 关掉两层修复：1) sitecustomize 不再写回注入；2) 不再要求加载凭据。
+        # 关掉全部证据修复层：1) sitecustomize 不再写回注入；2) 不再要求加载凭据；
+        # 3) P0-2/P0-3 的 nonce 核验、独立回放与覆盖/环境复核同样关闭（否则攻击
+        # 会被新层拦下，这条反事实就不再证明"旧修复层"的作用）。
         monkeypatch.setattr("zmai.swe.agent._GUARD_SITECUSTOMIZE", "")
         monkeypatch.setattr("zmai.swe.agent._guard_receipt_advanced",
                             lambda context, g: True)
+        monkeypatch.setattr("zmai.swe.agent._verify_guard_nonce",
+                            lambda *args, **kwargs: (True, ""))
+        monkeypatch.setattr(
+            "zmai.swe.agent._replay_record",
+            lambda context, ledger, record: setattr(
+                record.integrity, "replay_verified", True))
+        monkeypatch.setattr("zmai.swe.agent._completion_evidence_trusted",
+                            lambda context: (True, ""))
         r = _run(tmp_path, [[_attack(_CLEAR_ADDOPTS)], TEXT], max_steps=3,
                  project=_write_split_project)
 

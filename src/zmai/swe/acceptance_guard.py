@@ -30,19 +30,35 @@ import base64
 import hashlib
 import json
 import os
+import sys
 import time
 
 #: 中止时打印的前缀 —— Runtime 据此把本次运行判为"无判定证据"（见 agent.step）。
 MARKER = "[AcceptanceGuard]"
+
+#: P0-2：Runtime 每次测试执行发放的 nonce 回显前缀。守卫在会话结束时打印本次
+#: 实际收到的 nonce；Runtime 只接受"输出与 receipt 同时带有本 run 的 nonce"的结果。
+#: 与中止 MARKER 刻意不同（`[AcceptanceGuard:nonce]` 不包含 `[AcceptanceGuard]`）。
+NONCE_MARKER = "[AcceptanceGuard:nonce]"
+
+#: Runtime 注入 nonce 的环境变量名（与 agent._NONCE_ENV 一致）。
+NONCE_ENV = "ZMAI_ACCEPTANCE_NONCE"
 
 _MANIFEST_NAME = "manifest.json"
 
 #: 运行凭据：本会话确实加载过守卫的证明（与 guard 模块同目录）。
 _RECEIPT_NAME = "receipt"
 
+#: 本 pytest 进程收到的 nonce（由 pytest_configure 从环境变量读取）。
+_nonce = ""
+
 #: scope 配置快照：pytest 启动瞬间四份配置的原文（base64）。
 #: Runtime 事后用与 run 起始基线相同的算法重算身份，覆盖 A→B→A 的瞬时改配置。
 _SCOPE_SNAPSHOT_NAME = "scope_snapshot.json"
+
+#: P0-3：测试环境身份快照（conftest / .pth / sitecustomize / 已加载插件）。
+#: Runtime 把它与证据记录绑定，并在回放后比对；环境变化 → 证据作废。
+ENV_SNAPSHOT_NAME = "env_snapshot.json"
 
 
 def _manifest_path() -> str:
@@ -87,7 +103,7 @@ def _abort(lines: list[str]) -> None:
     raise pytest.UsageError(msg)
 
 
-def _stamp_receipt() -> None:
+def _stamp_receipt(nonce: str) -> None:
     """留下"守卫确实在本 pytest 进程里加载过"的凭据。
 
     CR-4 残余：模型可以在 shell 命令里清空/覆盖 PYTEST_ADDOPTS，把 Runtime 注入的
@@ -95,11 +111,14 @@ def _stamp_receipt() -> None:
     任何东西（测试文件已被还原）。Runtime 侧的要求因此是：本次调用只要**真的跑了
     pytest**，就必须留下新凭据；没有凭据 = 守卫没加载 = 本次运行 fail-closed。
     写不进去（目录只读等）同样没有凭据，同样 fail-closed。
+
+    P0-2：凭据同时记录本次 run 的 nonce —— 只写"加载过"无法区分新旧运行，
+    记录 nonce 后才能与 Runtime 本次发放的值绑定。
     """
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                _RECEIPT_NAME), "a", encoding="utf-8") as f:
-            f.write(f"{os.getpid()} {time.time()}\n")
+            f.write(f"{os.getpid()} {time.time()} {nonce}\n")
     except OSError:
         pass
 
@@ -129,10 +148,93 @@ def _snapshot_scope() -> None:
         pass
 
 
+#: 扫描 conftest / .pth 时跳过的目录（构建产物、VCS、缓存、依赖）。
+_ENV_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", "__pycache__", ".venv", "venv", ".tox", ".eggs",
+    "node_modules", ".pytest_cache", ".mypy_cache", ".ruff_cache", "htmlcov",
+})
+
+
+def _file_digest(path: str) -> str | None:
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _snapshot_environment(config) -> None:
+    """P0-3：记录影响测试执行的环境身份，供 Runtime 与证据绑定。
+
+    覆盖 conftest.py、sys.path 上的 .pth、sitecustomize/usercustomize、本会话
+    实际加载的 pytest 插件。只取证、不判定；读不到的文件记为 None（同样改变身份）。
+    同一命令回放时会加载同一组 conftest/插件，因此前后快照可比。
+    """
+    try:
+        manifest = _load_manifest()
+        root = manifest.get("root") or "."
+        entries: dict[str, str | None] = {}
+        count = 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _ENV_SKIP_DIRS]
+            for name in filenames:
+                if name != "conftest.py":
+                    continue
+                path = os.path.join(dirpath, name)
+                entries[f"conftest:{os.path.relpath(path, root)}"] = _file_digest(path)
+                count += 1
+            if count >= 500:       # 有界：异常深的仓库不拖垮测试启动
+                break
+        seen: set[str] = set()
+        for entry in sys.path:
+            if not entry:
+                continue
+            directory = os.path.abspath(entry)
+            if directory in seen:
+                continue
+            seen.add(directory)
+            try:
+                names = sorted(n for n in os.listdir(directory) if n.endswith(".pth"))
+            except OSError:
+                continue
+            for name in names:
+                path = os.path.join(directory, name)
+                entries[f"pth:{path}"] = _file_digest(path)
+        for name in ("sitecustomize", "usercustomize"):
+            module = sys.modules.get(name)
+            path = getattr(module, "__file__", None) if module else None
+            if not path:
+                for entry in sys.path:
+                    candidate = os.path.join(entry, name + ".py")
+                    if os.path.isfile(candidate):
+                        path = candidate
+                        break
+            if path:
+                entries[f"module:{name}"] = _file_digest(path)
+        try:
+            plugins = list(getattr(config.pluginmanager, "_name2plugin", {}).values())
+        except Exception:
+            plugins = []
+        for plugin in plugins:
+            path = getattr(plugin, "__file__", None)
+            if path:
+                entries[f"plugin:{path}"] = _file_digest(path)
+        payload = {"entries": entries, "python": sys.executable,
+                   "version": sys.version.split()[0]}
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               ENV_SNAPSHOT_NAME), "w", encoding="utf-8") as f:
+            json.dump(payload, f, sort_keys=True)
+    except Exception:
+        pass                       # 快照失败 → Runtime 侧按"环境不可证明"降级
+
+
 def pytest_configure(config):  # noqa: ARG001  —— pytest 钩子签名
     """会话启动（任何测试被收集/导入之前）：验收文件必须 == run 起始内容。"""
+    global _nonce
+    _nonce = os.environ.get(NONCE_ENV, "").strip()
     _snapshot_scope()
-    _stamp_receipt()
+    _snapshot_environment(config)
+    _stamp_receipt(_nonce)
     try:
         deviated = _deviated()
     except Exception as e:  # 清单缺失/损坏 → fail-closed
@@ -152,6 +254,13 @@ def pytest_configure(config):  # noqa: ARG001  —— pytest 钩子签名
 
 def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001  —— pytest 钩子签名
     """会话结束时再核一次：测试**运行期间**被改写的运行不得算通过。"""
+    # P0-2：回显本次运行收到的 nonce，供 Runtime 与输出/receipt 双向核对。
+    # 它只是防"旧输出/伪造输出被复用"的绑定值，不是密钥，也不承诺绝对防篡改
+    # （被测代码与测试进程共享信任边界）。
+    if _nonce:
+        print(f"{NONCE_MARKER} {_nonce}", flush=True)
+    # 会话结束时再拍一次：捕获收集/运行阶段才加载的插件。
+    _snapshot_environment(session.config)
     try:
         deviated = _deviated()
     except Exception:

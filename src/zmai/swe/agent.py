@@ -9,6 +9,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -22,9 +24,30 @@ from zmai.errors import BackendError
 from zmai.gateway import Backend
 from zmai.gateway.base import BackendRequest, BackendResponse
 from zmai.swe._async_utils import run_sync
+from zmai.swe.acceptance_guard import ENV_SNAPSHOT_NAME, NONCE_MARKER
 from zmai.swe.acceptance_guard import MARKER as ACCEPTANCE_GUARD_MARKER
 from zmai.swe.completion import CompletionState
 from zmai.swe.context import ContextManager
+from zmai.swe.evidence import (
+    COVERAGE_FULL,
+    COVERAGE_PARTIAL,
+    COVERAGE_UNKNOWN,
+    EVIDENCE_POLLUTED,
+    EVIDENCE_VALID,
+    SCOPE_FULL,
+    SCOPE_SUBSET,
+    SCOPE_TARGETED,
+    SCOPE_UNKNOWN,
+    BaselineCompare,
+    CompletionLedger,
+    EvidenceRecord,
+    Integrity,
+    ReplayResult,
+    command_key,
+    decide_terminal,
+    fingerprint_digest,
+    shadow_diff,
+)
 from zmai.swe.graph import GraphRuntime, Node, SWEState
 from zmai.swe.loop_guard import LoopGuard
 from zmai.swe.models import MAX_REPLANS, Plan, format_plan_summary
@@ -41,6 +64,7 @@ from zmai.swe.tools import (
     ShowToUserTool,
     WriteFileTool,
     _is_test_file,
+    _run_shell_command,
     cli_scope_filter,
     cli_scope_names_exclusions,
     is_test_command,
@@ -621,6 +645,13 @@ def _scope_config_msg(files: list[str]) -> str:
 # 把 run 起始清单交给守卫、把守卫注入测试命令的子进程环境、把守卫的判定接进
 # 测试证据判定。
 _GUARD_METADATA_KEY = "__acceptance_guard__"
+#: P0-2：Runtime 每次测试执行发放的 nonce 环境变量（守卫回显它）。
+_NONCE_ENV = "ZMAI_ACCEPTANCE_NONCE"
+#: 回放只接受无 shell 组合/重定向的单一测试命令（副作用与可复现性可控）。
+_REPLAY_UNSAFE_RE = re.compile(r"[;&|<>\n\r`]|\$\(")
+#: P0-3：测试收集/影响范围可能无法静态确认的动态导入形态。
+_DYNAMIC_IMPORT_RE = re.compile(
+    r"\bimportlib\.import_module\s*\(|\b__import__\s*\(|pytest_plugins\s*=")
 
 #: 守卫目录里自动加载的 sitecustomize（标准库-only，见 acceptance_guard 模块头）。
 #: 解释器启动时由 `site` 自动 import —— 此刻 shell 里的 `set "PYTEST_ADDOPTS="`
@@ -684,6 +715,8 @@ def _install_acceptance_guard(context: AgentContext) -> None:
         "receipt": str(receipt),
         "receipt_seen": "",
         "scope_snapshot": str(guard_dir / "scope_snapshot.json"),
+        # P0-3：守卫在 pytest 启动/结束时写出的环境身份快照。
+        "env_snapshot": str(guard_dir / ENV_SNAPSHOT_NAME),
         # 守卫自身的代码摘要：目录在工作区之外，但模型仍可能顺着 PYTHONPATH 找到
         # 并改写它（改成空壳 + 照写凭据）。与清单同理：摘要不符 → 本次运行不作数。
         "module_digest": _content_digest(guard_dir / "zmai_acceptance_guard.py"),
@@ -693,21 +726,26 @@ def _install_acceptance_guard(context: AgentContext) -> None:
                 len(baseline), guard_dir)
 
 
-def _acceptance_guard_env(context: AgentContext) -> dict[str, str]:
+def _acceptance_guard_env(context: AgentContext,
+                          nonce: str | None = None) -> dict[str, str]:
     """测试命令子进程的环境增量：把守卫模块注入被测解释器。
 
     只"追加"不覆盖：PYTHONPATH 前置守卫目录、PYTEST_ADDOPTS 追加 `-p`，项目自己
     的取值原样保留（漏掉这条会让合法运行的 pytest 行为被改变）。
+    P0-2：nonce 随本次测试执行注入；守卫在输出与 receipt 中回显它。
     """
     g = context.metadata.get(_GUARD_METADATA_KEY)
     if not g:
         return {}
     pypath = os.environ.get("PYTHONPATH", "")
     addopts = os.environ.get("PYTEST_ADDOPTS", "").strip()
-    return {
+    env = {
         "PYTHONPATH": g["dir"] + (os.pathsep + pypath if pypath else ""),
         "PYTEST_ADDOPTS": ((addopts + " ") if addopts else "") + "-p zmai_acceptance_guard",
     }
+    if nonce:
+        env[_NONCE_ENV] = nonce
+    return env
 
 
 def _guard_receipt_advanced(context: AgentContext, g: dict[str, Any]) -> bool:
@@ -814,6 +852,316 @@ def _acceptance_guard_broken(context: AgentContext, test_out: str, cmd: str = ""
         )
         return True
     return False
+
+
+# ── P0-2: nonce 与独立进程回放 ──────────────────────────────────────
+
+def _new_test_nonce(context: AgentContext, command: str) -> str:
+    """为一次真实测试执行生成唯一 nonce，并记录其绑定信息。"""
+    nonce = secrets.token_hex(16)
+    context.metadata.setdefault("evidence_nonces", []).append({
+        "agent_id": context.agent_id,
+        "nonce": nonce,
+        "step": context.step_count,
+        "command": command,
+        "workspace_fingerprint": fingerprint_digest(
+            context.metadata.get("__ws_fingerprint__")),
+    })
+    return nonce
+
+
+def _verify_guard_nonce(context: AgentContext, test_out: str, nonce: str,
+                        command: str) -> tuple[bool | None, str]:
+    """核验本次测试输出与守卫凭据是否都绑定 Runtime 发放的 nonce。
+
+    返回值：
+      True  — 输出与 receipt 本次增量都带有同一个 nonce；
+      False — 运行了 pytest 但 nonce 缺失/被替换/未进凭据（伪造或旧证据）；
+      None  — 非 pytest 运行器 / 未生成 nonce（nonce 不适用，交给回放复核）。
+
+    边界：被测代码与测试进程共享信任边界，nonce 不承诺抵御能控制进程的恶意程序；
+    它只阻止旧输出复用与简单伪造。
+    """
+    if not nonce:
+        return None, "no nonce issued"
+    cmd = (command or "").lower()
+    if "pytest" not in cmd and "py.test" not in cmd:
+        return None, "nonce not supported for this runner"
+    g = context.metadata.get(_GUARD_METADATA_KEY)
+    if not g:
+        return False, "acceptance guard was not installed"
+    markers = re.findall(re.escape(NONCE_MARKER) + r"\s+([0-9a-f]{16,64})", test_out)
+    if not markers:
+        return False, "guard nonce missing from test output"
+    # 同一命令里跑了多个 pytest 会话时 nonce 会重复出现；只要没有**非本次**的
+    # marker 就算绑定成功（旧值/伪造值仍然是可检测的）。
+    if any(m != nonce for m in markers):
+        return False, "guard nonce does not match this execution"
+    try:
+        raw = Path(g["receipt"]).read_text(encoding="utf-8")
+    except OSError:
+        return False, "guard receipt unreadable"
+    seen = g.get("receipt_seen", "")
+    delta = raw[len(seen):] if raw.startswith(seen) else raw
+    if nonce not in delta:
+        return False, "guard receipt does not bind this nonce"
+    return True, ""
+
+
+def _read_test_env_snapshot(context: AgentContext) -> dict | None:
+    """读取守卫写出的测试环境快照；缺失/损坏返回 None（环境不可证明）。"""
+    g = context.metadata.get(_GUARD_METADATA_KEY)
+    if not g or not g.get("env_snapshot"):
+        return None
+    try:
+        data = json.loads(Path(g["env_snapshot"]).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+        return None
+    return data
+
+
+def _test_env_fingerprint(snapshot: dict | None) -> str:
+    """测试环境身份摘要：解释器 + conftest/.pth/sitecustomize/插件哈希。"""
+    if not snapshot:
+        return ""
+    payload = {
+        "python": snapshot.get("python", ""),
+        "version": snapshot.get("version", ""),
+        "entries": snapshot.get("entries") or {},
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _dynamic_import_risk(context: AgentContext) -> bool:
+    """测试文件/ conftest 是否使用无法静态确认影响范围的动态导入。
+
+    只影响**非完整范围**运行的 coverage 标记（降级为 unknown，仍可 candidate）；
+    完整套件运行覆盖的是整个套件，不因项目使用动态导入而被无差别阻止。
+    """
+    cached = context.metadata.get("__dynamic_import_risk__")
+    if cached is not None:
+        return bool(cached)
+    root = _workspace_root(context)
+    risk = False
+    budget = 2000                     # 有界扫描：异常大的测试树按"无法确认"处理
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _WS_IGNORE_DIRS]
+            for name in filenames:
+                if not name.endswith(".py"):
+                    continue
+                path = Path(dirpath) / name
+                if not _is_test_file(path, root):
+                    continue
+                budget -= 1
+                if budget < 0:
+                    risk = True
+                    break
+                try:
+                    text = path.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    risk = True       # 读不到就无法确认收集范围：保守
+                    continue
+                if _DYNAMIC_IMPORT_RE.search(text):
+                    risk = True
+                    break
+            if risk:
+                break
+    except OSError:
+        risk = True
+    context.metadata["__dynamic_import_risk__"] = risk
+    return risk
+
+
+def _replay_safe_command(command: str) -> tuple[bool, str]:
+    """回放只允许已识别、无 shell 组合且工作目录稳定的测试命令。"""
+    cmd = (command or "").strip()
+    if not cmd:
+        return False, "empty command"
+    if len(cmd) > 500:
+        return False, "command too long"
+    if _REPLAY_UNSAFE_RE.search(cmd):
+        return False, "shell composition/redirection is not safely reproducible"
+    if not is_test_command(cmd):
+        return False, "not a test runner command"
+    if test_scope_changes_root(cmd) or test_scope_has_opaque_wrapper(cmd):
+        return False, "working-directory/wrapper context is not reproducible"
+    if cli_scope_names_exclusions(cmd):
+        return False, "command declares test exclusions"
+    return True, ""
+
+
+def _replay_record(context: AgentContext, ledger: CompletionLedger,
+                   record: EvidenceRecord) -> None:
+    """在独立新进程中重放一次测试命令，并把结果写回证据记录。"""
+    if record.replay.attempted:
+        return
+    max_attempts = int(context.config.get("replay.max_attempts", 2))
+    if ledger.replay_attempts >= max_attempts:
+        record.integrity.replay_verified = False
+        record.replay = ReplayResult(
+            command=record.command, reason="replay attempt budget exhausted")
+        return
+    if record.integrity.nonce_verified is False:
+        record.integrity.replay_verified = False
+        record.replay = ReplayResult(
+            attempted=False, command=record.command, reason="nonce not verified")
+        record.evidence_status = EVIDENCE_POLLUTED
+        record.invalid_reason = "nonce verification failed"
+        return
+    ok, reason = _replay_safe_command(record.command)
+    if not ok:
+        record.integrity.replay_verified = False
+        record.replay = ReplayResult(command=record.command, reason=reason)
+        return
+    if (not record.workspace_fingerprint
+            or fingerprint_digest(context.metadata.get("__ws_fingerprint__"))
+            != record.workspace_fingerprint):
+        record.integrity.replay_verified = False
+        record.replay = ReplayResult(
+            command=record.command, reason="workspace changed since evidence")
+        return
+
+    nonce = _new_test_nonce(context, record.command)
+    env = {**os.environ, **_acceptance_guard_env(context, nonce)}
+    timeout = max(1, int(context.config.get("replay.timeout", 300)))
+    cwd = str(context.config.get("project_path") or context.workspace or ".")
+    started = _now_ms()
+    out, code, error = "", None, ""
+    try:
+        r = _run_shell_command(record.command, shell=True, cwd=cwd, env=env,
+                               text=True, timeout=timeout,
+                               encoding="utf-8", errors="replace")
+        out = r.stdout or ""
+        if r.stderr:
+            out += f"\n[stderr]\n{r.stderr}"
+        code = r.returncode
+    except subprocess.TimeoutExpired:
+        error = f"replay timed out after {timeout}s"
+    except Exception as e:  # noqa: BLE001 —— 回放失败必须变成证据结论，不能中断 run
+        error = f"replay failed: {e}"
+    duration = _now_ms() - started
+    totals = parse_test_totals(out)
+    nonce_ok, nonce_reason = _verify_guard_nonce(context, out, nonce, record.command)
+    root = _explicit_workspace_root(context) or Path(".")
+    after_digest = fingerprint_digest(
+        _workspace_fingerprint(root, prefer_git=_prefer_git_fingerprint(context)))
+    workspace_unchanged = after_digest == record.workspace_fingerprint
+    _cmd_l = record.command.lower()
+    _is_pytest = "pytest" in _cmd_l or "py.test" in _cmd_l
+    replay_env_fp = (_test_env_fingerprint(_read_test_env_snapshot(context))
+                     if _is_pytest else record.environment_fingerprint)
+    # 记录本身没有环境身份（覆盖未知）时无法比对，交由 coverage 限制 candidate。
+    environment_unchanged = (not record.environment_fingerprint
+                             or replay_env_fp == record.environment_fingerprint)
+
+    replay = ReplayResult(
+        attempted=True, command=record.command, nonce=nonce, exit_code=code,
+        passed=totals["passed"], failed=totals["failed"] + totals["errors"],
+        duration_ms=duration, workspace_unchanged=workspace_unchanged,
+        environment_unchanged=environment_unchanged, reason=error)
+    verified = (
+        not error
+        and code == record.exit_code
+        and totals["passed"] == record.passed
+        and totals["failed"] + totals["errors"] == record.failed
+        # pytest 必须带 nonce；非 pytest 运行器（None）由回放本身证明可复现。
+        and nonce_ok is not False
+        and workspace_unchanged
+        and environment_unchanged
+    )
+    if not verified and not replay.reason:
+        if nonce_ok is False:
+            replay.reason = f"replay nonce not verified: {nonce_reason}"
+        elif code != record.exit_code:
+            replay.reason = f"exit code {code} != recorded {record.exit_code}"
+        elif (totals["passed"] != record.passed
+              or totals["failed"] + totals["errors"] != record.failed):
+            replay.reason = (f"test totals differ: {totals['passed']} passed/"
+                             f"{totals['failed'] + totals['errors']} failed")
+        elif not environment_unchanged:
+            replay.reason = "test environment changed since evidence"
+        else:
+            replay.reason = "workspace changed during replay"
+    replay.verified = verified
+    record.replay = replay
+    record.integrity.replay_verified = verified
+    ledger.replay_attempts += 1
+    ledger.replay_total_ms += duration
+    if verified:
+        logger.info("[EvidenceReplay] %s step %d: verified %s in %dms",
+                    context.agent_id, context.step_count, record.run_id, duration)
+    else:
+        record.evidence_status = EVIDENCE_POLLUTED
+        record.invalid_reason = f"replay failed: {replay.reason}"
+        logger.warning("[EvidenceReplay] %s step %d: %s",
+                       context.agent_id, context.step_count, replay.reason)
+
+
+def _evidence_for_replay(ledger: CompletionLedger,
+                         kind: str) -> EvidenceRecord | None:
+    """选出支撑 completed / candidate 的最新绿色证据。"""
+    usable = ledger.usable()
+    if kind == "completed":
+        full = [r for r in usable if r.scope == SCOPE_FULL and r.green]
+        return full[-1] if full else None
+    latest: dict[tuple[str, str], EvidenceRecord] = {}
+    for r in usable:
+        latest[(r.scope, command_key(r.command))] = r
+    greens = [r for r in latest.values()
+              if r.green and not (r.scope == SCOPE_FULL
+                                  and r.coverage == COVERAGE_FULL)]
+    return greens[-1] if greens else None
+
+
+def _replay_for_terminal(context: AgentContext, kind: str) -> EvidenceRecord | None:
+    """在进入终态判定前回放一次支撑证据；已回放过则直接复用。"""
+    if str(context.config.get("replay.enabled", "true")).lower() == "false":
+        return None
+    ledger = _ledger(context)
+    record = _evidence_for_replay(ledger, kind)
+    if record is None:
+        return None
+    if not record.replay.attempted:
+        _replay_record(context, ledger, record)
+    return record
+
+
+def _completion_evidence_trusted(context: AgentContext) -> tuple[bool, str]:
+    """完成门禁的证据复核：有账本记录时，必须存在可验证的完整范围全绿证据。"""
+    ledger = _ledger(context)
+    if not ledger.records:
+        return True, "no ledger records (legacy path)"
+    if str(context.config.get("replay.enabled", "true")).lower() == "false":
+        # 关闭独立复核不能让未验证证据变成可信证据：有证据就必须验证。
+        return False, "replay disabled: evidence cannot be independently verified"
+    record = _replay_for_terminal(context, "completed")
+    if record is None:
+        return False, "no usable full-scope green evidence"
+    if record.coverage != COVERAGE_FULL:
+        return False, (f"coverage not proven ({record.coverage}): "
+                       f"{record.unverified_scope or 'unknown'}")
+    if record.integrity.trusted():
+        return True, ""
+    return False, record.replay.reason or "evidence not trusted"
+
+
+def _candidate_evidence_trusted(context: AgentContext) -> tuple[bool, str]:
+    """候选门禁的证据复核：支撑候选的局部绿证据必须可验证。"""
+    ledger = _ledger(context)
+    if not ledger.records:
+        return True, "no ledger records (legacy path)"
+    if str(context.config.get("replay.enabled", "true")).lower() == "false":
+        return False, "replay disabled: evidence cannot be independently verified"
+    record = _replay_for_terminal(context, "candidate")
+    if record is None:
+        return False, "no usable post-edit green evidence"
+    if record.integrity.trusted():
+        return True, ""
+    return False, record.replay.reason or "evidence not trusted"
 
 
 def _acceptance_guard_msg() -> str:
@@ -1148,6 +1496,93 @@ def _has_full_scope_green_evidence(context: AgentContext) -> bool:
     """
     completion = context.metadata.get("completion")
     return bool(completion and completion.tests_passed and completion.tests_complete)
+
+
+# ── M1 / P0-1: 证据账本（影子判定，不改变现有终态）──────────────────
+
+def _ledger(context: AgentContext) -> CompletionLedger:
+    """取本次 run 的证据账本；未初始化时惰性建立（兼容直接构造的 context）。"""
+    ledger = context.metadata.get("evidence_ledger")
+    if ledger is None:
+        ledger = CompletionLedger()
+        context.metadata["evidence_ledger"] = ledger
+    return ledger
+
+
+def _shadow_terminal(context: AgentContext, old_kind: str, point: str) -> None:
+    """记录一次新旧判定对比。只写审计数据，不改变任何控制流。"""
+    ledger = _ledger(context)
+    if old_kind in ("completed", "candidate"):
+        # 进入可信终态前复核；已完成过的回放直接复用（每记录最多一次）。
+        _replay_for_terminal(context, old_kind)
+    decision = decide_terminal(ledger)
+    diff = shadow_diff(old_kind, decision, point=point, step=context.step_count)
+    context.metadata.setdefault("evidence_shadow", []).append(diff)
+    if not diff["agree"]:
+        logger.warning(
+            "[EvidenceShadow] %s step %d: old=%s new=%s (%s)",
+            point, context.step_count, old_kind, decision.kind, decision.reason,
+        )
+
+
+def _record_test_evidence(
+    context: AgentContext,
+    *,
+    command: str,
+    scope: str,
+    coverage: str,
+    evidence_status: str,
+    exit_code: int,
+    totals: dict[str, int],
+    failed_ids: list[str],
+    comparison: dict,
+    test_files_unchanged: bool,
+    config_unchanged: bool,
+    no_scope_narrowing: bool,
+    unverified_scope: str,
+    invalid_reason: str = "",
+    regression_detected: bool = False,
+    nonce: str = "",
+    nonce_verified: bool | None = None,
+    environment_fingerprint: str = "",
+) -> EvidenceRecord:
+    """把一次真实测试运行写入账本（与旧 metadata 双写）。"""
+    status = comparison.get("status")
+    record = EvidenceRecord(
+        run_id=f"{context.agent_id}:{context.step_count}:{len(_ledger(context).records)}",
+        step=context.step_count,
+        command=command,
+        scope=scope,
+        coverage=coverage,
+        evidence_status=evidence_status,
+        workspace_fingerprint=fingerprint_digest(
+            context.metadata.get("__ws_fingerprint__")),
+        environment_fingerprint=environment_fingerprint,
+        exit_code=exit_code,
+        passed=totals["passed"],
+        failed=totals["failed"] + totals["errors"],
+        failed_ids=list(failed_ids)[:20],
+        executed_tests=totals["passed"] + totals["failed"] + totals["errors"],
+        baseline_compare=BaselineCompare(
+            available=status in ("comparable", "new_failures"),
+            new_failures=list(comparison.get("introduced") or []),
+            fixed_failures=list(comparison.get("resolved") or []),
+            preexisting_failures=list(comparison.get("pre_existing") or []),
+        ),
+        integrity=Integrity(
+            test_files_unchanged=test_files_unchanged,
+            config_unchanged=config_unchanged,
+            no_scope_narrowing=no_scope_narrowing,
+            ran_after_last_edit=True,
+            nonce_verified=nonce_verified,
+            replay_verified=None,
+        ),
+        unverified_scope=unverified_scope,
+        invalid_reason=invalid_reason,
+        regression_detected=regression_detected,
+        nonce=nonce,
+    )
+    return _ledger(context).record(record)
 
 
 def _eval_blocking_completion(context: AgentContext,
@@ -1723,6 +2158,11 @@ class SWEAgent(Agent):
             context.metadata["completion"] = CompletionState()
             logger.info("CompletionState initialized")
 
+        # ── 证据账本（M1/P0-1）：与 CompletionState 并行双写，判定先影子对比 ──
+        if "evidence_ledger" not in context.metadata:
+            context.metadata["evidence_ledger"] = CompletionLedger()
+            logger.info("Evidence ledger initialized")
+
         # ── Workflow phase tracking ────────────────────────────
         if "has_run_test" not in context.metadata:
             context.metadata["has_run_test"] = False
@@ -1815,28 +2255,55 @@ class SWEAgent(Agent):
             )
 
         _green_once = context.metadata.get("test_success_count", 0) >= 1
-        if (not _eval_blocks_completion and completion
-                and (completion.should_complete() or _green_once)):
-            logger.info(
-                "CompletionState satisfied — entering DONE (%s, step %d): %s",
-                context.agent_id, context.step_count, completion.summary(),
-            )
-            _log_stop()
-            _graph_enter(context, Node.DONE, f"completion_state: {completion.summary()}")
-            _l = context.metadata.get("__log__")
-            if _l:
-                try:
-                    _l.record_step(phase="complete", action="completion_state",
-                                   success=True,
-                                   metadata={"step": context.step_count,
-                                             "reason": completion.summary()})
-                except Exception:
-                    pass
-            context.metadata["messages"] = cm.get_context()
-            return AgentAction.complete(
-                output=f"Task completed — objective met and tests green "
-                       f"(step {completion.last_pass_step}). No further work needed."
-            )
+        _would_complete = (not _eval_blocks_completion and completion
+                           and (completion.should_complete() or _green_once))
+        if _would_complete:
+            # ── P0-3: 步入口的硬终止同样必须过证据复核 ─────────────
+            # 否则"工具步被拦下 → 下一步入口"会绕过 P0-2/P0-3 的门禁。
+            _evidence_ok, _evidence_why = _completion_evidence_trusted(context)
+            if not _evidence_ok:
+                _blocks = context.metadata.get("completion_block_count", 0) + 1
+                context.metadata["completion_block_count"] = _blocks
+                if _blocks > MAX_COMPLETION_BLOCKS:
+                    _graph_enter(context, Node.FAILED,
+                                 "evidence_verification_blocked_entry")
+                    return AgentAction.fail(
+                        error=(f"Test evidence failed nonce/replay/coverage "
+                               f"verification {_blocks - 1}x without progress: "
+                               f"{_evidence_why}"))
+                logger.warning(
+                    "CompletionState suppressed at step entry: evidence not verified "
+                    "(%s): %s", context.agent_id, _evidence_why,
+                )
+                cm.add_message("user",
+                    "[EvidenceGuard] 测试证据没有通过 nonce/回放/覆盖复核，"
+                    f"不能判定完成：{_evidence_why}\n"
+                    "请重新运行同一条测试命令；不要只回文本结束。"
+                )
+                context.metadata["messages"] = cm.get_context()
+                # 不 return：让模型拿到提示并重新取得可验证证据。
+            else:
+                logger.info(
+                    "CompletionState satisfied — entering DONE (%s, step %d): %s",
+                    context.agent_id, context.step_count, completion.summary(),
+                )
+                _log_stop()
+                _graph_enter(context, Node.DONE,
+                             f"completion_state: {completion.summary()}")
+                _l = context.metadata.get("__log__")
+                if _l:
+                    try:
+                        _l.record_step(phase="complete", action="completion_state",
+                                       success=True,
+                                       metadata={"step": context.step_count,
+                                                 "reason": completion.summary()})
+                    except Exception:
+                        pass
+                context.metadata["messages"] = cm.get_context()
+                return AgentAction.complete(
+                    output=f"Task completed — objective met and tests green "
+                           f"(step {completion.last_pass_step}). No further work needed."
+                )
 
         # ── Auto-plan phase ──────────────────────────────────
         auto_plan = context.config.get("auto_plan", False)
@@ -2084,6 +2551,13 @@ class SWEAgent(Agent):
             for tc in response.tool_calls:
                 if on_progress:
                     on_progress("tool", tc.name)
+                # P0-2：本次测试执行的 nonce 必须与**这一次**命令绑定，不能放在
+                # 跨调用共享的 metadata 里（同一步多个 tool call 会互相覆盖）。
+                _cmd_text = str((tc.params or {}).get("command", ""))
+                _test_nonce = (
+                    _new_test_nonce(context, _cmd_text)
+                    if tc.name in ("shell_exec", "git") and is_test_command(_cmd_text)
+                    else None)
                 tctx = ToolContext(
                     agent_id=context.agent_id,
                     workspace_path=context.workspace or Path("."),
@@ -2095,7 +2569,7 @@ class SWEAgent(Agent):
                     # 不持有 cm 引用。
                     read_state=cm.read_state,
                     # CR-4: 测试命令的子进程环境（守卫注入）。非测试命令不使用。
-                    env=_acceptance_guard_env(context),
+                    env=_acceptance_guard_env(context, _test_nonce),
                 )
                 _ts = _now_ms()
                 # 用 execute_tool 容错分发：LLM 幻觉出不存在的工具名时返回
@@ -2220,6 +2694,8 @@ class SWEAgent(Agent):
                         # CompletionState 完成）。只作废旧证据，不记 ever_modified。
                         context.metadata["test_success_count"] = 0
                         context.metadata.pop("candidate_test_evidence", None)
+                        _ledger(context).mark_polluted(
+                            "test files removed or rewritten during the run")
                         if completion:
                             completion.record_modification(step=context.step_count)
                         # 立刻把恢复指令交给模型（step 末随上下文进入下一轮）
@@ -2287,6 +2763,8 @@ class SWEAgent(Agent):
                     if _scope_drift_now:
                         context.metadata["test_success_count"] = 0
                         context.metadata.pop("candidate_test_evidence", None)
+                        _ledger(context).mark_polluted(
+                            "pytest scope config changed after the run")
                         completion.record_modification(step=context.step_count)
                         logger.warning(
                             "pytest scope config changed — prior green invalidated "
@@ -2305,6 +2783,7 @@ class SWEAgent(Agent):
                     had_modification = True
                     context.metadata["ever_modified"] = True
                     context.metadata.pop("candidate_test_evidence", None)
+                    _ledger(context).record_modification(context.step_count)
                     if completion:
                         completion.record_modification(step=context.step_count)
                     context.metadata["test_success_count"] = 0
@@ -2333,6 +2812,7 @@ class SWEAgent(Agent):
                         context.metadata["force_edit"] = False
                         repair_phase = "edit"
                         # ── CompletionState: 任何修改使旧测试结果失效 ──
+                        _ledger(context).record_modification(context.step_count)
                         if completion:
                             completion.record_modification(step=context.step_count)
                         # ── P0-2B: green 计数必须与 CompletionState 同步失效 ──
@@ -2371,6 +2851,17 @@ class SWEAgent(Agent):
                         )
                         # 失败时 output 为空、错误在 error 里；合并供 verify_test_output 判定
                         test_out = (result.output or "") + (result.error or "")
+                        # P0-2：在 receipt 被 `_acceptance_guard_broken` 消费之前核验
+                        # nonce —— 本次输出与本次 receipt 增量必须同时绑定它。
+                        _nonce_ok, _nonce_reason = _verify_guard_nonce(
+                            context, test_out, _test_nonce or "", _cmd_l)
+                        # P0-3：测试环境身份（conftest/.pth/sitecustomize/插件）。
+                        # 非 pytest 或 nonce 未通过时不采信可能残留的快照。
+                        _is_pytest_cmd = "pytest" in _cmd_l or "py.test" in _cmd_l
+                        _env_snapshot = (
+                            _read_test_env_snapshot(context)
+                            if _is_pytest_cmd and _nonce_ok is not False else None)
+                        _env_fp = _test_env_fingerprint(_env_snapshot)
                         # ── CR-4: 测试进程内部守卫的判定 ──────────────────
                         # 守卫在测试进程里核对 run 起始清单：被改写的会话会中止并打印
                         # 标记（无任何计数），因此这里的"本次运行不作数"是守卫**在运行
@@ -2431,6 +2922,8 @@ class SWEAgent(Agent):
                         )
                         _pre_edit = context.metadata.setdefault("pre_edit_test_baselines", {})
                         _new_failure_ids: list[str] = []
+                        _comparison: dict = {"status": "unknown",
+                                             "reason": "not_compared"}
                         if _baseline_safe and not context.metadata.get("ever_modified"):
                             _pre_edit.setdefault(_scope, {
                                 "failed_ids": list(_test_ids), "totals": dict(_totals),
@@ -2687,7 +3180,71 @@ class SWEAgent(Agent):
                         # 不得进 green 计数、不得当失败处理。
                         _no_verdict = (_no_test_evidence or _timeout_evidence
                                        or _files_missing or _guard_broken
-                                       or bool(_scope_drift) or _scope_declared)
+                                       or bool(_scope_drift) or _scope_declared
+                                       or _nonce_ok is False)
+                        # ── M1/P0-1: 写入结构化证据账本（影子，不改控制流）──
+                        # 零计数 / 超时没有可验证的执行结果，不产生证据；运行期间
+                        # 验收文件缺失、守卫中止、scope 配置偏离或命令点名排除
+                        # 则记录为 polluted —— 连 candidate 都不能支撑。
+                        if not _no_test_evidence and not _timeout_evidence:
+                            _scope_targets = test_scope_targets(_cmd_l)
+                            if _full_scope_cmd:
+                                _scope_kind = SCOPE_FULL
+                            elif _scope_targets:
+                                _scope_kind = SCOPE_TARGETED
+                            elif cli_scope_filter(_cmd_l):
+                                _scope_kind = SCOPE_SUBSET
+                            else:
+                                _scope_kind = SCOPE_UNKNOWN
+                            _polluted_reason = (
+                                "test files removed or rewritten" if _files_missing else
+                                "acceptance guard aborted the run" if _guard_broken else
+                                "pytest scope config changed" if _scope_drift else
+                                "command declared test exclusions" if _scope_declared else
+                                f"guard nonce verification failed: {_nonce_reason}"
+                                if _nonce_ok is False else "")
+                            # ── P0-3: 覆盖可证明性 ────────────────────
+                            # full 需要"完整范围 + 环境身份可证"；否则降级为
+                            # unknown（仍可 candidate），不能仅凭全绿判 completed。
+                            _dynamic_risk = (_is_pytest_cmd and not _full_scope_cmd
+                                             and _dynamic_import_risk(context))
+                            if _scope_complete and _env_fp:
+                                _coverage = COVERAGE_FULL
+                                _unverified = ""
+                            elif _scope_complete:
+                                _coverage = COVERAGE_UNKNOWN
+                                _unverified = "test environment identity"
+                            elif _dynamic_risk:
+                                _coverage = COVERAGE_UNKNOWN
+                                _unverified = "tests affected by dynamic imports"
+                            else:
+                                _coverage = COVERAGE_PARTIAL
+                                _unverified = "full suite"
+                            _record_test_evidence(
+                                context,
+                                command=str((result.metadata or {}).get(
+                                    "effective_command")
+                                    or tc.params.get("command", "")),
+                                scope=_scope_kind,
+                                coverage=_coverage,
+                                evidence_status=(EVIDENCE_POLLUTED
+                                                 if _polluted_reason
+                                                 else EVIDENCE_VALID),
+                                exit_code=exit_code,
+                                totals=_totals,
+                                failed_ids=(_test_ids
+                                            if isinstance(_test_ids, list) else []),
+                                comparison=_comparison,
+                                test_files_unchanged=not _files_missing,
+                                config_unchanged=not _scope_drift,
+                                no_scope_narrowing=not _scope_declared,
+                                unverified_scope=_unverified,
+                                invalid_reason=_polluted_reason,
+                                regression_detected=(_verdict == "regression"),
+                                nonce=_test_nonce or "",
+                                nonce_verified=_nonce_ok,
+                                environment_fingerprint=_env_fp,
+                            )
                         if _full_scope_cmd and not _no_verdict:
                             # A completed broad run resolves the *scope* question
                             # even when it reports failures. Keep failure evidence,
@@ -2766,6 +3323,21 @@ class SWEAgent(Agent):
                                         "python -m pytest -q"
                                     )
                                 )
+                        elif _nonce_ok is False:
+                            logger.warning(
+                                "Test evidence nonce verification failed (%s): %s",
+                                context.agent_id, _nonce_reason,
+                            )
+                            _stats(context, test_guard_triggered=1)
+                            context.metadata["required_next_action"] = "rerun_test_for_nonce"
+                            cm.add_message("user",
+                                "[EVIDENCE_NONCE] 本次测试输出没有通过 nonce 核验："
+                                f"{_nonce_reason}。\n"
+                                "这可能表示复用了旧输出、守卫未加载或输出被改写。"
+                                "本次运行不构成通过证据，也不构成失败证据。\n"
+                                "下一步：不要复用/拼接旧日志，直接重新运行同一条测试命令"
+                                "（用 shell_exec 原样执行），让 Runtime 重新发放并核验 nonce。"
+                            )
                         # 修改后首次运行的任意测试范围若没有同范围可信基线，
                         # 失败不能直接归因于本次编辑；仍保留失败和完成阻断。
                         _unbaselined_post_edit_failure = bool(
@@ -3181,6 +3753,31 @@ class SWEAgent(Agent):
                 )
             _green_once = context.metadata.get("test_success_count", 0) >= 1
             if completion and (completion.should_complete() or _green_once):
+                # ── P0-2: 进入完成前复核 nonce + 独立进程回放 ──────────
+                _evidence_ok, _evidence_why = _completion_evidence_trusted(context)
+                if not _evidence_ok:
+                    _blocks = context.metadata.get("completion_block_count", 0) + 1
+                    context.metadata["completion_block_count"] = _blocks
+                    if _blocks > MAX_COMPLETION_BLOCKS:
+                        _graph_enter(context, Node.FAILED,
+                                     "evidence_verification_blocked")
+                        return AgentAction.fail(
+                            error=(f"Test evidence failed nonce/replay verification "
+                                   f"{_blocks - 1}x without progress: {_evidence_why}"))
+                    logger.warning(
+                        "Completion blocked: evidence not verified (%s): %s",
+                        context.agent_id, _evidence_why,
+                    )
+                    cm.add_message("user",
+                        "[EvidenceGuard] 测试全绿结果没有通过 nonce/回放/覆盖核验，"
+                        f"不能判定完成：{_evidence_why}\n"
+                        "不要复用旧输出或拼接日志。请重新运行同一条测试命令，"
+                        "让 Runtime 用新 nonce 重新执行，并在独立进程中复核"
+                        "测试结果、工作区与测试环境。"
+                    )
+                    context.metadata["messages"] = cm.get_context()
+                    return AgentAction.cont(
+                        output=f"Evidence verification failed: {_evidence_why}")
                 context.metadata["tests_passed"] = True
                 context.metadata["messages"] = cm.get_context()
                 logger.info(
@@ -3198,6 +3795,7 @@ class SWEAgent(Agent):
                     except Exception:
                         pass
                 _graph_enter(context, Node.DONE, "post_tool_complete")
+                _shadow_terminal(context, "completed", "post_tool_complete")
                 return AgentAction.complete(
                     output=f"Tests passed. Task completed in {context.step_count} step(s)."
                 )
@@ -3465,12 +4063,20 @@ class SWEAgent(Agent):
             if any(_acceptance_violation(context)) or _pytest_scope_drift(context):
                 blockers.append("test files or test scope changed")
             if not blockers:
+                # ── P0-2: 候选同样需要 nonce + 回放复核 ─────────────
+                _evidence_ok, _evidence_why = _candidate_evidence_trusted(context)
+                if not _evidence_ok:
+                    blockers.append(
+                        f"test evidence failed nonce/replay verification: {_evidence_why}")
+            if not blockers:
                 context.metadata["candidate_submitted"] = True
                 context.metadata["candidate_verification"] = "incomplete"
                 context.metadata["messages"] = cm.get_context()
                 _graph_enter(context, Node.DONE, "candidate_submitted")
+                _shadow_terminal(context, "candidate", "candidate_submit")
                 return AgentAction.candidate(
                     output="Candidate patch submitted; full verification remains incomplete.")
+            _shadow_terminal(context, "continue", "candidate_blocked")
             blocks = context.metadata.get("completion_block_count", 0) + 1
             context.metadata["completion_block_count"] = blocks
             if blocks > MAX_COMPLETION_BLOCKS:
@@ -3635,9 +4241,14 @@ class SWEAgent(Agent):
         # 与 CR-1 同理：_no_verdict 已让偏离期内的测试结果不产生证据，这里再补上
         # 纯文本路径（未声明项目根的 run 会走"零修改 + 本 run 证据"的放行分支）。
         _scope_drift = _pytest_scope_drift(context)
+        # ── P0-3: 纯文本完成路径同样必须过 nonce/回放/覆盖复核 ──
+        # 否则"工具步里被拦下 → 下一步只回文本"就能绕过证据门禁。
+        _evidence_ok, _evidence_why = _completion_evidence_trusted(context)
+        _needs_evidence = not _evidence_ok
 
         _graph_enter(context, Node.COMPLETION_GATE, "text_only")
-        if _needs_retest or _needs_change or _files_missing or _scope_drift:
+        if (_needs_retest or _needs_change or _files_missing or _scope_drift
+                or _needs_evidence):
             _blocks = context.metadata.get("completion_block_count", 0) + 1
             context.metadata["completion_block_count"] = _blocks
             if _blocks > MAX_COMPLETION_BLOCKS:
@@ -3670,6 +4281,16 @@ class SWEAgent(Agent):
                     "(%s): %s", context.agent_id, ", ".join(_scope_drift),
                 )
                 cm.add_message("user", _scope_config_msg(_scope_drift))
+            elif _needs_evidence:
+                logger.warning(
+                    "Completion blocked: evidence verification failed (%s): %s",
+                    context.agent_id, _evidence_why,
+                )
+                cm.add_message("user",
+                    "[EvidenceGuard] 测试证据没有通过 nonce/回放/覆盖复核，"
+                    f"不能判定完成：{_evidence_why}\n"
+                    "请重新运行同一条测试命令；不要复用旧输出，也不要只回文本结束。"
+                )
             elif _needs_retest and context.metadata.get("ever_modified"):
                 logger.warning(
                     "Completion blocked: tests failed earlier but no full-scope green "
@@ -3723,7 +4344,9 @@ class SWEAgent(Agent):
                 except Exception:
                     pass
             return AgentAction.cont(
-                output=("Modified but not re-tested; forcing pytest re-run"
+                output=("Evidence verification failed; forcing test re-run"
+                        if _needs_evidence else
+                        "Modified but not re-tested; forcing pytest re-run"
                         if (_needs_retest and context.metadata.get("ever_modified")) else
                         "No code change yet; completion blocked until source is modified")
             )
@@ -3862,6 +4485,20 @@ class SWEAgent(Agent):
         else:
             status = AgentState.COMPLETED
 
+        # ── M1/P0-1: 证据账本影子判定 —— 只记录新旧差异，不改变 status ──
+        # 预算耗尽 / 显式不可恢复失败是账本能独立确认的两种终态语义。
+        ledger = _ledger(context)
+        if status == AgentState.TIMEOUT:
+            ledger.mark_budget_exhausted()
+        elif status == AgentState.FAILED:
+            # Runtime 的 FAILED 分支都是"无法继续"的权威判定：计划耗尽、工具全败、
+            # 验证失败、显式 fail。账本必须映射为同一终态，否则影子会把失败误读成
+            # continue，掩盖真实差异。
+            ledger.mark_fatal(str(error or context.metadata.get("step_failed")
+                                  or "agent entered FAILED state"))
+        _shadow_terminal(context, status.value, "finalize")
+        decision = decide_terminal(ledger)
+
         result = AgentResult(
             agent_id=self.agent_id,
             status=status,
@@ -3889,6 +4526,10 @@ class SWEAgent(Agent):
                 # Graph Runtime：显式化的转移轨迹（观察层，不影响判定）
                 "graph_trace": context.metadata.get("graph_trace", []),
                 "graph_violations": context.metadata.get("graph_violations", []),
+                # M1/P0-1：证据账本与影子判定差异（审计用，不参与终态）
+                "evidence_decision": decision.to_dict(),
+                "evidence_shadow": context.metadata.get("evidence_shadow", []),
+                "evidence_ledger": ledger.summary(),
             },
         )
         logger.info(

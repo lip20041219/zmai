@@ -134,14 +134,21 @@ class TestT1GreenWithoutModificationCompletes:
         assert r.ctx.metadata.get("test_success_count", 0) == 0
         assert r.ctx.metadata["completion"].tests_complete is False
 
-    def test_counterfactual_prefix_green_count_would_complete(self, tmp_path: Path):
+    def test_counterfactual_prefix_green_count_would_complete(self, tmp_path: Path,
+                                                              monkeypatch):
         """反事实：pre-fix 的 state 生产者一回来，攻击立刻成立。
 
         N-2 删掉的那一行是"子集全绿（`_baseline is None` + 零修改）→
         `test_success_count += 1`"。本用例先跑真实攻击确认计数没有被累加（修复生效），
         再手工写入那一行本会写出的值（`test_success_count = 1`）—— 完成门禁随即放行。
         证明攻击面正是这条 state，堵住它不需要新增状态机。
+
+        P0-2/P0-3 又加了证据复核；要让反事实只检验"计数被加一"的旧漏洞，必须
+        把新层关掉，否则新层会先把攻击拦下，反事实不再说明旧门禁的问题。
         """
+        monkeypatch.setattr(
+            "zmai.swe.agent._completion_evidence_trusted",
+            lambda context: (True, ""))
         _write_clean_project(tmp_path)
         backend = _ScriptedBackend([[_SUBSET], TEXT])
         ctx = AgentContext(
