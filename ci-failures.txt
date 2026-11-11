@@ -1,92 +1,97 @@
 === FAILED/ERROR ===
-FAILED test_extra.py::test_broken - assert 1 == 2
-ERROR    zmai.swe.agent:agent.py:1571 Backend call permanently failed (attempt 3/3): [DEGENERATE_RESPONSE] empty response (no content, no tool calls)
-FAILED test_all.py::test_b - assert 1 == 2
-FAILED test_v.py::test_v - assert 0 == 1
-FAILED test_v.py::test_v - assert 0 == 1
-ERROR    zmai.swe.agent:agent.py:1571 Backend call permanently failed (attempt 3/3): [DEGENERATE_RESPONSE] empty response (no content, no tool calls)
-FAILED tests/test_e2e_mock.py::TestSWEAgentMockConversation::test_agent_step_with_tool_execution - AssertionError: 预期 complete, 实际 continue
-FAILED tests/test_swe_pytest_addopts_guard.py::TestCounterfactualWithoutEnvAddoptsCheck::test_attack_completes_when_env_parsing_disabled - AssertionError: 关掉环境变量解析后该攻击必须仍然成功（否则本条对照无意义）: ['continue', 'continue', 'fail']
-FAILED tests/test_swe_regression_detect.py::test_git_status_is_not_a_modification - AssertionError: git status 应真正执行而非被拦截
-FAILED tests/test_swe_shell_modification.py::test_shell_change_then_retest_completes - AssertionError: shell 修复后重测全绿应 complete: ['continue', 'continue', 'continue', 'fail']
+FAILED tests/test_loop_guard.py::TestSWEAgentLoopGuardIntegration::test_no_loop_during_normal_operation - assert not True
+FAILED tests/test_runtime.py::TestTrajectoryPersistence::test_write_failure_does_not_fail_agent - AssertionError: 写入失败必须留下警告日志
+FAILED tests/test_swe_fix_driving.py::TestForceEditEntryDiscoveryAllowance::test_allowance_survives_boundary_reset_inside_force_edit - AssertionError: 工作区变动但调用失败 → 仍处于强制期（既有语义不得改变）
+FAILED tests/test_swe_fix_driving.py::TestPytestStatsClassification::test_real_pytest_command_counted - AssertionError: 两次真实 pytest 调用均应计入，pytest_calls=1
+FAILED tests/test_swe_fix_driving.py::TestFixDrivingStickyEscape::test_failing_pytest_rerun_cannot_escape_force_edit - AssertionError: force_edit 激活后重跑 pytest 必须真正执行（用于验证）
+FAILED tests/test_swe_fix_driving.py::TestRootCauseLatchLifecycle::test_parse_exception_does_not_burn_latch - AssertionError: 下一次失败必须重试解析，不得永久锁死
+FAILED tests/test_swe_regression_detect.py::test_force_edit_closes_loop_with_real_diff - AssertionError: 第 4 步 pytest 应真正执行
+FAILED tests/test_swe_workflow.py::TestWindowsPlatformPrompt::test_windows_prompt_includes_tail_alternative - AssertionError: assert 'tail' in '\n## current os: linux/mac\n\n- standard unix commands work (ls, cat, grep, pwd, etc.)\n- use forward slash / for paths\n- do not run interactive commands (they will hang)\n'
+FAILED tests/test_swe_workflow.py::TestWindowsPlatformPrompt::test_windows_prompt_warns_against_tail_head - AssertionError: assert ('Do NOT use `tail`' in '\n## Current OS: Linux/Mac\n\n- Standard Unix commands work (ls, cat, grep, pwd, etc.)\n- Use forward slash / for paths\n- Do NOT run interactive commands (they will hang)\n' or 'do not use tail' in '\n## current os: linux/mac\n\n- standard unix commands work (ls, cat, grep, pwd, etc.)\n- use forward slash / for paths\n- do not run interactive commands (they will hang)\n')
+FAILED tests/test_swe_workflow.py::TestWindowsPlatformPrompt::test_windows_prompt_warns_about_pipe_exit_code - AssertionError: assert 'exit code' in '\n## current os: linux/mac\n\n- standard unix commands work (ls, cat, grep, pwd, etc.)\n- use forward slash / for paths\n- do not run interactive commands (they will hang)\n'
+FAILED tests/test_swe_workflow.py::TestWindowsPlatformPrompt::test_windows_prompt_still_has_existing_mappings - AssertionError: assert 'dir' in '\n## Current OS: Linux/Mac\n\n- Standard Unix commands work (ls, cat, grep, pwd, etc.)\n- Use forward slash / for paths\n- Do NOT run interactive commands (they will hang)\n'
+ERROR tests/test_runtime.py::TestTrajectoryPersistence::test_visible_mid_run - AssertionError: 需要至少 2 步才能验证逐步落盘
+ERROR tests/test_runtime.py::TestTrajectoryPersistence::test_content_matches_real_request - AssertionError: 需要至少 2 步才能验证逐步落盘
+ERROR tests/test_runtime.py::TestTrajectoryPersistence::test_step_number_is_latest_completed - AssertionError: 需要至少 2 步才能验证逐步落盘
+ERROR tests/test_runtime.py::TestTrajectoryPersistence::test_atomic_write_leaves_parseable_file - AssertionError: 需要至少 2 步才能验证逐步落盘
 === tail ===
-E     
-E     - complete
-E     + fail
------------------------------ Captured stderr call -----------------------------
-[shell_exec]
-  Target:   python -m pytest -q
-  Workspace: .
-  Project:  /tmp/pytest-of-runner/pytest-0/test_shell_change_then_retest_0
-  Result:   FAIL (0.20s)
-  Reason:   [test summary] 0 passed, 1 failed, 0 errors
-exit 1: F                                                                        [100%]
-=================================== FAILURES ===================================
-____________________________________ test_v ____________________________________
-
-    def test_v():
->       assert bug.VALUE == 1
-E       assert 0 == 1
-E        +  where 0 = bug.VALUE
-
-test_v.py:5: AssertionError
-=========================== short test summary info ============================
-FAILED test_v.py::test_v - assert 0 == 1
- +  where 0 = bug.VALUE
-1 failed in 0.02s
-
-[shell_exec]
-  Target:   python setter.py 1
-  Workspace: .
-  Project:  /tmp/pytest-of-runner/pytest-0/test_shell_change_then_retest_0
-  Result:   SUCCESS (0.02s)
-  Output:   set VALUE = 1
-
-[shell_exec]
-  Target:   python -m pytest -q
-  Workspace: .
-  Project:  /tmp/pytest-of-runner/pytest-0/test_shell_change_then_retest_0
-  Result:   FAIL (0.20s)
-  Reason:   [test summary] 0 passed, 1 failed, 0 errors
-exit 1: F                                                                        [100%]
-=================================== FAILURES ===================================
-____________________________________ test_v ____________________________________
-
-    def test_v():
->       assert bug.VALUE == 1
-E       assert 0 == 1
-E        +  where 0 = bug.VALUE
-
-test_v.py:5: AssertionError
-=========================== short test summary info ============================
-FAILED test_v.py::test_v - assert 0 == 1
- +  where 0 = bug.VALUE
-1 failed in 0.02s
-
+    FAIL 0.13s
+    [test summary] 1 passed, 1 failed, 0 errors exit 1: [test output collapsed — same result as previous run] 1 passed, 1 failed, 0 errors Faili
 ------------------------------ Captured log call -------------------------------
-WARNING  zmai.swe.agent:agent.py:1557 [DegenerateResponse] attempt 1/3: empty response (no content, no tool calls) (sm)
-WARNING  zmai.swe.agent:agent.py:1557 [DegenerateResponse] attempt 2/3: empty response (no content, no tool calls) (sm)
-WARNING  zmai.swe.agent:agent.py:1557 [DegenerateResponse] attempt 3/3: empty response (no content, no tool calls) (sm)
-ERROR    zmai.swe.agent:agent.py:1571 Backend call permanently failed (attempt 3/3): [DEGENERATE_RESPONSE] empty response (no content, no tool calls)
+WARNING  zmai.swe.agent:agent.py:3282 FixDriving: test failed, 3 reads after failure without modification — forcing fix phase
+___ TestWindowsPlatformPrompt.test_windows_prompt_includes_tail_alternative ____
+tests/test_swe_workflow.py:121: in test_windows_prompt_includes_tail_alternative
+    assert "tail" in prompt.lower()
+E   AssertionError: assert 'tail' in '\n## current os: linux/mac\n\n- standard unix commands work (ls, cat, grep, pwd, etc.)\n- use forward slash / for paths\n- do not run interactive commands (they will hang)\n'
+E    +  where '\n## current os: linux/mac\n\n- standard unix commands work (ls, cat, grep, pwd, etc.)\n- use forward slash / for paths\n- do not run interactive commands (they will hang)\n' = <built-in method lower of str object at 0x76c662d54ab0>()
+E    +    where <built-in method lower of str object at 0x76c662d54ab0> = '\n## Current OS: Linux/Mac\n\n- Standard Unix commands work (ls, cat, grep, pwd, etc.)\n- Use forward slash / for paths\n- Do NOT run interactive commands (they will hang)\n'.lower
+____ TestWindowsPlatformPrompt.test_windows_prompt_warns_against_tail_head _____
+tests/test_swe_workflow.py:128: in test_windows_prompt_warns_against_tail_head
+    assert "Do NOT use `tail`" in prompt or "do not use tail" in prompt.lower()
+E   AssertionError: assert ('Do NOT use `tail`' in '\n## Current OS: Linux/Mac\n\n- Standard Unix commands work (ls, cat, grep, pwd, etc.)\n- Use forward slash / for paths\n- Do NOT run interactive commands (they will hang)\n' or 'do not use tail' in '\n## current os: linux/mac\n\n- standard unix commands work (ls, cat, grep, pwd, etc.)\n- use forward slash / for paths\n- do not run interactive commands (they will hang)\n')
+E    +  where '\n## current os: linux/mac\n\n- standard unix commands work (ls, cat, grep, pwd, etc.)\n- use forward slash / for paths\n- do not run interactive commands (they will hang)\n' = <built-in method lower of str object at 0x76c662d54ab0>()
+E    +    where <built-in method lower of str object at 0x76c662d54ab0> = '\n## Current OS: Linux/Mac\n\n- Standard Unix commands work (ls, cat, grep, pwd, etc.)\n- Use forward slash / for paths\n- Do NOT run interactive commands (they will hang)\n'.lower
+___ TestWindowsPlatformPrompt.test_windows_prompt_warns_about_pipe_exit_code ___
+tests/test_swe_workflow.py:134: in test_windows_prompt_warns_about_pipe_exit_code
+    assert "exit code" in prompt.lower()
+E   AssertionError: assert 'exit code' in '\n## current os: linux/mac\n\n- standard unix commands work (ls, cat, grep, pwd, etc.)\n- use forward slash / for paths\n- do not run interactive commands (they will hang)\n'
+E    +  where '\n## current os: linux/mac\n\n- standard unix commands work (ls, cat, grep, pwd, etc.)\n- use forward slash / for paths\n- do not run interactive commands (they will hang)\n' = <built-in method lower of str object at 0x76c662d54ab0>()
+E    +    where <built-in method lower of str object at 0x76c662d54ab0> = '\n## Current OS: Linux/Mac\n\n- Standard Unix commands work (ls, cat, grep, pwd, etc.)\n- Use forward slash / for paths\n- Do NOT run interactive commands (they will hang)\n'.lower
+__ TestWindowsPlatformPrompt.test_windows_prompt_still_has_existing_mappings ___
+tests/test_swe_workflow.py:143: in test_windows_prompt_still_has_existing_mappings
+    assert "dir" in prompt
+E   AssertionError: assert 'dir' in '\n## Current OS: Linux/Mac\n\n- Standard Unix commands work (ls, cat, grep, pwd, etc.)\n- Use forward slash / for paths\n- Do NOT run interactive commands (they will hang)\n'
+=============================== warnings summary ===============================
+src/zmai/swe/agent.py:1240
+  /home/runner/work/zmai/zmai/src/zmai/swe/agent.py:1240: DeprecationWarning: invalid escape sequence '\p'
+    _BASE_SYSTEM_PROMPT = """You are a Software Engineering Agent (SWE Agent). Your job doesn't end when code is written — you must deliver results the user can see.
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
 =========================== short test summary info ============================
-FAILED tests/test_e2e_mock.py::TestSWEAgentMockConversation::test_agent_step_with_tool_execution - AssertionError: 预期 complete, 实际 continue
-assert 'continue' == 'complete'
-  
-  - complete
-  + continue
-FAILED tests/test_swe_pytest_addopts_guard.py::TestCounterfactualWithoutEnvAddoptsCheck::test_attack_completes_when_env_parsing_disabled - AssertionError: 关掉环境变量解析后该攻击必须仍然成功（否则本条对照无意义）: ['continue', 'continue', 'fail']
-assert 'fail' == 'complete'
-  
-  - complete
-  + fail
-FAILED tests/test_swe_regression_detect.py::test_git_status_is_not_a_modification - AssertionError: git status 应真正执行而非被拦截
-assert 2 == 1
- +  where 2 = <built-in method get of dict object at 0x7f35cd5b1fc0>('tool_calls_fail', 0)
- +    where <built-in method get of dict object at 0x7f35cd5b1fc0> = {'cm': <zmai.context.manager.ContextManager object at 0x7f35cd5b3050>, 'project_root_declared': True, 'repo_info': Rep... (根目录)/\n    bug.py\n    helper.py\n    test_all.py\n\n### 测试文件 (1)\n  - test_all.py'), 'test_discovery': 'known', ...}.get
- +      where {'cm': <zmai.context.manager.ContextManager object at 0x7f35cd5b3050>, 'project_root_declared': True, 'repo_info': Rep... (根目录)/\n    bug.py\n    helper.py\n    test_all.py\n\n### 测试文件 (1)\n  - test_all.py'), 'test_discovery': 'known', ...} = AgentContext(agent_id='reg', task='修复 bug 使全部测试通过', config={'project_path': '/tmp/pytest-of-runner/pytest-0/test_git_s... repository (or any of the parent directories): .git\n', 'metadata': {'exit_code': 128, 'tool': 'git'}}]}, memory=None).metadata
-FAILED tests/test_swe_shell_modification.py::test_shell_change_then_retest_completes - AssertionError: shell 修复后重测全绿应 complete: ['continue', 'continue', 'continue', 'fail']
-assert 'fail' == 'complete'
-  
-  - complete
-  + fail
-4 failed, 1733 passed, 16 skipped in 373.32s (0:06:13)
+FAILED tests/test_loop_guard.py::TestSWEAgentLoopGuardIntegration::test_no_loop_during_normal_operation - assert not True
+ +  where True = <zmai.swe.loop_guard.LoopGuard object at 0x76c661fd9990>.is_stuck
+FAILED tests/test_runtime.py::TestTrajectoryPersistence::test_write_failure_does_not_fail_agent - AssertionError: 写入失败必须留下警告日志
+assert False
+ +  where False = any(<generator object TestTrajectoryPersistence.test_write_failure_does_not_fail_agent.<locals>.<genexpr> at 0x76c660a4a5a0>)
+FAILED tests/test_swe_fix_driving.py::TestForceEditEntryDiscoveryAllowance::test_allowance_survives_boundary_reset_inside_force_edit - AssertionError: 工作区变动但调用失败 → 仍处于强制期（既有语义不得改变）
+assert None is True
+ +  where None = <built-in method get of dict object at 0x76c66088a940>('force_edit')
+ +    where <built-in method get of dict object at 0x76c66088a940> = {'cm': <zmai.context.manager.ContextManager object at 0x76c66088bdd0>, 'project_root_declared': True, 'repo_info': Rep...\n    module_b.py\n    test_app.py\n\n### 测试文件 (2)\n  - conftest.py\n  - test_app.py'), 'test_discovery': 'known', ...}.get
+ +      where {'cm': <zmai.context.manager.ContextManager object at 0x76c66088bdd0>, 'project_root_declared': True, 'repo_info': Rep...\n    module_b.py\n    test_app.py\n\n### 测试文件 (2)\n  - conftest.py\n  - test_app.py'), 'test_discovery': 'known', ...} = AgentContext(agent_id='fix_drive_test', task='项目在 /tmp/pytest-of-runner/pytest-0/test_allowance_survives_bounda0/d1_bo...rue, target='', evidence='No uncommitted changes', error=None)], summary='1/3 checks passed', errors=[])}, memory=None).metadata
+FAILED tests/test_swe_fix_driving.py::TestPytestStatsClassification::test_real_pytest_command_counted - AssertionError: 两次真实 pytest 调用均应计入，pytest_calls=1
+assert 1 == 2
+ +  where 1 = <built-in method get of dict object at 0x76c660883440>('pytest_calls', 0)
+ +    where <built-in method get of dict object at 0x76c660883440> = {'failure_parser_used': 1, 'total_calls': 2, 'pytest_calls': 1, 'unchanged_pytest_calls': 1}.get
+FAILED tests/test_swe_fix_driving.py::TestFixDrivingStickyEscape::test_failing_pytest_rerun_cannot_escape_force_edit - AssertionError: force_edit 激活后重跑 pytest 必须真正执行（用于验证）
+assert 2 == 3
+FAILED tests/test_swe_fix_driving.py::TestRootCauseLatchLifecycle::test_parse_exception_does_not_burn_latch - AssertionError: 下一次失败必须重试解析，不得永久锁死
+assert 1 >= 2
+FAILED tests/test_swe_regression_detect.py::test_force_edit_closes_loop_with_real_diff - AssertionError: 第 4 步 pytest 应真正执行
+assert 2 == 3
+FAILED tests/test_swe_workflow.py::TestWindowsPlatformPrompt::test_windows_prompt_includes_tail_alternative - AssertionError: assert 'tail' in '\n## current os: linux/mac\n\n- standard unix commands work (ls, cat, grep, pwd, etc.)\n- use forward slash / for paths\n- do not run interactive commands (they will hang)\n'
+ +  where '\n## current os: linux/mac\n\n- standard unix commands work (ls, cat, grep, pwd, etc.)\n- use forward slash / for paths\n- do not run interactive commands (they will hang)\n' = <built-in method lower of str object at 0x76c662d54ab0>()
+ +    where <built-in method lower of str object at 0x76c662d54ab0> = '\n## Current OS: Linux/Mac\n\n- Standard Unix commands work (ls, cat, grep, pwd, etc.)\n- Use forward slash / for paths\n- Do NOT run interactive commands (they will hang)\n'.lower
+FAILED tests/test_swe_workflow.py::TestWindowsPlatformPrompt::test_windows_prompt_warns_against_tail_head - AssertionError: assert ('Do NOT use `tail`' in '\n## Current OS: Linux/Mac\n\n- Standard Unix commands work (ls, cat, grep, pwd, etc.)\n- Use forward slash / for paths\n- Do NOT run interactive commands (they will hang)\n' or 'do not use tail' in '\n## current os: linux/mac\n\n- standard unix commands work (ls, cat, grep, pwd, etc.)\n- use forward slash / for paths\n- do not run interactive commands (they will hang)\n')
+ +  where '\n## current os: linux/mac\n\n- standard unix commands work (ls, cat, grep, pwd, etc.)\n- use forward slash / for paths\n- do not run interactive commands (they will hang)\n' = <built-in method lower of str object at 0x76c662d54ab0>()
+ +    where <built-in method lower of str object at 0x76c662d54ab0> = '\n## Current OS: Linux/Mac\n\n- Standard Unix commands work (ls, cat, grep, pwd, etc.)\n- Use forward slash / for paths\n- Do NOT run interactive commands (they will hang)\n'.lower
+FAILED tests/test_swe_workflow.py::TestWindowsPlatformPrompt::test_windows_prompt_warns_about_pipe_exit_code - AssertionError: assert 'exit code' in '\n## current os: linux/mac\n\n- standard unix commands work (ls, cat, grep, pwd, etc.)\n- use forward slash / for paths\n- do not run interactive commands (they will hang)\n'
+ +  where '\n## current os: linux/mac\n\n- standard unix commands work (ls, cat, grep, pwd, etc.)\n- use forward slash / for paths\n- do not run interactive commands (they will hang)\n' = <built-in method lower of str object at 0x76c662d54ab0>()
+ +    where <built-in method lower of str object at 0x76c662d54ab0> = '\n## Current OS: Linux/Mac\n\n- Standard Unix commands work (ls, cat, grep, pwd, etc.)\n- Use forward slash / for paths\n- Do NOT run interactive commands (they will hang)\n'.lower
+FAILED tests/test_swe_workflow.py::TestWindowsPlatformPrompt::test_windows_prompt_still_has_existing_mappings - AssertionError: assert 'dir' in '\n## Current OS: Linux/Mac\n\n- Standard Unix commands work (ls, cat, grep, pwd, etc.)\n- Use forward slash / for paths\n- Do NOT run interactive commands (they will hang)\n'
+ERROR tests/test_runtime.py::TestTrajectoryPersistence::test_visible_mid_run - AssertionError: 需要至少 2 步才能验证逐步落盘
+assert 0 >= 2
+ +  where 0 = <tests.test_runtime.TrajectoryProbeBackend object at 0x76c66240f990>.invoke_count
+ +  and   2 = <tests.test_runtime.TestTrajectoryPersistence object at 0x76c6628ade90>.STEPS
+ERROR tests/test_runtime.py::TestTrajectoryPersistence::test_content_matches_real_request - AssertionError: 需要至少 2 步才能验证逐步落盘
+assert 0 >= 2
+ +  where 0 = <tests.test_runtime.TrajectoryProbeBackend object at 0x76c660978190>.invoke_count
+ +  and   2 = <tests.test_runtime.TestTrajectoryPersistence object at 0x76c6628ae710>.STEPS
+ERROR tests/test_runtime.py::TestTrajectoryPersistence::test_step_number_is_latest_completed - AssertionError: 需要至少 2 步才能验证逐步落盘
+assert 0 >= 2
+ +  where 0 = <tests.test_runtime.TrajectoryProbeBackend object at 0x76c660956390>.invoke_count
+ +  and   2 = <tests.test_runtime.TestTrajectoryPersistence object at 0x76c6623faa90>.STEPS
+ERROR tests/test_runtime.py::TestTrajectoryPersistence::test_atomic_write_leaves_parseable_file - AssertionError: 需要至少 2 步才能验证逐步落盘
+assert 0 >= 2
+ +  where 0 = <tests.test_runtime.TrajectoryProbeBackend object at 0x76c66089abd0>.invoke_count
+ +  and   2 = <tests.test_runtime.TestTrajectoryPersistence object at 0x76c6623fb350>.STEPS
+11 failed, 1893 passed, 16 skipped, 1 warning, 4 errors in 385.02s (0:06:25)
