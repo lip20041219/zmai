@@ -1,3 +1,4 @@
+# ruff: noqa: E501, W605
 """SWE Agent — software engineering agent (delivery-oriented)."""
 
 from __future__ import annotations
@@ -1747,7 +1748,7 @@ Do NOT skip phases. Do NOT reorder phases.
 5. Do not repeatedly ls/dir without purpose
 6. A "Requirements:" / numbered-list section in the user's task is a set of CONSTRAINTS, NOT separate tasks. Lines like "run tests" or "stop after success" tell you HOW to work on your single objective — never spin them into independent sub-tasks, and never keep working after your objective is met.
 7. NEVER run a bare `pytest`. Always run tests via `python -m pytest` (or `.venv/Scripts/python -m pytest` on Windows).
-8. AFTER A TEST FAILURE — inspect the failing test, assertion and traceback. Decide whether it is related to the issue or your change. If it is unrelated, environmental, or has no trustworthy pre-edit baseline, do not change unrelated business code to make it green.
+8. AFTER A TEST FAILURE — inspect the failing test, assertion, actual value, expected value and traceback. Decide whether it is related to the issue or your change. If it is unrelated, environmental, or has no trustworthy pre-edit baseline, do not change unrelated business code to make it green.
 9. READ-TO-FIX LIMIT — use a few focused reads to understand the relevant call chain and existing behavior before editing. If evidence is still insufficient, state what is missing; do not guess a patch merely to satisfy a read limit.
 10. NEVER loop: test-fail → read → test-fail → read with no modification. Each pass must move toward an edit. If your read is not advancing you toward a concrete fix, make the fix. Do NOT re-run the same test command unless you have (a) modified code, (b) observed a change in test results, or (c) obtained new diagnostic evidence that the previous run did not provide. Re-running tests with no code change and no new evidence wastes time and tokens.
 11. FIX-DRIVEN TOOL CADENCE — use the observed failure to select focused reads, make a justified minimal edit, and rerun that test. Do not repeat a test with unchanged code and no new diagnostic purpose.

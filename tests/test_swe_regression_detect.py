@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+
 # 防止 pytest 子进程使用 stale __pycache__ 字节码：编辑 bug.py 后，
 # 若源文件 mtime 与 .pyc 头部记录一致，Python 会跳过重编译，导致
 # 第二次 pytest 读到修改前的 VALUE。本测试文件所有集成用例均依赖
@@ -30,8 +31,8 @@ import pytest
 def _disable_bytecode(monkeypatch):
     monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
 
-from zmai.agent import AgentContext
-from zmai.gateway.base import (
+from zmai.agent import AgentContext  # noqa: E402
+from zmai.gateway.base import (  # noqa: E402
     Backend,
     BackendCapability,
     BackendEvent,
@@ -39,14 +40,14 @@ from zmai.gateway.base import (
     BackendResponse,
     TokenUsage,
 )
-from zmai.swe.agent import (
+from zmai.swe.agent import (  # noqa: E402
     MAX_COMPLETION_BLOCKS,
     MAX_FORCE_EDIT_STEPS,
     MAX_REGRESSION_RECOVERIES,
     SWEAgent,
 )
-from zmai.swe.verifier import classify_test_progress, parse_test_totals
-from zmai.tool import ToolCall, ToolRegistry
+from zmai.swe.verifier import classify_test_progress, parse_test_totals  # noqa: E402
+from zmai.tool import ToolCall, ToolRegistry  # noqa: E402
 
 
 def _t(passed: int, failed: int, *, errors: int = 0, skipped: int = 0) -> dict:

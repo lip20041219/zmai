@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """SWE tools — read, write, edit, grep, shell, git, open, show."""
 
 from __future__ import annotations
@@ -7,9 +8,9 @@ import hashlib
 import logging
 import os
 import re
-import signal
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -51,23 +52,23 @@ def _emit_tool_result(tool_name: str, context: ToolContext,
 
     tty = sys.stderr.isatty()
     if tty:
-        BLUE, ICE, DIM, RESET = "\033[94m", "\033[96m", "\033[2m", "\033[0m"
-        FAIL = "\033[97;44m"
+        blue, ice, dim, reset = "\033[94m", "\033[96m", "\033[2m", "\033[0m"
+        fail = "\033[97;44m"
     else:
-        BLUE = ICE = DIM = FAIL = RESET = ""
+        blue = ice = dim = fail = reset = ""
 
     tag = " ok " if result.success else "FAIL"
-    tag_color = ICE if result.success else FAIL
+    tag_color = ice if result.success else fail
     lines = [
-        f"{BLUE}  >{RESET} {ICE}{tool_name}{RESET} {DIM}{target}{RESET}",
-        f"    {tag_color}{tag}{RESET} {DIM}{elapsed:.2f}s{RESET}",
+        f"{blue}  >{reset} {ice}{tool_name}{reset} {dim}{target}{reset}",
+        f"    {tag_color}{tag}{reset} {dim}{elapsed:.2f}s{reset}",
     ]
     if result.error:
         reason = str(result.error).replace("\r", " ").replace("\n", " ")[:140]
-        lines.append(f"    {DIM}{reason}{RESET}")
+        lines.append(f"    {dim}{reason}{reset}")
     if result.output and len(result.output) < 200:
         out = str(result.output).replace("\r", " ").replace("\n", " ")[:140]
-        lines.append(f"    {DIM}{out}{RESET}")
+        lines.append(f"    {dim}{out}{reset}")
     sys.stderr.write("\n".join(lines) + "\n")
     sys.stderr.flush()
 
