@@ -1470,11 +1470,7 @@ def _log_stop() -> None:
 
 
 def _graph_enter(context: AgentContext, node: Node, reason: str = "") -> None:
-    """Graph Runtime 接入点：只记录控制流**实际到达**的节点。
-
-    纯观察层 —— 不做任何判定、不改变任何分支、不写除 graph_trace /
-    graph_violations 之外的 metadata。默认 enforce=False，非法转移只记录。
-    """
+    """Graph Runtime 接入点：只记录控制流实际到达的节点。"""
     graph: GraphRuntime | None = context.metadata.get("graph")
     if graph is None:
         graph = GraphRuntime(SWEState(context.metadata))
@@ -1513,6 +1509,15 @@ def _shadow_terminal(context: AgentContext, old_kind: str, point: str) -> None:
     """记录一次新旧判定对比。只写审计数据，不改变任何控制流。"""
     ledger = _ledger(context)
     if old_kind in ("completed", "candidate"):
+        verification = context.metadata.get("verification")
+        checks = getattr(verification, "checks", ()) if verification else ()
+        ledger.record_terminal(
+            old_kind, source=point, step=context.step_count,
+            verification_checks=len(checks),
+            verification_passed=bool(verification and verification.passed
+                                      and checks),
+        )
+    if old_kind in ("completed", "candidate"):
         # 进入可信终态前复核；已完成过的回放直接复用（每记录最多一次）。
         _replay_for_terminal(context, old_kind)
     decision = decide_terminal(ledger)
@@ -1545,6 +1550,7 @@ def _record_test_evidence(
     nonce: str = "",
     nonce_verified: bool | None = None,
     environment_fingerprint: str = "",
+    duration_ms: int = 0,
 ) -> EvidenceRecord:
     """把一次真实测试运行写入账本（与旧 metadata 双写）。"""
     status = comparison.get("status")
@@ -1581,6 +1587,7 @@ def _record_test_evidence(
         invalid_reason=invalid_reason,
         regression_detected=regression_detected,
         nonce=nonce,
+        duration_ms=max(0, int(duration_ms or 0)),
     )
     return _ledger(context).record(record)
 
@@ -2115,6 +2122,12 @@ class SWEAgent(Agent):
             context.metadata["test_discovery"] = (
                 "known" if context.metadata.get("repo_info") is not None else "unknown"
             )
+        if (context.metadata.get("test_discovery") == "known"
+                and not getattr(context.metadata.get("repo_info"), "test_files", None)):
+            _ledger(context).no_tests_confirmed = True
+        _ledger(context).objective_verification_required = bool(
+            _ledger(context).no_tests_confirmed
+        )
 
         # ── 工作区指纹基线（P1-3）────────────────────────────────
         # 必须在任何工具执行**之前**取基线，否则第一次工具调用造成的修改会被
@@ -2568,6 +2581,10 @@ class SWEAgent(Agent):
                     # ContextManager（完整 / 被截断 / 不在窗口）。工具只拿探针，
                     # 不持有 cm 引用。
                     read_state=cm.read_state,
+                    evidence_ledger=context.metadata.get("evidence_ledger"),
+                    candidate_evidence_available=bool(
+                        context.metadata.get("candidate_test_evidence")
+                    ),
                     # CR-4: 测试命令的子进程环境（守卫注入）。非测试命令不使用。
                     env=_acceptance_guard_env(context, _test_nonce),
                 )
@@ -3066,7 +3083,13 @@ class SWEAgent(Agent):
                         # baseline 被锁成子集规模后，同一子集再跑绿即满足
                         # `_total_tests >= _baseline`，于是"只验证了子集"被当成
                         # "完整套件全绿"，携带未验证范围判定完成（fail-open）。
-                        _full_scope_cmd = _is_full_scope_test_command(_cmd_l)
+                        # Keep the baseline path independently fail-closed when the
+                        # broader CLI scope classifier is unavailable: explicit
+                        # exclusions can never establish the suite denominator.
+                        _full_scope_cmd = (
+                            _is_full_scope_test_command(_cmd_l)
+                            and not cli_scope_names_exclusions(_cmd_l)
+                        )
                         if _totals["passed"] + _totals["failed"] > 0:
                             context.metadata["last_test_full_scope"] = _full_scope_cmd
                         if (_full_scope_cmd and _baseline_safe and not passed
@@ -3244,6 +3267,7 @@ class SWEAgent(Agent):
                                 nonce=_test_nonce or "",
                                 nonce_verified=_nonce_ok,
                                 environment_fingerprint=_env_fp,
+                                duration_ms=result.duration_ms,
                             )
                         if _full_scope_cmd and not _no_verdict:
                             # A completed broad run resolves the *scope* question
@@ -4045,6 +4069,10 @@ class SWEAgent(Agent):
                     "Max replan attempts (%d) exceeded, Plan partially complete: %d/%d",
                     MAX_REPLANS, plan.completed_steps, len(plan.steps),
                 )
+                return AgentAction.fail(
+                    f"Plan not fully executed after {MAX_REPLANS} replans "
+                    f"({plan.completed_steps}/{len(plan.steps)} steps completed)"
+                )
 
         # Context compaction
         cm.compact()
@@ -4091,6 +4119,12 @@ class SWEAgent(Agent):
         vresult = self._auto_verify(context)
         if vresult is not None:
             context.metadata["verification"] = vresult
+            _ledger(context).record_objective_checks([
+                {"name": check.name, "strategy": check.strategy,
+                 "passed": check.passed, "target": check.target,
+                 "evidence": check.evidence}
+                for check in vresult.checks
+            ])
             # ── ExecutionLog: verification ─────────────────
             _l = context.metadata.get("__log__")
             if _l:
@@ -4245,10 +4279,16 @@ class SWEAgent(Agent):
         # 否则"工具步里被拦下 → 下一步只回文本"就能绕过证据门禁。
         _evidence_ok, _evidence_why = _completion_evidence_trusted(context)
         _needs_evidence = not _evidence_ok
+        _no_test_objective_missing = bool(
+            _ledger(context).objective_verification_required
+            and not (context.metadata.get("verification")
+                     and context.metadata["verification"].passed
+                     and context.metadata["verification"].checks)
+        )
 
         _graph_enter(context, Node.COMPLETION_GATE, "text_only")
         if (_needs_retest or _needs_change or _files_missing or _scope_drift
-                or _needs_evidence):
+                or _needs_evidence or _no_test_objective_missing):
             _blocks = context.metadata.get("completion_block_count", 0) + 1
             context.metadata["completion_block_count"] = _blocks
             if _blocks > MAX_COMPLETION_BLOCKS:
@@ -4290,6 +4330,17 @@ class SWEAgent(Agent):
                     "[EvidenceGuard] 测试证据没有通过 nonce/回放/覆盖复核，"
                     f"不能判定完成：{_evidence_why}\n"
                     "请重新运行同一条测试命令；不要复用旧输出，也不要只回文本结束。"
+                )
+            elif _no_test_objective_missing:
+                logger.warning(
+                    "Completion blocked: no objective verification for confirmed "
+                    "no-test project (%s, step %d)", context.agent_id,
+                    context.step_count,
+                )
+                cm.add_message("user",
+                    "[VerificationGuard] 当前运行没有 pytest 完整通过作为完成依据，"
+                    "且没有任何通过的客观验证检查。模型自述不能作为完成依据；"
+                    "请使用现有工具产生可验证的文件、命令或 Git 检查结果后再结束。"
                 )
             elif _needs_retest and context.metadata.get("ever_modified"):
                 logger.warning(
@@ -4346,6 +4397,8 @@ class SWEAgent(Agent):
             return AgentAction.cont(
                 output=("Evidence verification failed; forcing test re-run"
                         if _needs_evidence else
+                        "No objective verification evidence; completion blocked"
+                        if _no_test_objective_missing else
                         "Modified but not re-tested; forcing pytest re-run"
                         if (_needs_retest and context.metadata.get("ever_modified")) else
                         "No code change yet; completion blocked until source is modified")
@@ -4408,96 +4461,11 @@ class SWEAgent(Agent):
         return result
 
     async def finalize(self, context: AgentContext) -> AgentResult:
-        """Finalize agent execution.
-
-        Determines actual status by priority (highest first):
-          1. timed_out → TIMEOUT (max_steps exhausted)
-          2. step_failed → FAILED (step() returned fail with error)
-          3. candidate_submitted → CANDIDATE (independent acceptance pending)
-          4. replan exhausted + Plan incomplete → FAILED
-          5. All tools failed → FAILED
-          6. Verification failed → FAILED
-          7. Everything else → COMPLETED
-        """
-        timed_out = context.metadata.get("timed_out", False)
+        """Build the SWE result payload; Runtime owns the terminal decision."""
         step_failed = context.metadata.get("step_failed", False)
-        tool_ok = context.metadata.get("tool_calls_ok", 0)
-        tool_fail = context.metadata.get("tool_calls_fail", 0)
-        replan_count = context.metadata.get("replan_count", 0)
-        plan = context.metadata.get("execution_plan")
-
-        error: str | None = None
-
-        if timed_out:
-            status = AgentState.TIMEOUT
-            logger.info(
-                "SWEAgent timeout: %s (%d steps)",
-                context.agent_id, context.step_count,
-            )
-        elif step_failed:
-            status = AgentState.FAILED
-            error = str(step_failed) if step_failed is not True else None
-            logger.info(
-                "SWEAgent step failed: %s (%s)",
-                context.agent_id, error or "unknown error",
-            )
-        elif context.metadata.get("candidate_submitted"):
-            status = AgentState.CANDIDATE
-        elif replan_count >= MAX_REPLANS and plan and not plan.is_finished:
-            status = AgentState.FAILED
-            logger.info(
-                "SWEAgent Plan incomplete with replan exhausted: %s (%d/%d steps, %d replans)",
-                context.agent_id, plan.completed_steps, len(plan.steps), replan_count,
-            )
-        # 测试曾全绿通过是"目标已达成"的决定性信号。
-        # 修复过程中必然会出现多次失败 pytest（tool_fail 累积），
-        # 若最终测试已通过，不得再被 tool_fail 比例误判为 FAILED。
-        elif (
-            not (
-                context.metadata.get("tests_passed", False)
-                or context.metadata.get("test_success_count", 0) >= 1
-            )
-            and tool_fail > 0
-            and (tool_ok == 0 or tool_fail >= tool_ok)
-        ):
-            status = AgentState.FAILED
-            logger.info(
-                "SWEAgent tool calls failed: %s (%d steps, %d/%d tool calls failed)",
-                context.agent_id, context.step_count, tool_fail, tool_fail + tool_ok,
-            )
-        elif (
-            not (
-                context.metadata.get("tests_passed", False)
-                or context.metadata.get("test_success_count", 0) >= 1
-            )
-            and (vresult := context.metadata.get("verification")) is not None
-            and not vresult.passed
-        ):
-            # Check verification — failed verification must not result in COMPLETED.
-            # 但"测试曾全绿通过"是目标已达成的决定性信号（同上 tool_fail 分支）：
-            # 修复过程中 mid-run 的 auto_verify 可能留下一次过期的 failed 结果，
-            # 不得用它覆盖一次合法的全绿完成。
-            status = AgentState.FAILED
-            logger.info(
-                "SWEAgent verification failed: %s (%s)",
-                context.agent_id, vresult.summary,
-            )
-        else:
-            status = AgentState.COMPLETED
-
-        # ── M1/P0-1: 证据账本影子判定 —— 只记录新旧差异，不改变 status ──
-        # 预算耗尽 / 显式不可恢复失败是账本能独立确认的两种终态语义。
+        error = str(step_failed) if step_failed and step_failed is not True else None
+        status = AgentState.EXECUTING
         ledger = _ledger(context)
-        if status == AgentState.TIMEOUT:
-            ledger.mark_budget_exhausted()
-        elif status == AgentState.FAILED:
-            # Runtime 的 FAILED 分支都是"无法继续"的权威判定：计划耗尽、工具全败、
-            # 验证失败、显式 fail。账本必须映射为同一终态，否则影子会把失败误读成
-            # continue，掩盖真实差异。
-            ledger.mark_fatal(str(error or context.metadata.get("step_failed")
-                                  or "agent entered FAILED state"))
-        _shadow_terminal(context, status.value, "finalize")
-        decision = decide_terminal(ledger)
 
         result = AgentResult(
             agent_id=self.agent_id,
@@ -4526,8 +4494,7 @@ class SWEAgent(Agent):
                 # Graph Runtime：显式化的转移轨迹（观察层，不影响判定）
                 "graph_trace": context.metadata.get("graph_trace", []),
                 "graph_violations": context.metadata.get("graph_violations", []),
-                # M1/P0-1：证据账本与影子判定差异（审计用，不参与终态）
-                "evidence_decision": decision.to_dict(),
+                # Runtime 在这里之后依据账本唯一确定终态。
                 "evidence_shadow": context.metadata.get("evidence_shadow", []),
                 "evidence_ledger": ledger.summary(),
             },

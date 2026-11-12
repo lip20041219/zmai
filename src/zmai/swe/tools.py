@@ -150,6 +150,93 @@ def _public_api_warning(old_text: str, new_text: str) -> str:
     return "\n".join(lines)
 
 
+def _expr_shape(expr: ast.expr) -> str:
+    """Coarse shape of an expression: container kind or called/unreferenced name."""
+    if isinstance(expr, ast.Call):
+        return "call:" + ast.unparse(expr.func)
+    if isinstance(expr, ast.List):
+        return "list"
+    if isinstance(expr, ast.Dict):
+        return "dict"
+    if isinstance(expr, ast.Set):
+        return "set"
+    if isinstance(expr, ast.Tuple):
+        return "tuple"
+    if isinstance(expr, ast.ListComp):
+        return "listcomp"
+    if isinstance(expr, ast.DictComp):
+        return "dictcomp"
+    if isinstance(expr, ast.SetComp):
+        return "setcomp"
+    if isinstance(expr, ast.Constant):
+        return "const"
+    if isinstance(expr, ast.Name):
+        return "name"
+    if isinstance(expr, ast.Attribute):
+        return "attr"
+    return type(expr).__name__
+
+
+def _behavior_surface(source: str) -> dict[str, tuple[list[str], list[str]]] | None:
+    """Per-function return shapes and raised exception types."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    surface: dict[str, tuple[list[str], list[str]]] = {}
+
+    def collect(body: list[ast.stmt], prefix: str) -> None:
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                returns = sorted({
+                    _expr_shape(item.value)
+                    for item in ast.walk(node)
+                    if isinstance(item, ast.Return) and item.value is not None
+                })
+                raises = sorted({
+                    ast.unparse(item.exc)
+                    for item in ast.walk(node)
+                    if isinstance(item, ast.Raise) and item.exc is not None
+                })
+                surface[prefix + node.name] = (returns, raises)
+            elif isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
+                collect(node.body, f"{node.name}.")
+
+    collect(tree.body, "")
+    return surface
+
+
+def _behavior_changes(old_text: str, new_text: str) -> list[str]:
+    """返回值形态或异常类型变化的函数（启发式，只提示）。"""
+    before = _behavior_surface(old_text)
+    after = _behavior_surface(new_text)
+    if before is None or after is None:
+        return []
+    changes: list[str] = []
+    for name, (old_returns, old_raises) in before.items():
+        if name not in after:
+            continue
+        new_returns, new_raises = after[name]
+        if old_returns != new_returns:
+            changes.append(f"返回值形态变化 {name}: {old_returns} -> {new_returns}")
+        if old_raises != new_raises:
+            changes.append(f"异常类型变化 {name}: {old_raises} -> {new_raises}")
+    return changes
+
+
+def _behavior_warning(old_text: str, new_text: str) -> str:
+    changes = _behavior_changes(old_text, new_text)
+    if not changes:
+        return ""
+    lines = ["[BEHAVIOR_CHANGE] 本次修改改变了函数的返回值形态或异常类型，可能影响调用者："]
+    lines.extend(f"- {change}" for change in changes[:8])
+    lines.append(
+        "action_required: 静态检查不确定运行时行为；先 grep 调用方与现有测试，"
+        "确认这些变化是任务要求的，并跑相关测试后再继续。"
+    )
+    return "\n".join(lines)
+
+
 def _invalidate_bytecode_cache(full: Path) -> None:
     """写入 .py 后作废它自己的 __pycache__ 字节码缓存。
 
@@ -223,9 +310,12 @@ def _write_checked(full: Path, content: str, orig_text: str, label: str) -> tupl
     _invalidate_bytecode_cache(full)
     ok, message = _validate_written_py(full)
     if ok and full.suffix.lower() == ".py":
-        warning = _public_api_warning(orig_text, content)
-        if warning:
-            return True, warning
+        warnings = [warning for warning in (
+            _public_api_warning(orig_text, content),
+            _behavior_warning(orig_text, content),
+        ) if warning]
+        if warnings:
+            return True, "\n".join(warnings)
     return ok, message
 
 
@@ -1756,13 +1846,13 @@ def _collapse_test_output(output: str, exit_code: int, cmd: str) -> tuple[str, b
     # 失败数和测试名相同不代表失败内容相同；更换 head/tail 查看细节时
     # 也不能继续返回上一次的摘要。只折叠同命令、同正文的重复结果。
     failed_names = re.findall(r"FAILED\s+(\S+)", output)
-    stable_output = re.sub(r"\bin \d+(?:\.\d+)?s\b", "in <time>", output)
     # P0-2：守卫 nonce 每次运行都不同，必须从哈希里归一化，否则重复测试永远不折叠；
     # 但折叠后的输出仍要带上**本次** nonce —— Runtime 用它核验这份结果不是旧输出。
     # marker 可能与 pytest 进度输出粘在同一行（`.......[100%][AcceptanceGuard:nonce] …`），
     # 因此按子串提取而不是按行首。
     _nonce_match = re.search(re.escape(NONCE_MARKER) + r"\s+\S+", output)
     nonce_line = _nonce_match.group(0) if _nonce_match else ""
+    stable_output = re.sub(r"\bin \d+(?:\.\d+)?s\b", "in <time>", output)
     stable_output = re.sub(re.escape(NONCE_MARKER) + r"\s+\S+",
                            NONCE_MARKER + " <nonce>", stable_output)
     hash_content = cmd + "|" + summary_line + "|" + stable_output
@@ -1843,6 +1933,46 @@ class ShellTool(Tool):
         remaining = remaining_wall_seconds(context.config)
         return allowed if remaining is None else min(allowed, max(0.0, remaining - 3.0))
 
+    @staticmethod
+    def _full_suite(command: str) -> bool:
+        """Only guard a suite whose project-wide scope is statically provable."""
+        return (is_test_command(command)
+                and test_scope_targets(command) == []
+                and not cli_scope_filter(command)
+                and not test_scope_changes_root(command)
+                and not test_scope_has_opaque_wrapper(command))
+
+    @staticmethod
+    def _test_duration_estimate(context: ToolContext, command: str) -> tuple[float | None, str]:
+        ledger = context.evidence_ledger
+        key = " ".join(command.casefold().split())
+        # A stale result cannot prove completion, but its measured cost is still useful.
+        records = ledger.records if ledger is not None else []
+        for record in reversed(records):
+            duration_ms = getattr(record, "duration_ms", 0)
+            previous = " ".join(str(getattr(record, "command", "")).casefold().split())
+            if previous == key and isinstance(duration_ms, (int, float)) and duration_ms > 0:
+                return float(duration_ms) / 1000.0 * 1.5, "same_command_history"
+        # A timeout is an upper bound, not an observed duration. First runs keep
+        # the existing wall-clock timeout so short suites can establish history.
+        return None, "no_history"
+
+    @staticmethod
+    def _candidate_evidence_is_available(context: ToolContext) -> bool:
+        if not context.candidate_evidence_available or context.evidence_ledger is None:
+            return False
+        for record in reversed(context.evidence_ledger.usable()):
+            integrity = getattr(record, "integrity", None)
+            baseline = getattr(record, "baseline_compare", None)
+            if (getattr(record, "green", False)
+                    and (getattr(record, "scope", "") != "full"
+                         or getattr(record, "coverage", "") != "full")
+                    and not getattr(record, "regression_detected", False)
+                    and not (getattr(baseline, "new_failures", []) or [])
+                    and integrity is not None and integrity.ok()):
+                return True
+        return False
+
     def execute(self, context: ToolContext, params: dict[str, Any]) -> ToolResult:
         _st = time.time()
         cmd = params.get("command", "")
@@ -1891,6 +2021,28 @@ class ShellTool(Tool):
         # 测试命令走独立超时预算：完整套件不是"30s 没跑完就等于失败"的普通命令。
         # 模型显式传的 timeout 优先；普通 shell 命令行为完全不变。
         timeout = self.timeout_for(context, params)
+        remaining = remaining_wall_seconds(context.config)
+        if self._full_suite(cmd) and remaining is not None:
+            estimate, estimate_source = self._test_duration_estimate(context, cmd)
+            if estimate is not None and remaining < estimate:
+                candidate_available = self._candidate_evidence_is_available(context)
+                guidance = (
+                    "有效的定向通过证据可尝试走 `SUBMIT_CANDIDATE`；提交时仍会执行现有证据回放与安全门禁。"
+                    if candidate_available else
+                    "当前没有合格的候选证据，不得提交 candidate；可继续做低成本定向验证。"
+                )
+                result = ToolResult.err(
+                    "[TIME_BUDGET_GUARD] 未启动全量测试：剩余墙钟预算 "
+                    f"{remaining:.1f}s，小于估算成本 {estimate:.1f}s "
+                    f"（{estimate_source}，估算按历史/默认值 ×1.5，非确定承诺）。\n{guidance}",
+                    metadata={"budget_guard": "full_suite", "blocked": True,
+                              "estimate_seconds": estimate,
+                              "estimate_source": estimate_source,
+                              "remaining_seconds": remaining,
+                              "candidate_evidence_available": candidate_available},
+                )
+                _emit_tool_result(self.name, context, params, result, _st)
+                return result
         if timeout <= 0:
             context.config["_wall_budget_exhausted"] = True
             result = ToolResult.err("task wall budget exhausted before shell_exec",

@@ -25,6 +25,7 @@ CR-5-4 改源码 + 完整套件全绿仍能完成 / CR-5-5 pytest.ini 与 confte
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 from tests.test_swe_acceptance_window_guard import (
@@ -54,6 +55,7 @@ _BUILD_SYSTEM = (
     'requires = ["setuptools"]\n'
     'build-backend = "setuptools.build_meta"\n'
 )
+_PYTHON = f'"{sys.executable}"'
 
 
 def _write_cfg(path: str, content: str) -> ToolCall:
@@ -64,12 +66,12 @@ def _write_cfg(path: str, content: str) -> ToolCall:
 
 def _pytest_full() -> ToolCall:
     return ToolCall(id="pt", name="shell_exec",
-                    params={"command": "python -m pytest -q"})
+                    params={"command": f"{_PYTHON} -m pytest -q"})
 
 
 def _pytest_subset() -> ToolCall:
     return ToolCall(id="pts", name="shell_exec",
-                    params={"command": "python -m pytest -q test_app.py"})
+                    params={"command": f"{_PYTHON} -m pytest -q test_app.py"})
 
 
 def _assert_no_completion(r) -> None:

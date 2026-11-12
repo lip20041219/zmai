@@ -9,7 +9,7 @@
     timeout    预算耗尽（沿用既有超时语义）
 
 completed 与 candidate 的 scope 条件互斥；polluted / stale 证据一律不参与判定。
-P0-1 只做影子对比，不改变 Runtime 现有终态。
+Runtime 在 SWE Agent 终态出口使用该判定作为权威；Agent 内部调用仅用于影子审计。
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ TERMINAL_COMPLETED = "completed"
 TERMINAL_CANDIDATE = "candidate"
 TERMINAL_FAILED = "failed"
 TERMINAL_TIMEOUT = "timeout"
+TERMINAL_CANCELLED = "cancelled"
 TERMINAL_CONTINUE = "continue"  # 非终态：证据不足，继续循环
 
 
@@ -119,6 +120,7 @@ class EvidenceRecord:
     nonce: str = ""
     replay: ReplayResult = field(default_factory=ReplayResult)
     sequence: int = -1
+    duration_ms: int = 0
 
     @property
     def valid(self) -> bool:
@@ -134,7 +136,7 @@ class EvidenceRecord:
 
 @dataclass
 class TerminalDecision:
-    """终态判定（kind 为 completed/candidate/failed/timeout/continue 之一）。"""
+    """终态判定（kind 为 completed/candidate/failed/timeout/cancelled/continue 之一）。"""
 
     kind: str
     reason: str
@@ -143,6 +145,18 @@ class TerminalDecision:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class TerminalFact:
+    """Runtime-observed terminal event, separate from completion evidence."""
+
+    status: str
+    reason: str = ""
+    source: str = ""
+    step: int = -1
+    verification_checks: int = 0
+    verification_passed: bool = False
 
 
 @dataclass
@@ -161,6 +175,10 @@ class CompletionLedger:
     fatal_error: str | None = None
     replay_attempts: int = 0
     replay_total_ms: int = 0
+    terminal_facts: list[TerminalFact] = field(default_factory=list)
+    no_tests_confirmed: bool = False
+    objective_verification_required: bool = False
+    objective_checks: list[dict[str, Any]] = field(default_factory=list)
 
     def record(self, record: EvidenceRecord) -> EvidenceRecord:
         record.sequence = len(self.records)
@@ -190,6 +208,22 @@ class CompletionLedger:
     def mark_fatal(self, error: str) -> None:
         self.fatal_error = error
 
+    def record_terminal(self, status: str, reason: str = "", *,
+                        source: str = "", step: int = -1,
+                        verification_checks: int = 0,
+                        verification_passed: bool = False) -> TerminalFact:
+        fact = TerminalFact(status, reason, source, step,
+                            verification_checks, verification_passed)
+        self.terminal_facts.append(fact)
+        if status in (TERMINAL_FAILED, "exception"):
+            self.mark_fatal(reason or status)
+        elif status == TERMINAL_TIMEOUT:
+            self.mark_budget_exhausted()
+        return fact
+
+    def record_objective_checks(self, checks: list[dict[str, Any]]) -> None:
+        self.objective_checks = [dict(check) for check in checks]
+
     def usable(self) -> list[EvidenceRecord]:
         return [r for r in self.records if r.valid]
 
@@ -201,6 +235,10 @@ class CompletionLedger:
             "fatal_error": self.fatal_error,
             "replay_attempts": self.replay_attempts,
             "replay_total_ms": self.replay_total_ms,
+            "terminal_facts": [asdict(fact) for fact in self.terminal_facts],
+            "no_tests_confirmed": self.no_tests_confirmed,
+            "objective_verification_required": self.objective_verification_required,
+            "objective_checks": list(self.objective_checks),
             "usable_records": len(self.usable()),
             "records": [r.to_dict() for r in self.records],
         }
@@ -245,6 +283,15 @@ def decide_terminal(ledger: CompletionLedger) -> TerminalDecision:
         return TerminalDecision(TERMINAL_FAILED,
                                 f"unrecoverable: {ledger.fatal_error}",
                                 unverified_scope=unverified)
+    if ledger.terminal_facts and ledger.terminal_facts[-1].status == TERMINAL_CANCELLED:
+        return TerminalDecision(TERMINAL_CANCELLED,
+                                ledger.terminal_facts[-1].reason or "run cancelled",
+                                unverified_scope=unverified)
+
+    if (ledger.objective_verification_required and ledger.objective_checks
+            and all(check.get("passed") is True for check in ledger.objective_checks)):
+        return TerminalDecision(TERMINAL_COMPLETED,
+                                "objective verification passed without pytest acceptance")
 
     usable = ledger.usable()
     if not usable:

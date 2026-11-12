@@ -51,6 +51,9 @@ class ToolContext:
     logger: logging.Logger | None = None
     # P1-1/P1-2: 上下文交付状态探针。默认 None —— 不注入时行为与改造前一致且 fail-closed。
     read_state: Callable[[Any], str] | None = None
+    # M2/P1-1: 已有测试耗时与候选证据；工具只读取，不改变终态。
+    evidence_ledger: Any | None = None
+    candidate_evidence_available: bool = False
 
 
 @dataclass

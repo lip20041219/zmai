@@ -349,6 +349,36 @@ def test_runtime_candidate_after_edit_and_stale_pre_edit_evidence(tmp_path):
                for s in meta["evidence_shadow"])
 
 
+def test_runtime_no_test_completion_uses_objective_verification(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("VALUE = 0\n", encoding="utf-8")
+    ScriptedBackend.script = [
+        call("edit", path="app.py", mode="regex_replace",
+             old_text="VALUE = 0", new_text="VALUE = 1"),
+        "The requested change is complete.",
+    ]
+    cfg = Config(sources=[])
+    cfg.set("runtime.max_iterations", 4)
+    cfg.set("workspace.root", str(tmp_path / "runtime_workspace"))
+    runtime = Runtime(config=cfg)
+    runtime._gateway.register(ScriptedBackend.name, ScriptedBackend)
+
+    result = asyncio.run(runtime.run(
+        agent_id="no_test_objective_runtime",
+        task="Change VALUE from zero to one.", backend=ScriptedBackend.name,
+        config={"project_path": str(source)},
+    ))
+
+    assert result["status"] == "completed", result
+    ledger = result["metadata"]["evidence_ledger"]
+    assert ledger["no_tests_confirmed"] is True
+    assert ledger["objective_verification_required"] is True
+    assert ledger["objective_checks"]
+    assert all(check["passed"] for check in ledger["objective_checks"])
+    assert result["metadata"]["evidence_decision"]["kind"] == "completed"
+
+
 def test_runtime_records_polluted_evidence_when_scope_config_changes(tmp_path):
     (tmp_path / "app.py").write_text("FIXED = True\n", encoding="utf-8")
     (tmp_path / "test_target.py").write_text(

@@ -651,10 +651,10 @@ class TestMaxStepsTimeout:
 
 
 class TestSWEAgentFinalize:
-    """直接测试 finalize() 的各状态分支，确保 Runtime 尊重其返回。"""
+    """finalize() 只构建结果；SWE 终态由 Runtime 的证据判定器决定。"""
 
-    def test_normal_complete(self):
-        """无异常 → COMPLETED。"""
+    def test_finalize_returns_nonterminal_payload(self):
+        """finalize 不能自行把 SWE 任务判成 COMPLETED。"""
         from zmai.swe.agent import SWEAgent
 
         agent = SWEAgent("test")
@@ -662,10 +662,10 @@ class TestSWEAgentFinalize:
             agent_id="test", task="test", config={},
         )
         result = asyncio.run(agent.finalize(ctx))
-        assert result.status == AgentState.COMPLETED
+        assert result.status == AgentState.EXECUTING
 
-    def test_step_failed_returns_failed(self):
-        """step_failed → FAILED，error 传递正确。"""
+    def test_step_failed_error_is_preserved_for_runtime(self):
+        """保留错误诊断，终态交由 Runtime 判定。"""
         from zmai.swe.agent import SWEAgent
 
         agent = SWEAgent("test")
@@ -674,13 +674,13 @@ class TestSWEAgentFinalize:
             metadata={"step_failed": "something went wrong"},
         )
         result = asyncio.run(agent.finalize(ctx))
-        assert result.status == AgentState.FAILED
+        assert result.status == AgentState.EXECUTING
         assert result.error == "something went wrong", (
             f"step_failed 的 error 应传递到 AgentResult，实际 {result.error}"
         )
 
-    def test_timed_out_returns_timeout(self):
-        """timed_out → TIMEOUT。"""
+    def test_timed_out_is_not_decided_in_finalize(self):
+        """超时事实由 Runtime 写入账本。"""
         from zmai.swe.agent import SWEAgent
 
         agent = SWEAgent("test")
@@ -690,10 +690,10 @@ class TestSWEAgentFinalize:
             step_count=5,
         )
         result = asyncio.run(agent.finalize(ctx))
-        assert result.status == AgentState.TIMEOUT
+        assert result.status == AgentState.EXECUTING
 
-    def test_verification_failure_returns_failed(self):
-        """验证失败 → FAILED。"""
+    def test_verification_failure_is_not_decided_in_finalize(self):
+        """验证失败不得在 finalize 绕过 Runtime 的判定。"""
         from zmai.swe.agent import SWEAgent
         from zmai.swe.verifier import VerificationResult
 
@@ -706,11 +706,10 @@ class TestSWEAgentFinalize:
             metadata={"verification": failed_vr},
         )
         result = asyncio.run(agent.finalize(ctx))
-        assert result.status == AgentState.FAILED
-        assert result.status != AgentState.COMPLETED
+        assert result.status == AgentState.EXECUTING
 
-    def test_timed_out_priority_over_step_failed(self):
-        """timed_out 应优先于 step_failed。"""
+    def test_finalize_leaves_timeout_precedence_to_runtime(self):
+        """超时与失败优先级由账本中的 Runtime 事实决定。"""
         from zmai.swe.agent import SWEAgent
 
         agent = SWEAgent("test")
@@ -720,7 +719,7 @@ class TestSWEAgentFinalize:
             step_count=3,
         )
         result = asyncio.run(agent.finalize(ctx))
-        assert result.status == AgentState.TIMEOUT
+        assert result.status == AgentState.EXECUTING
 
     def test_step_failed_not_overridden_by_tool_ok(self):
         """step_failed 存在时，即使有成功工具也不得 COMPLETED。"""
@@ -736,11 +735,8 @@ class TestSWEAgentFinalize:
             },
         )
         result = asyncio.run(agent.finalize(ctx))
-        # step_failed 应优先于工具统计 → FAILED
-        assert result.status == AgentState.FAILED, (
-            f"step_failed 时不得 COMPLETED，实际 {result.status}"
-        )
-        assert result.status != AgentState.COMPLETED
+        assert result.status == AgentState.EXECUTING
+        assert result.error == "step-error"
 
 
 # ═══════════════════════════════════════════════════════════════

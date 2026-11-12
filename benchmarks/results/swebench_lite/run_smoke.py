@@ -37,6 +37,32 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="repla
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
+if os.environ.get("ZMAI_RUNTIME_SRC"):
+    sys.path.insert(0, str(Path(os.environ["ZMAI_RUNTIME_SRC"]).resolve()))
+
+
+def runtime_identity() -> dict:
+    """Prove which source tree this probe will import, without invoking a model."""
+    import zmai
+    from zmai.config import Config
+    from zmai.runtime import Runtime
+
+    source = Path(zmai.__file__).resolve().parent.parent
+    expected = os.environ.get("ZMAI_RUNTIME_SRC")
+    if expected and source != Path(expected).resolve():
+        raise RuntimeError(f"Runtime import escaped pinned source: {source}")
+    commit = sh(["git", "rev-parse", "HEAD"], cwd=source.parent)
+    actual = (commit.stdout or "").strip()
+    pinned = os.environ.get("ZMAI_EXPECTED_RUNTIME_COMMIT")
+    if pinned and actual != pinned:
+        raise RuntimeError(f"Runtime commit mismatch: {actual} != {pinned}")
+    selected_model = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
+    config = Config(sources=[])
+    config.set("backends.deepseek.model", selected_model)
+    backend_model = Runtime(config=config)._gateway.get("deepseek").model
+    if backend_model != selected_model:
+        raise RuntimeError(f"backend model mismatch: {backend_model} != {selected_model}")
+    return {"source": str(source), "commit": actual, "model": backend_model}
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("smoke")
@@ -201,13 +227,36 @@ def fetch_and_prepare(
     return setup_instance_repo(instance, work_dir)
 
 
+def run_baseline(instance, inst_dir: Path, result: dict) -> None:
+    """Independent FTP baseline; sealed A/B invokes this only after the Agent exits."""
+    before_dir = inst_dir / "_test_before"
+    before_repo = before_dir / instance.clone_dir
+    if before_repo.exists():
+        sh(["git", "-C", str(before_repo), "checkout", "-f", instance.base_commit])
+        sh(["git", "-C", str(before_repo), "reset", "--hard", "HEAD"])
+        sh(["git", "-C", str(before_repo), "clean", "-fd"])
+    else:
+        before_dir.mkdir(parents=True, exist_ok=True)
+        from zmai.eval.swebench import setup_instance_repo
+        before_repo = setup_instance_repo(instance, before_dir)
+    ok, err = apply_patch(before_repo, instance.test_patch)
+    if not ok:
+        result["ftp_before"] = "ERROR: test_patch apply failed"
+    else:
+        ftp_before, out_before = run_tests_independent(before_repo, instance.FAIL_TO_PASS)
+        result["ftp_before"] = "PASS(异常)" if ftp_before else "FAIL(符合预期)"
+        result["tests_before"] = out_before
+        result["ftp_before_counts"] = parse_pytest_counts(out_before)
+        (inst_dir / "test_before.log").write_text(out_before, encoding="utf-8")
+
+
 def run_instance(instance, repo_dir: Path, args) -> dict:
     """对单个实例执行完整链路，返回 result dict。"""
     result: dict = {
         "instance_id": instance.instance_id,
         "repo": instance.repo,
         "base_commit": instance.base_commit,
-        "model": "",
+        "model": getattr(args, "model", "") or "",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "success": None,
         "status": "running",
@@ -250,26 +299,8 @@ def run_instance(instance, repo_dir: Path, args) -> dict:
 
         # ── 2. test_before：base_commit + test_patch 跑 FTP ──
         # 在独立副本上验证任务可复现（FTP 应失败）
-        before_dir = inst_dir / "_test_before"
-        before_repo = before_dir / instance.clone_dir
-        if before_repo.exists():
-            sh(["git", "-C", str(before_repo), "checkout", "-f", instance.base_commit])
-            sh(["git", "-C", str(before_repo), "reset", "--hard", "HEAD"])
-            sh(["git", "-C", str(before_repo), "clean", "-fd"])
-        else:
-            before_dir.mkdir(parents=True, exist_ok=True)
-            from zmai.eval.swebench import setup_instance_repo
-            before_repo = setup_instance_repo(instance, before_dir)
-        ok, err = apply_patch(before_repo, instance.test_patch)
-        if not ok:
-            logger.warning("[%s] test_before: test_patch 应用失败: %s", instance.instance_id, err)
-            result["ftp_before"] = "ERROR: test_patch apply failed"
-        else:
-            ftp_before, out_before = run_tests_independent(before_repo, instance.FAIL_TO_PASS)
-            result["ftp_before"] = "PASS(异常)" if ftp_before else "FAIL(符合预期)"
-            result["tests_before"] = out_before
-            result["ftp_before_counts"] = parse_pytest_counts(out_before)
-            (inst_dir / "test_before.log").write_text(out_before, encoding="utf-8")
+        if not getattr(args, "sealed_ab", False) or getattr(args, "baseline_only", False):
+            run_baseline(instance, inst_dir, result)
 
         # ── 2b. 基线模式：到此为止，不启动 agent（验收 §5「运行前先确认问题真实存在」）──
         if getattr(args, "baseline_only", False):
@@ -281,17 +312,15 @@ def run_instance(instance, repo_dir: Path, args) -> dict:
             )
             return finalize(result, start, name="baseline.json")
 
-        # ── 3. 应用 test_patch 到 agent 工作仓库 ──────────────
+        # ── 3. 旧探针可选的公开 test_patch；封闭 A/B 禁止向 Agent 工作区注入 ──
         # 让 agent 能看到 FAIL_TO_PASS 测试失败，否则 base_commit 上
         # 根本没有这些测试，agent 永远看不到失败信号。
-        ok, err = apply_patch(repo_dir, instance.test_patch)
-        if not ok:
-            logger.warning("[%s] test_patch apply 失败（agent 工作区）: %s",
-                          instance.instance_id, err)
-            result["failure_category"] = "patch_failure"
-            result["failure_reason"] = f"test_patch apply failed: {err}"
-            return finalize(result, start)
-        logger.info("[%s] test_patch applied to agent workspace", instance.instance_id)
+        if not getattr(args, "sealed_ab", False):
+            ok, err = apply_patch(repo_dir, instance.test_patch)
+            if not ok:
+                result["failure_category"] = "patch_failure"
+                result["failure_reason"] = f"test_patch apply failed: {err}"
+                return finalize(result, start)
 
         # ── 4. 启动 Agent ─────────────────────────────
         from zmai.config import Config
@@ -307,7 +336,18 @@ def run_instance(instance, repo_dir: Path, args) -> dict:
         agent_id = f"eval_{instance.instance_id}"
         config = Config(sources=[])
         config.set("runtime.max_iterations", args.max_steps)
+        if args.backend == "deepseek":
+            config.set("backends.deepseek.model", args.model)
+        if getattr(args, "wall_seconds", None):
+            config.set("runtime.wall_seconds_limit", args.wall_seconds)
+        if getattr(args, "sealed_ab", False):
+            config.set("workspace.root", str((OUT_DIR or RESULT_DIR) / "workspace"))
         rt = Runtime(config=config)
+        actual_model = rt._gateway.get(args.backend).model
+        if actual_model != args.model:
+            raise RuntimeError(f"model mismatch: expected {args.model}, got {actual_model}")
+        result["model"] = actual_model
+        runtime_started = time.monotonic()
         rdict = asyncio.run(rt.run(
             agent_id=agent_id,
             task=agent_task_text(instance,
@@ -315,12 +355,15 @@ def run_instance(instance, repo_dir: Path, args) -> dict:
             backend=args.backend,
             config={
                 "project_path": str(repo_dir),
+                "wall_seconds_limit": getattr(args, "wall_seconds", None),
                 # SWE-bench eval 守卫：未修改任何源码不得因现有测试全绿而完成
                 "eval.require_code_change": "true",
             },
         ))
+        result["runtime_duration_seconds"] = round(time.monotonic() - runtime_started, 3)
 
         result["status"] = rdict.get("status", "")
+        result["agent_status"] = rdict.get("status", "")
         result["steps"] = rdict.get("steps", 0)
         result["error"] = (rdict.get("error") or "")[:500]
 
@@ -328,9 +371,17 @@ def run_instance(instance, repo_dir: Path, args) -> dict:
         # Runtime.run() 现在透出 finalize 的 metadata（swe_stats + token_usage）。
         _meta = rdict.get("metadata") or {}
         _tok = _meta.get("token_usage") or {}
-        result["input_tokens"] = _tok.get("input_tokens", 0) or 0
-        result["output_tokens"] = _tok.get("output_tokens", 0) or 0
-        result["total_tokens"] = result["input_tokens"] + result["output_tokens"]
+        result["input_tokens"] = _tok.get("input_tokens")
+        result["output_tokens"] = _tok.get("output_tokens")
+        result["total_tokens"] = (
+            result["input_tokens"] + result["output_tokens"]
+            if isinstance(result["input_tokens"], int)
+            and isinstance(result["output_tokens"], int) else None
+        )
+        _ledger = _meta.get("evidence_ledger") or {}
+        result["replay_total_ms"] = _ledger.get("replay_total_ms")
+        result["evidence_decision"] = _meta.get("evidence_decision")
+        result["delivery_report"] = rdict.get("delivery_report")
         _swe = _meta.get("swe_stats") or {}
         result["failure_parser_used"] = int(_swe.get("failure_parser_used", 0) or 0)
         result["loop_guard_triggered"] = bool(_swe.get("loopguard_blocks", 0))
@@ -343,6 +394,8 @@ def run_instance(instance, repo_dir: Path, args) -> dict:
         metrics = collect_agent_metrics(agent_id, ws)
         result["tool_calls"] = metrics.get("tool_calls")
         result["test_runs"] = metrics.get("test_runs")
+        if getattr(args, "sealed_ab", False):
+            run_baseline(instance, inst_dir, result)
 
         # ── 基础设施失败：backend 调用错误（如 HTTP 402/限流/网络）──
         # agent 根本没机会执行 → 标记 infrastructure_failure，不判 no_change/test_failure。
@@ -361,7 +414,7 @@ def run_instance(instance, repo_dir: Path, args) -> dict:
         # 先剥离预应用的 test_patch：checkout 恢复 test_patch 涉及的文件到 base_commit。
         # 否则 agent 的 git diff 会包含预应用测试改动 → eval 重复应用冲突 + 误判 test_tampering。
         _tp_files = _test_patch_files(instance)
-        if _tp_files:
+        if _tp_files and not getattr(args, "sealed_ab", False):
             sh(["git", "-C", str(repo_dir), "checkout", "--"] + _tp_files)
             logger.info("[%s] test_patch files reverted before diff: %s",
                         instance.instance_id, _tp_files)
@@ -506,6 +559,8 @@ def main() -> None:
     ap.add_argument("--instance", required=True, help="instance_id")
     ap.add_argument("--backend", default="deepseek", help="backend 名称")
     ap.add_argument("--max-steps", type=int, default=60)
+    ap.add_argument("--wall-seconds", type=int, default=1800)
+    ap.add_argument("--model", default="deepseek-flash")
     ap.add_argument("--repo-dir", default=None, help="repo 缓存目录（跨任务复用）")
     ap.add_argument("--baseline-only", action="store_true",
                     help="只验证基线（base_commit + test_patch 跑 FTP），不启动 agent，"
@@ -515,12 +570,34 @@ def main() -> None:
     ap.add_argument("--no-hints", action="store_true",
                     help="任务提示词只用 problem_statement，**剥离 hints_text**。"
                          "SWE-bench 的 hints_text 常含维护者对根因的讨论，属任务输入级答案泄漏")
+    ap.add_argument("--sealed-ab", action="store_true",
+                    help="A/B 模式：不向 Agent 工作区应用验收 test_patch")
+    ap.add_argument("--identity-only", action="store_true",
+                    help="仅核对实际加载的 Runtime 源码与 Commit，不运行实例或模型")
     args = ap.parse_args()
+    if args.identity_only:
+        print(json.dumps(runtime_identity(), ensure_ascii=False))
+        return
+    if args.sealed_ab:
+        runtime_identity()
+    if args.backend == "deepseek":
+        os.environ["DEEPSEEK_MODEL"] = args.model
 
     global OUT_DIR
     OUT_DIR = Path(args.result_dir).resolve() if args.result_dir else None
 
     from zmai.eval.swebench import load_instances
+    if args.sealed_ab:
+        import hashlib
+        import zmai.eval.swebench as swebench_module
+
+        dataset = Path(os.environ.pop("ZMAI_AB_DATASET"))
+        expected = os.environ.pop("ZMAI_AB_DATASET_SHA256")
+        payload = dataset.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != expected:
+            raise ValueError("paired dataset digest changed")
+        frozen_instances = json.loads(payload.decode("utf-8"))
+        swebench_module.download_instances = lambda split: frozen_instances
     instances = load_instances(split="lite")
     by_id = {i.instance_id: i for i in instances}
     if args.instance not in by_id:

@@ -5,8 +5,8 @@
   * 同一命令的后一次绿运行可以清除该范围的历史回归
   * 完整套件绿不能掩盖另一范围的未解决回归
   * 关闭回放不得让未验证证据完成/候选
-  * finalize 的 FAILED 分支映射为 failed（不再与影子判定分歧）
-  * 无测试任务的 legacy completed 与证据判定的已知差异
+  * finalize 不再自行决定 SWE 终态
+  * 无测试任务需要客观检查证据
 """
 
 from __future__ import annotations
@@ -83,7 +83,8 @@ def test_full_green_cannot_mask_regression_on_other_command():
 # ═══════════════════════════════════════════════════════════════
 
 
-def _run_agent(project: Path, script, *, steps: int = 2, **config):
+def _run_agent(project: Path, script, *, steps: int = 2,
+               initial_metadata: dict | None = None, **config):
     ScriptedBackend.script = script
     agent = SWEAgent("term_probe")
     ctx = AgentContext(
@@ -91,7 +92,7 @@ def _run_agent(project: Path, script, *, steps: int = 2, **config):
         tools=ToolRegistry(),
         config={"project_path": str(project), "timeout": 60,
                 "loop_guard.threshold": 50, **config},
-        metadata={},
+        metadata=dict(initial_metadata or {}),
     )
 
     async def run():
@@ -134,44 +135,75 @@ async def _finalize(project: Path, metadata: dict):
     return await agent.finalize(ctx), ctx
 
 
-def test_finalize_tool_failure_maps_to_failed(tmp_path):
+def test_finalize_does_not_decide_tool_failure_terminal(tmp_path):
     (tmp_path / "app.py").write_text("X = 1\n", encoding="utf-8")
     result, ctx = asyncio.run(_finalize(
         tmp_path, {"tool_calls_fail": 3, "tool_calls_ok": 0}))
-    assert result.status.value == "failed"
-    assert result.metadata["evidence_decision"]["kind"] == "failed"
-    assert ctx.metadata["evidence_shadow"][-1]["agree"] is True
+    assert result.status.value == "executing"
+    assert ctx.metadata["evidence_ledger"].terminal_facts == []
+    assert "evidence_decision" not in result.metadata
 
 
-def test_finalize_verification_failure_maps_to_failed(tmp_path):
+def test_finalize_does_not_decide_verification_failure_terminal(tmp_path):
     (tmp_path / "app.py").write_text("X = 1\n", encoding="utf-8")
     failed = VerificationResult(passed=False, summary="1 check failed")
     result, ctx = asyncio.run(_finalize(tmp_path, {"verification": failed}))
-    assert result.status.value == "failed"
-    assert result.metadata["evidence_decision"]["kind"] == "failed"
-    assert ctx.metadata["evidence_shadow"][-1]["agree"] is True
+    assert result.status.value == "executing"
+    assert ctx.metadata["evidence_ledger"].terminal_facts == []
+    assert "evidence_decision" not in result.metadata
 
 
-def test_finalize_plan_exhaustion_maps_to_failed(tmp_path):
+def test_finalize_does_not_decide_plan_exhaustion_terminal(tmp_path):
     (tmp_path / "app.py").write_text("X = 1\n", encoding="utf-8")
     plan = Plan(goal="x", steps=[PlanStep(id=1, action="a")])
     result, ctx = asyncio.run(_finalize(tmp_path, {
         "replan_count": MAX_REPLANS, "execution_plan": plan}))
-    assert result.status.value == "failed"
-    assert result.metadata["evidence_decision"]["kind"] == "failed"
-    assert ctx.metadata["evidence_shadow"][-1]["agree"] is True
+    assert result.status.value == "executing"
+    assert ctx.metadata["evidence_ledger"].terminal_facts == []
+    assert "evidence_decision" not in result.metadata
 
 
-def test_no_test_legacy_completion_is_a_known_difference(tmp_path):
-    """无测试任务仍由旧逻辑完成；统一判定器没有证据可判 → continue。
+def test_plan_exhaustion_emits_failure_action_at_detection(tmp_path):
+    plan = Plan(goal="x", steps=[PlanStep(id=1, action="unfinished")])
+    _, actions = _run_agent(
+        tmp_path, ["continue"], steps=1,
+        initial_metadata={"replan_count": MAX_REPLANS, "execution_plan": plan})
+    assert actions[-1].type == "fail"
+    assert "replans" in (actions[-1].error or "")
 
-    这是已知的语义边界（不是状态机缺陷）：若直接切换，非测试任务会被判为
-    continue。需要先决定"无测试任务"的终态政策，才能切换控制权。
-    """
+
+def test_finalize_leaves_no_test_completion_to_runtime_authority(tmp_path):
+    """已确认无测试时，finalize 不得自行完成或补写失败事实。"""
     (tmp_path / "app.py").write_text("X = 1\n", encoding="utf-8")
     result, ctx = asyncio.run(_finalize(tmp_path, {}))
-    assert result.status.value == "completed"
-    assert result.metadata["evidence_decision"]["kind"] == "continue"
-    diff = ctx.metadata["evidence_shadow"][-1]
-    assert (diff["old"], diff["new"], diff["agree"]) == (
-        "completed", "continue", False)
+    assert result.status.value == "executing"
+    assert ctx.metadata["evidence_ledger"].objective_verification_required is True
+    assert ctx.metadata["evidence_ledger"].terminal_facts == []
+    assert "evidence_decision" not in result.metadata
+
+
+def test_no_test_model_text_alone_cannot_complete(tmp_path):
+    (tmp_path / "app.py").write_text("X = 1\n", encoding="utf-8")
+    ctx, actions = _run_agent(tmp_path, ["task done"], steps=1)
+    assert actions[-1].type == "continue"
+    assert ctx.metadata["evidence_ledger"].no_tests_confirmed is True
+    assert decide_terminal(ctx.metadata["evidence_ledger"]).kind != "completed"
+
+
+def test_no_test_objective_checks_are_completion_evidence():
+    ledger = CompletionLedger(no_tests_confirmed=True,
+                              objective_verification_required=True)
+    ledger.record_objective_checks([
+        {"strategy": "file_exists", "passed": True},
+        {"strategy": "exit_code", "passed": True},
+    ])
+    assert decide_terminal(ledger).kind == "completed"
+
+
+def test_runtime_terminal_facts_drive_failure_timeout_and_cancelled_shadow():
+    for status, kind in (("failed", "failed"), ("exception", "failed"),
+                         ("timeout", "timeout"), ("cancelled", "cancelled")):
+        ledger = CompletionLedger()
+        ledger.record_terminal(status, "observed", source="runtime", step=3)
+        assert ledger.terminal_facts[-1].source == "runtime"
+        assert decide_terminal(ledger).kind == kind

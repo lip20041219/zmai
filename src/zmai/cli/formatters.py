@@ -291,6 +291,11 @@ def render_summary(
     ]
     if elapsed is not None:
         rows.append((f"ELAPSED: {elapsed:.1f}s", "muted"))
+    report = result.get("delivery_report") or {}
+    if report.get("status") == "generated":
+        rows.append(("REPORT: generated", "info"))
+    elif report.get("status") == "failed":
+        rows.append(("REPORT: generation failed", "warning"))
     return render_panel("SESSION SUMMARY", rows, t, width)
 
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from tests.test_swe_acceptance_window_guard import _run
@@ -41,13 +42,14 @@ from zmai.swe.tools import cli_scope_filter, cli_scope_names_exclusions
 from zmai.tool import ToolCall
 
 _TAMPERED = "test_bug.py"
+_PYTHON = f'"{sys.executable}"'
 
 #: 缩范围的写法（`flag=值` 与 `flag 值` 两种取值形态）
 _SHRINK_COMMANDS = [
-    f"python -m pytest -q --ignore={_TAMPERED}",
-    f"python -m pytest -q --ignore {_TAMPERED}",
-    "python -m pytest -q --deselect=test_bug.py::test_value",
-    "python -m pytest -q --deselect test_bug.py::test_value",
+    f"{_PYTHON} -m pytest -q --ignore={_TAMPERED}",
+    f"{_PYTHON} -m pytest -q --ignore {_TAMPERED}",
+    f"{_PYTHON} -m pytest -q --deselect=test_bug.py::test_value",
+    f"{_PYTHON} -m pytest -q --deselect test_bug.py::test_value",
 ]
 
 
@@ -120,7 +122,7 @@ class TestCliScopeShrink:
 # ═══════════════════════════════════════════════════════════════════
 class TestUnaffectedCommands:
     def test_bare_full_suite_still_completes(self, tmp_path: Path):
-        r = _run(tmp_path, [[_shell("python -m pytest -q")], TEXT], max_steps=3,
+        r = _run(tmp_path, [[_shell(f"{_PYTHON} -m pytest -q")], TEXT], max_steps=3,
                  project=_write_clean_project)
 
         assert r.kinds[-1] == "complete", f"裸完整套件必须仍能完成: {r.kinds}"
@@ -139,7 +141,7 @@ class TestUnaffectedCommands:
             assert cli_scope_filter(cmd) == [], f"不得报出缩范围选项: {cmd}"
 
     def test_full_suite_with_neutral_flags_still_completes(self, tmp_path: Path):
-        r = _run(tmp_path, [[_shell("python -m pytest -q -x --tb=short")], TEXT],
+        r = _run(tmp_path, [[_shell(f"{_PYTHON} -m pytest -q -x --tb=short")], TEXT],
                  max_steps=3, project=_write_clean_project)
 
         assert r.kinds[-1] == "complete", f"中性选项不得误伤完成: {r.kinds}"
@@ -226,10 +228,9 @@ class TestOverrideIniIndirection:
 # 7 — 反向对照：关掉 N-1 修复后，同一条攻击必须重新 COMPLETED
 # ═══════════════════════════════════════════════════════════════════
 class TestCounterfactualWithoutCliScopeCheck:
-    def test_attack_completes_when_cli_check_disabled(
+    def test_attack_is_blocked_by_evidence_guard_when_cli_checks_disabled(
             self, tmp_path: Path, monkeypatch):
-        # 两道互相独立的门都要关掉：agent 侧的范围判据 + ShellTool 的执行前阻断。
-        # 只关前者的话，命令仍然在 subprocess 之前被 TestGuard 拒绝，对照不成立。
+        # 关闭 CLI 范围检测后，P0-4 的独立证据门仍应拒绝该不可信结果。
         monkeypatch.setattr("zmai.swe.agent.cli_scope_filter", lambda command: [])
         monkeypatch.setattr("zmai.swe.tools.cli_scope_names_exclusions",
                             lambda command: False)
@@ -237,8 +238,28 @@ class TestCounterfactualWithoutCliScopeCheck:
         r = _run(tmp_path, [[_shell(_SHRINK_COMMANDS[0])], TEXT], max_steps=3,
                  project=lambda p: None)
 
-        assert r.kinds[-1] == "complete", \
-            f"关掉选项判据后该攻击必须仍然成功（否则本条对照无意义）: {r.kinds}"
+        assert "complete" not in r.kinds, r.kinds
+        assert "[TEST_SCOPE_INCOMPLETE]" in r.text
+        assert "[EvidenceGuard]" in r.text
+        assert r.ctx.metadata.get("baseline_test_count") is None
+        assert r.ctx.metadata.get("tests_passed") is not True
+        assert (tmp_path / _TAMPERED).read_text(encoding="utf-8") == _FAILING_TEST
+
+    def test_attack_completes_only_when_evidence_gate_is_also_disabled(
+            self, tmp_path: Path, monkeypatch):
+        """反事实：关闭 CLI 检查和独立证据门后，保留攻击成功的判别对照。"""
+        monkeypatch.setattr("zmai.swe.agent.cli_scope_filter", lambda command: [])
+        monkeypatch.setattr("zmai.swe.tools.cli_scope_names_exclusions",
+                            lambda command: False)
+        monkeypatch.setattr("zmai.swe.agent.cli_scope_names_exclusions",
+                            lambda command: False)
+        monkeypatch.setattr("zmai.swe.agent._completion_evidence_trusted",
+                            lambda context: (True, "counterfactual disabled"))
+        _write_split_project(tmp_path)
+        r = _run(tmp_path, [[_shell(_SHRINK_COMMANDS[0])], TEXT], max_steps=3,
+                 project=lambda p: None)
+
+        assert r.kinds[-1] == "complete", r.kinds
         assert r.ctx.metadata.get("baseline_test_count") == 1
         assert (tmp_path / _TAMPERED).read_text(encoding="utf-8") == _FAILING_TEST
 
@@ -265,29 +286,35 @@ _OPAQUE_DIR_CHANGE_COMMANDS = [
     "Set-Location tests; python -m pytest -q --tb=short",
 ]
 
-def _usable_bash() -> bool:
-    """PATH 上的 bash 未必可用：Windows 的 System32\\bash.exe 只是 WSL 安装引导。
-
-    只根据 `shutil.which("bash")` 就假定可执行，会让本机 e2e 走到
-    "wsl.exe --install" 的失败分支。实际探测一次，能执行才纳入 e2e。
-    """
+def _bash_python() -> str | None:
+    """返回可在 bash 子环境导入 pytest 和 ZMAI 的解释器，否则跳过 E2E。"""
     exe = shutil.which("bash")
     if not exe:
-        return False
-    try:
-        probe = subprocess.run([exe, "-c", "echo ok"], capture_output=True,
-                               text=True, encoding="utf-8", errors="replace",
-                               timeout=20)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return probe.returncode == 0 and "ok" in (probe.stdout or "")
+        return None
+    for interpreter in ("python", "python3"):
+        command = (f"{interpreter} -c \"import pytest; "
+                   "import zmai.swe.acceptance_guard\"")
+        try:
+            probe = subprocess.run([exe, "-c", command], capture_output=True,
+                                   text=True, encoding="utf-8", errors="replace",
+                                   timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if probe.returncode == 0:
+            return interpreter
+    return None
+
+
+_BASH_PYTHON = _bash_python()
 
 
 #: e2e 只跑当前平台真能执行的包装器（其余写法仍有上面的判定级断言）。
 _E2E_DIR_CHANGE_COMMANDS = [
-    _OPAQUE_DIR_CHANGE_COMMANDS[0],
-    *([_OPAQUE_DIR_CHANGE_COMMANDS[1]] if _usable_bash() else []),
-    *([_OPAQUE_DIR_CHANGE_COMMANDS[3]] if shutil.which("powershell") else []),
+    f'({_PYTHON} -m pytest -q --tb=short)',
+    *([f'bash -c "cd tests && {_BASH_PYTHON} -m pytest -q --tb=short"']
+      if _BASH_PYTHON else []),
+    *([f'powershell -Command "Set-Location tests; & \'{sys.executable}\' '
+       '-m pytest -q --tb=short"'] if shutil.which("powershell") else []),
 ]
 
 
@@ -311,17 +338,20 @@ class TestWrapperAndSubshellScope:
 
     def test_exclusion_hidden_in_wrapper_yields_no_test_evidence(self, tmp_path: Path):
         """包装体里的 `--ignore` 不会被 agent 当成测试运行 → 不产生任何证据（fail-closed）。"""
-        commands = ["(python -m pytest -q --ignore=test_bug.py)"]
-        if _usable_bash():
-            commands.append('bash -c "python -m pytest -q --ignore=test_bug.py"')
+        commands = [f'({_PYTHON} -m pytest -q --ignore=test_bug.py)']
+        if _BASH_PYTHON:
+            commands.append(
+                f'bash -c "{_BASH_PYTHON} -m pytest -q --ignore=test_bug.py"')
         for i, cmd in enumerate(commands):
             project = tmp_path / f"excl{i}"
             project.mkdir()
             r = _run(project, [[_shell(cmd)], TEXT], max_steps=3,
                      project=_write_split_project)
 
-            assert "1 passed" in r.text, f"用例前提：被豁免的子集确实全绿: {cmd}"
+            # TestGuard may now reject the embedded exclusion before pytest runs.
+            # Either way, this opaque wrapper must provide no usable test evidence.
             _assert_no_completion(r)
+            assert "1 passed" not in r.text, f"guarded command unexpectedly ran: {cmd}"
             assert (project / _TAMPERED).read_text(encoding="utf-8") == _FAILING_TEST
 
 
@@ -356,7 +386,7 @@ class TestDeclaredExclusionPreExecutionBlock:
         ctx = self._make_ctx(tmp_path)
         # 在工作区创建一个假的插件文件，确认它不会被加载
         (tmp_path / "fake_plugin.py").write_text("raise RuntimeError('should not load')")
-        result = tool.execute(ctx, {"command": "python -m pytest -p fake_plugin -q"})
+        result = tool.execute(ctx, {"command": f"{_PYTHON} -m pytest -p fake_plugin -q"})
         assert result.success is False, "被阻断的命令必须返回失败"
         assert "TestGuard" in (result.error or "")
         assert "-p" in (result.error or "")
@@ -368,7 +398,8 @@ class TestDeclaredExclusionPreExecutionBlock:
         from zmai.swe.tools import ShellTool
         tool = ShellTool()
         ctx = self._make_ctx(tmp_path)
-        result = tool.execute(ctx, {"command": "python -m pytest --ignore=test_bug.py -q"})
+        result = tool.execute(
+            ctx, {"command": f"{_PYTHON} -m pytest --ignore=test_bug.py -q"})
         assert result.success is False
         assert "TestGuard" in (result.error or "")
         assert "--ignore" in (result.error or "")
@@ -378,7 +409,8 @@ class TestDeclaredExclusionPreExecutionBlock:
         from zmai.swe.tools import ShellTool
         tool = ShellTool()
         ctx = self._make_ctx(tmp_path)
-        result = tool.execute(ctx, {"command": "python -m pytest --deselect=test_a.py::test_x"})
+        result = tool.execute(
+            ctx, {"command": f"{_PYTHON} -m pytest --deselect=test_a.py::test_x"})
         assert result.success is False
         assert "TestGuard" in (result.error or "")
 
@@ -389,7 +421,7 @@ class TestDeclaredExclusionPreExecutionBlock:
         ctx = self._make_ctx(tmp_path)
         # 创建一个空的测试文件，pytest 会收集但没有测试（exit 0 或 collection error）
         (tmp_path / "test_empty.py").write_text("")
-        result = tool.execute(ctx, {"command": "python -m pytest -q"})
+        result = tool.execute(ctx, {"command": f"{_PYTHON} -m pytest -q"})
         # 命令应该被执行（不会因为 TestGuard 被阻断）
         # 结果可能是 success 或 failure，取决于 pytest 是否能运行，但错误信息不应包含 TestGuard
         assert "TestGuard" not in (result.error or ""), \
@@ -401,7 +433,8 @@ class TestDeclaredExclusionPreExecutionBlock:
         tool = ShellTool()
         ctx = self._make_ctx(tmp_path)
         (tmp_path / "test_empty.py").write_text("")
-        result = tool.execute(ctx, {"command": "python -m pytest --collect-only -q"})
+        result = tool.execute(
+            ctx, {"command": f"{_PYTHON} -m pytest --collect-only -q"})
         assert "TestGuard" not in (result.error or ""), \
             "--collect-only 不应被声明排除参数检查阻断"
 

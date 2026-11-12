@@ -45,11 +45,12 @@ from zmai.tool import ToolCall, ToolRegistry
 #: 攻击者用它保证**还原一定执行**（测试跑完 → 文件回到 A）—— 这正是本文件要
 #: 证明的形态：端状态合法也不能追回被污染的 green。
 _SEP = " & " if sys.platform == "win32" else " ; "
+_PYTHON = f'"{sys.executable}"'
 
 
 def _py_write(path: str, content: str) -> str:
     """经 shell 写文件：绕过 TestGuard 的 write_file/edit 路径保护。"""
-    return f"python -c \"open({path!r},'w').write({content!r})\""
+    return f"{_PYTHON} -c \"open({path!r},'w').write({content!r})\""
 
 
 def _tamper_run_restore(*, sep: str = _SEP) -> ToolCall:
@@ -58,7 +59,7 @@ def _tamper_run_restore(*, sep: str = _SEP) -> ToolCall:
     分隔符刻意不用 `&&`：还原必须**一定执行**（pytest 被守卫中止时也要执行），
     这样端状态才真的等于 A —— 用例要证明的正是"端状态合法也不能追回 green"。
     """
-    cmd = (_py_write("test_bug.py", _WEAK_TEST) + sep + "python -m pytest -q" + sep
+    cmd = (_py_write("test_bug.py", _WEAK_TEST) + sep + f"{_PYTHON} -m pytest -q" + sep
            + _py_write("test_bug.py", _FAILING_TEST))
     return ToolCall(id="cr4", name="shell_exec", params={"command": cmd})
 
@@ -70,14 +71,14 @@ def _gut_manifest_run_restore(manifest: str) -> ToolCall:
     清单**被改。Runtime 自己记着清单摘要，据此把本次结果 fail-closed 作废。
     """
     cmd = (_py_write(manifest.replace("\\", "/"), "{}") + _SEP
-           + _py_write("test_bug.py", _WEAK_TEST) + _SEP + "python -m pytest -q" + _SEP
+           + _py_write("test_bug.py", _WEAK_TEST) + _SEP + f"{_PYTHON} -m pytest -q" + _SEP
            + _py_write("test_bug.py", _FAILING_TEST))
     return ToolCall(id="cr4m", name="shell_exec", params={"command": cmd})
 
 
 def _pytest_full() -> ToolCall:
     return ToolCall(id="pt", name="shell_exec",
-                    params={"command": "python -m pytest -q"})
+                    params={"command": f"{_PYTHON} -m pytest -q"})
 
 
 def _write_bug_project(tmp_path: Path) -> None:

@@ -156,6 +156,7 @@ def _print_help() -> None:
     print("  zmai --help                 Show this help")
     print("\nSubcommands:")
     print("  zmai plan <task>            PLAN ONLY: analyze and generate execution plan")
+    print("  zmai verify <report.json> --project <path> --command <full-test-command>")
     print("  zmai --plan <task>          AUTO PLAN: generate plan then execute")
     print("  zmai config                 Manage configuration")
     print("  zmai auth                   Show authentication status")
@@ -276,7 +277,21 @@ def _repl_run(task: str, runtime: Runtime, agent_id: str, theme: Theme,
             _offer_auth_fix(theme)
     print()
     print(render_summary(result, theme, elapsed=elapsed, budget=budget))
+    _print_delivery_report_path(result)
     return result
+
+
+def _print_delivery_report_path(result: dict[str, Any]) -> None:
+    """Show the relative Markdown report location in human-readable CLI modes."""
+    report = result.get("delivery_report") or {}
+    if report.get("status") != "generated":
+        return
+    path = "/".join((
+        str(report.get("workspace_directory", "unknown")),
+        str(report.get("directory", "unknown")),
+        str(report.get("markdown", "report.md")),
+    ))
+    print(f"  report: {path}")
 
 
 def _run_plan_only(task_args: list[str]) -> None:
@@ -410,6 +425,7 @@ def _oneshot_run(task: str, runtime: Runtime, config: Config, args: argparse.Nam
                 sys.stderr.write(f"\n{output}\n")
         print()
         print(render_summary(result, theme, elapsed=elapsed, budget=_budget(config)))
+        _print_delivery_report_path(result)
     sys.exit(0 if result.get("status") == "completed" else 3)
 
 
@@ -535,6 +551,17 @@ def main(argv: list[str] | None = None) -> None:
         if cmd == "doctor":
             use_json = "--json" in rest
             _run_doctor(json_output=use_json)
+            return
+        if cmd == "verify":
+            from zmai.swe.candidate_verify import verify_candidate
+
+            verify_parser = argparse.ArgumentParser(prog="zmai verify")
+            verify_parser.add_argument("report", type=Path)
+            verify_parser.add_argument("--project", type=Path, default=Path.cwd())
+            verify_parser.add_argument("--command", required=True)
+            verify_args = verify_parser.parse_args(rest)
+            print(json.dumps(verify_candidate(verify_args.report, verify_args.project,
+                                              verify_args.command), ensure_ascii=False))
             return
         if cmd == "plugin":
             _run_plugin(rest)
